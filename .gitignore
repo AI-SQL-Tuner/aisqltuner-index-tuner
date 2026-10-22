@@ -1,3 +1,6 @@
 test-output.txt
 *.tmp
 .vs/
+
+# Local endpoint setup with a real key; never commit it.
+setup/Configure-Endpoint-DEV.sql

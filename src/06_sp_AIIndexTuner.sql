@@ -16,6 +16,16 @@ GO
     CREATE does the same, then applies the CreateIndex recommendations that pass validation (see
     AIIndexTuner.usp_ApplyRecommendation). Every other recommendation stays for you to review.
 
+    Change controls (each restricts the prompt, and is enforced again when applying):
+        @AllowColumnstore   NULL (default) columnstore indexes may be recommended but are not created;
+                            1 = they may also be created; 0 = they are not recommended or created.
+        @AllowDropIndex     NULL (default) index drops may be recommended but are not run;
+                            1 = they may also be run; 0 = they are not recommended or run.
+        @MaxNewIndexes      at most this many new indexes are recommended and created (NULL = no limit).
+
+    A recommend-only (NULL) change can be applied after review with sp_AIIndexTuner_Apply and the
+    matching setting set to 1. A 0 cannot be overridden later.
+
     Testing and troubleshooting:
         @CollectOnly = 1    returns the collected data and the system prompt; no AI call, no run row.
         @TestResponse = N'{...}'
@@ -34,7 +44,10 @@ CREATE OR ALTER PROCEDURE dbo.sp_AIIndexTuner
     @Mode         varchar(10) = 'RECOMMEND',
     @CollectOnly  bit = 0,
     @TestResponse nvarchar(max) = NULL,
-    @CollectedData nvarchar(max) = NULL
+    @CollectedData nvarchar(max) = NULL,
+    @AllowColumnstore bit = NULL,
+    @AllowDropIndex   bit = NULL,
+    @MaxNewIndexes    int = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -60,7 +73,11 @@ BEGIN
            @Endpoint = Endpoint, @Deployment = Deployment, @Effort = ReasoningEffort
     FROM AIIndexTuner.Config WHERE ConfigId = 1;
 
-    DECLARE @Data nvarchar(max), @SystemPrompt nvarchar(max) = AIIndexTuner.fn_SystemPrompt();
+    IF @MaxNewIndexes < 0
+        THROW 50209, N'@MaxNewIndexes must be 0 or more, or NULL for no limit.', 1;
+
+    DECLARE @Data nvarchar(max),
+            @SystemPrompt nvarchar(max) = AIIndexTuner.fn_SystemPrompt() + AIIndexTuner.fn_ChangeRules(@AllowColumnstore, @AllowDropIndex, @MaxNewIndexes);
 
     IF @CollectedData IS NOT NULL AND (@CollectOnly = 1 OR LEN(@CollectedData) = 0)
         THROW 50208, N'@CollectedData cannot be empty, and cannot be combined with @CollectOnly = 1.', 1;
@@ -77,13 +94,15 @@ BEGIN
         THROW 50206, N'AIIndexTuner.Config has no row. Run setup/Configure-Endpoint.sql first.', 1;
 
     DECLARE @RunId int;
-    INSERT AIIndexTuner.Run (Mode, SchemaName, TableName, Endpoint, Deployment, ApiShape, ReasoningEffort, SystemPromptHash)
+    INSERT AIIndexTuner.Run (Mode, SchemaName, TableName, Endpoint, Deployment, ApiShape, ReasoningEffort, SystemPromptHash,
+                             AllowColumnstore, AllowDropIndex, MaxNewIndexes)
     VALUES (@Mode, @SchemaName, @TableName,
             CASE WHEN @TestResponse IS NULL THEN @Endpoint END,
             CASE WHEN @TestResponse IS NULL THEN @Deployment END,
             CASE WHEN @TestResponse IS NULL THEN 'OpenAIResponses' ELSE 'Test' END,
             CASE WHEN @TestResponse IS NULL THEN @Effort END,
-            CONVERT(char(64), HASHBYTES('SHA2_256', @SystemPrompt), 2));
+            CONVERT(char(64), HASHBYTES('SHA2_256', @SystemPrompt), 2),
+            @AllowColumnstore, @AllowDropIndex, @MaxNewIndexes);
     SET @RunId = SCOPE_IDENTITY();
 
     BEGIN TRY
@@ -138,11 +157,13 @@ BEGIN
         END;
 
         INSERT AIIndexTuner.Recommendation
-            (RunId, Priority, Category, Title, SchemaName, TableName, IndexName, KeyColumns, IncludeColumns, FilterPredicate,
+            (RunId, Priority, Category, Title, SchemaName, TableName, IndexName, IndexType, KeyColumns, IncludeColumns, FilterPredicate,
              IsUnique, [FillFactor], DataCompression, EstimatedSizeMB, Confidence, Rationale, BenefitingQueries, Script)
         SELECT @RunId, r.priority,
                CASE WHEN r.category IN ('CreateIndex', 'DropIndex', 'ConsolidateIndex', 'RebuildIndex', 'Constraint', 'Statistics', 'Setting', 'QueryChange') THEN r.category ELSE 'Other' END,
                LEFT(r.title, 400), LEFT(r.schema_name, 128), LEFT(r.table_name, 128), LEFT(r.index_name, 128),
+               CASE WHEN r.category = 'CreateIndex'
+                    THEN CASE WHEN UPPER(r.index_type) IN ('NONCLUSTERED COLUMNSTORE', 'CLUSTERED COLUMNSTORE') THEN UPPER(r.index_type) ELSE 'NONCLUSTERED' END END,
                ISNULL(r.key_columns, N'[]'), ISNULL(r.include_columns, N'[]'), LEFT(r.filter_predicate, 4000),
                r.is_unique,
                CASE WHEN r.fill_factor BETWEEN 1 AND 100 THEN r.fill_factor END,
@@ -152,7 +173,7 @@ BEGIN
                r.rationale, r.benefiting_queries, r.script
         FROM OPENJSON(@Text, '$.recommendations')
              WITH (priority int, category varchar(30), title nvarchar(4000), schema_name nvarchar(4000), table_name nvarchar(4000),
-                   index_name nvarchar(4000), key_columns nvarchar(max) AS JSON, include_columns nvarchar(max) AS JSON,
+                   index_name nvarchar(4000), index_type varchar(40), key_columns nvarchar(max) AS JSON, include_columns nvarchar(max) AS JSON,
                    filter_predicate nvarchar(max), is_unique bit, fill_factor int, data_compression varchar(20),
                    estimated_size_mb float, confidence varchar(20), rationale nvarchar(max),
                    benefiting_queries nvarchar(max) AS JSON, script nvarchar(max)) AS r;
@@ -176,9 +197,14 @@ BEGIN
     IF @Mode = 'CREATE'
     BEGIN
         DECLARE @RecId int, @ApplyStarted datetime2(7) = SYSDATETIME();
+        -- New rowstore indexes, plus the columnstore indexes and drops this run has a setting for.
+        -- Recommend-only ones (setting NULL) stay Recommended, for review. A change the run does not
+        -- allow (0) is still passed, so that it is marked Skipped if the model recommended it anyway.
         DECLARE apply_cur CURSOR LOCAL FAST_FORWARD FOR
             SELECT RecommendationId FROM AIIndexTuner.Recommendation
-            WHERE RunId = @RunId AND Category = 'CreateIndex'
+            WHERE RunId = @RunId
+              AND ((Category = 'CreateIndex' AND (IndexType = 'NONCLUSTERED' OR @AllowColumnstore IS NOT NULL))
+                   OR (Category = 'DropIndex' AND @AllowDropIndex IS NOT NULL))
             ORDER BY Priority, RecommendationId;
         OPEN apply_cur;
         FETCH NEXT FROM apply_cur INTO @RecId;
@@ -197,8 +223,8 @@ BEGIN
            N'Free and open source from AI SQL Tuner. For deadlocks, code review, server health, query tuning and more, see https://www.aisqltuner.com' AS MoreFrom
     FROM AIIndexTuner.Run AS r WHERE r.RunId = @RunId;
 
-    SELECT RecommendationId, Priority, Category, Title, SchemaName, TableName, IndexName, Confidence, EstimatedSizeMB,
-           Status, StatusReason, Rationale, Script, AppliedDDL
+    SELECT RecommendationId, Priority, Category, Title, SchemaName, TableName, IndexName, IndexType, Confidence, EstimatedSizeMB,
+           Status, StatusReason, Rationale, Script, AppliedDDL, UndoDDL
     FROM AIIndexTuner.Recommendation
     WHERE RunId = @RunId
     ORDER BY Priority, RecommendationId;
@@ -209,34 +235,61 @@ GO
     dbo.sp_AIIndexTuner_Apply: apply stored recommendations after reviewing them.
 
         EXEC dbo.sp_AIIndexTuner_Apply @RecommendationId = 42;   -- one recommendation
-        EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7;               -- every CreateIndex of a run
+        EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7;               -- the new rowstore indexes of a run
+        EXEC dbo.sp_AIIndexTuner_Apply @RecommendationId = 43, @AllowDropIndex = 1;
+        EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @AllowColumnstore = 1, @AllowDropIndex = 1;
+
+    @AllowColumnstore and @AllowDropIndex = 1 apply changes that the run left recommend-only (NULL);
+    0 blocks them. Neither can override a run that did not allow the change (0). @MaxNewIndexes
+    limits the new indexes of a run, together with the run's own limit.
 */
 CREATE OR ALTER PROCEDURE dbo.sp_AIIndexTuner_Apply
     @RecommendationId int = NULL,
-    @RunId            int = NULL
+    @RunId            int = NULL,
+    @AllowColumnstore bit = NULL,
+    @AllowDropIndex   bit = NULL,
+    @MaxNewIndexes    int = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
 
     IF (@RecommendationId IS NULL AND @RunId IS NULL) OR (@RecommendationId IS NOT NULL AND @RunId IS NOT NULL)
         THROW 50301, N'Pass either @RecommendationId or @RunId.', 1;
+    IF @MaxNewIndexes < 0
+        THROW 50302, N'@MaxNewIndexes must be 0 or more, or NULL for no limit.', 1;
 
-    DECLARE @Ids TABLE (RecommendationId int PRIMARY KEY);
+    DECLARE @Ids TABLE (RecommendationId int PRIMARY KEY, Priority int);
 
     IF @RecommendationId IS NOT NULL
-        INSERT @Ids VALUES (@RecommendationId);
+        INSERT @Ids VALUES (@RecommendationId, NULL);
     ELSE
-        INSERT @Ids SELECT RecommendationId FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Category = 'CreateIndex';
+        -- As in sp_AIIndexTuner CREATE mode, with this call's settings added to the run's.
+        INSERT @Ids
+        SELECT r.RecommendationId, r.Priority
+        FROM AIIndexTuner.Recommendation AS r
+        INNER JOIN AIIndexTuner.Run AS run ON run.RunId = r.RunId
+        WHERE r.RunId = @RunId
+          AND ((r.Category = 'CreateIndex' AND (ISNULL(r.IndexType, 'NONCLUSTERED') = 'NONCLUSTERED'
+                                                OR run.AllowColumnstore IS NOT NULL OR @AllowColumnstore IS NOT NULL))
+               OR (r.Category = 'DropIndex' AND (run.AllowDropIndex IS NOT NULL OR @AllowDropIndex IS NOT NULL)));
 
-    DECLARE @Id int = (SELECT MIN(RecommendationId) FROM @Ids);
-    WHILE @Id IS NOT NULL
+    -- In priority order, so a @MaxNewIndexes limit keeps the most important indexes.
+    DECLARE @Id int;
+    DECLARE apply_cur CURSOR LOCAL FAST_FORWARD FOR
+        SELECT RecommendationId FROM @Ids ORDER BY Priority, RecommendationId;
+    OPEN apply_cur;
+    FETCH NEXT FROM apply_cur INTO @Id;
+    WHILE @@FETCH_STATUS = 0
     BEGIN
-        EXEC AIIndexTuner.usp_ApplyRecommendation @RecommendationId = @Id;
-        SET @Id = (SELECT MIN(RecommendationId) FROM @Ids WHERE RecommendationId > @Id);
+        EXEC AIIndexTuner.usp_ApplyRecommendation @RecommendationId = @Id, @AllowColumnstore = @AllowColumnstore,
+                                                  @AllowDropIndex = @AllowDropIndex, @MaxNewIndexes = @MaxNewIndexes;
+        FETCH NEXT FROM apply_cur INTO @Id;
     END;
+    CLOSE apply_cur;
+    DEALLOCATE apply_cur;
 
     SELECT r.RecommendationId, r.RunId, r.Priority, r.Category, r.Title, r.SchemaName, r.TableName, r.IndexName,
-           r.Status, r.StatusReason, r.AppliedDDL, r.AppliedAt
+           r.Status, r.StatusReason, r.AppliedDDL, r.AppliedAt, r.UndoDDL
     FROM AIIndexTuner.Recommendation AS r
     INNER JOIN @Ids AS i ON i.RecommendationId = r.RecommendationId
     ORDER BY r.Priority, r.RecommendationId;

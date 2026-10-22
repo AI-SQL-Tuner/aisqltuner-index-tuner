@@ -104,6 +104,16 @@ IF COL_LENGTH(N'AIIndexTuner.Run', N'PayloadSupplied') IS NULL
         PollCount       int      NULL;   -- background-mode polls of the AI response
 GO
 
+/* Change controls (sp_AIIndexTuner @AllowColumnstore, @AllowDropIndex, @MaxNewIndexes). For the two
+   bits: NULL = may be recommended, never applied unless sp_AIIndexTuner_Apply is told to;
+   1 = may be recommended and applied; 0 = not recommended and never applied. */
+IF COL_LENGTH(N'AIIndexTuner.Run', N'AllowColumnstore') IS NULL
+    ALTER TABLE AIIndexTuner.Run ADD
+        AllowColumnstore bit NULL,
+        AllowDropIndex   bit NULL,
+        MaxNewIndexes    int NULL;   -- at most this many new indexes are recommended and created
+GO
+
 IF OBJECT_ID(N'AIIndexTuner.Recommendation', N'U') IS NULL
 BEGIN
     CREATE TABLE AIIndexTuner.Recommendation
@@ -137,6 +147,12 @@ BEGIN
 
     CREATE INDEX IX_AIIndexTuner_Recommendation_Run ON AIIndexTuner.Recommendation (RunId, Priority);
 END;
+GO
+
+IF COL_LENGTH(N'AIIndexTuner.Recommendation', N'IndexType') IS NULL
+    ALTER TABLE AIIndexTuner.Recommendation ADD
+        IndexType varchar(30)   NULL,   -- CreateIndex: NONCLUSTERED, NONCLUSTERED COLUMNSTORE or CLUSTERED COLUMNSTORE
+        UndoDDL   nvarchar(max) NULL;   -- reverses AppliedDDL: the DROP for a created index, the CREATE for a dropped one
 GO
 
 /* ===== Helpers ===== */
@@ -181,6 +197,92 @@ END;
 GO
 
 /* ===== 02_usp_CollectData.sql ===== */
+SET ANSI_NULLS ON;
+SET QUOTED_IDENTIFIER ON;
+GO
+/*
+    AIIndexTuner.usp_UsageSince
+
+    The period the usage DMVs cover for the current database (GetUsageStatisticsSinceAsync in the
+    desktop collector). Usage DMVs and the plan cache start empty when SQL Server starts, and for one
+    database when it is restored, attached, reverted from a snapshot, brought ONLINE or reopened
+    under AUTO_CLOSE. @Since is the latest of those times that can be read; @SinceSource names it.
+
+    Used by usp_CollectData for the "Database Usage Statistics Since" line, and by
+    usp_ApplyRecommendation, which drops an index for low use only after a long enough period.
+*/
+CREATE OR ALTER PROCEDURE AIIndexTuner.usp_UsageSince
+    @Since              datetime2(0)  = NULL OUTPUT,
+    @SinceSource        nvarchar(400) = NULL OUTPUT,
+    @StartTime          datetime2(0)  = NULL OUTPUT,
+    @AutoClose          bit           = NULL OUTPUT,
+    @RestoreHistoryRead bit           = NULL OUTPUT,
+    @LastStartup        datetime2(0)  = NULL OUTPUT,
+    @ErrorLogsSearched  int           = NULL OUTPUT,
+    @HasInstanceLogs    bit           = NULL OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @CreateDate datetime2(0), @LastRestore datetime2(0);
+    SELECT @Since = NULL, @SinceSource = NULL, @StartTime = NULL, @RestoreHistoryRead = 0, @LastStartup = NULL, @ErrorLogsSearched = 0,
+           -- Azure SQL Database, Synapse and Fabric have no msdb restore history or error log to read.
+           @HasInstanceLogs = CASE WHEN CAST(SERVERPROPERTY('EngineEdition') AS int) IN (5, 6, 11, 12) THEN 0 ELSE 1 END;
+
+    BEGIN TRY
+        SELECT @StartTime = sqlserver_start_time FROM sys.dm_os_sys_info;
+    END TRY
+    BEGIN CATCH
+        SET @StartTime = NULL;
+    END CATCH;
+
+    SELECT @CreateDate = create_date, @AutoClose = is_auto_close_on FROM sys.databases WHERE database_id = DB_ID();
+
+    IF @HasInstanceLogs = 1
+    BEGIN
+        BEGIN TRY
+            SELECT @LastRestore = MAX(restore_date) FROM msdb.dbo.restorehistory WHERE destination_database_name = DB_NAME();
+            SET @RestoreHistoryRead = 1;
+        END TRY
+        BEGIN CATCH
+            SET @LastRestore = NULL;
+        END CATCH;
+
+        -- Newest error log first, stopping at the first log with a startup message for this database.
+        -- Reading the error log needs securityadmin (or sysadmin). The closing quote in the search keeps
+        -- 'Sales' from matching 'Sales2'.
+        IF ISNULL(IS_SRVROLEMEMBER(N'securityadmin'), 0) = 1 OR ISNULL(IS_SRVROLEMEMBER(N'sysadmin'), 0) = 1
+        BEGIN
+            DECLARE @Log int = 0, @Search nvarchar(4000) = CONCAT(N'Starting up database ''', DB_NAME(), N'''.');
+            CREATE TABLE #ErrorLog (LogDate datetime, ProcessInfo nvarchar(100), [Text] nvarchar(max));
+            WHILE @Log < 7 AND @LastStartup IS NULL
+            BEGIN
+                BEGIN TRY
+                    TRUNCATE TABLE #ErrorLog;
+                    INSERT #ErrorLog (LogDate, ProcessInfo, [Text]) EXEC sys.sp_readerrorlog @p1 = @Log, @p2 = 1, @p3 = @Search;
+                    SELECT @LastStartup = MAX(LogDate) FROM #ErrorLog;
+                    SET @ErrorLogsSearched += 1;
+                END TRY
+                BEGIN CATCH
+                    BREAK;   -- past the oldest archive the log does not exist; any other error also ends the search
+                END CATCH;
+                SET @Log += 1;
+            END;
+            DROP TABLE #ErrorLog;
+        END;
+    END;
+
+    -- Later candidates win ties, so the error log, which names every kind of reset, is preferred.
+    IF @StartTime IS NOT NULL SELECT @Since = @StartTime, @SinceSource = N'the SQL Server start time, the latest reset found';
+    IF @CreateDate IS NOT NULL AND (@Since IS NULL OR @CreateDate >= @Since)
+        SELECT @Since = @CreateDate, @SinceSource = N'its create date in sys.databases, which an attach or a restore under a new name sets';
+    IF @LastRestore IS NOT NULL AND (@Since IS NULL OR @LastRestore >= @Since)
+        SELECT @Since = @LastRestore, @SinceSource = N'its latest restore in msdb.dbo.restorehistory';
+    IF @LastStartup IS NOT NULL AND (@Since IS NULL OR @LastStartup >= @Since)
+        SELECT @Since = @LastStartup, @SinceSource = N'its latest "Starting up database" message in the SQL Server error log, which is written whenever it starts: at a server restart, a restore, an attach, a database snapshot revert, an ONLINE after OFFLINE, or an AUTO_CLOSE reopen';
+END;
+GO
+
 SET ANSI_NULLS ON;
 SET QUOTED_IDENTIFIER ON;
 GO
@@ -243,66 +345,14 @@ BEGIN
         N'Major Version: ', CASE WHEN @MajorVersion >= 17 THEN N'SQL Server 2025' WHEN @MajorVersion = 16 THEN N'SQL Server 2022' ELSE CONCAT(N'Version ', @MajorVersion) END, @nl,
         N'Full Version: ', @@VERSION, @nl);
 
-    /* Start time and the period the usage DMVs cover (GetUsageStatisticsSinceAsync). Usage DMVs and
-       the plan cache start empty when SQL Server starts, and for one database when it is restored,
-       attached, reverted from a snapshot, brought ONLINE or reopened under AUTO_CLOSE. */
-    DECLARE @StartTime datetime2(0), @Now datetime2(0) = SYSDATETIME(), @CreateDate datetime2(0), @AutoClose bit,
-            @LastRestore datetime2(0), @RestoreHistoryRead bit = 0, @LastStartup datetime2(0), @ErrorLogsSearched int = 0,
-            @Since datetime2(0), @SinceSource nvarchar(400),
-            -- Azure SQL Database, Synapse and Fabric have no msdb restore history or error log to read.
-            @HasInstanceLogs bit = CASE WHEN CAST(SERVERPROPERTY('EngineEdition') AS int) IN (5, 6, 11, 12) THEN 0 ELSE 1 END;
+    /* Start time and the period the usage DMVs cover (GetUsageStatisticsSinceAsync); see usp_UsageSince. */
+    DECLARE @StartTime datetime2(0), @Now datetime2(0) = SYSDATETIME(), @AutoClose bit, @RestoreHistoryRead bit,
+            @LastStartup datetime2(0), @ErrorLogsSearched int, @Since datetime2(0), @SinceSource nvarchar(400), @HasInstanceLogs bit;
 
-    BEGIN TRY
-        SELECT @StartTime = sqlserver_start_time FROM sys.dm_os_sys_info;
-    END TRY
-    BEGIN CATCH
-        SET @StartTime = NULL;
-    END CATCH;
-
-    SELECT @CreateDate = create_date, @AutoClose = is_auto_close_on FROM sys.databases WHERE database_id = DB_ID();
-
-    IF @HasInstanceLogs = 1
-    BEGIN
-        BEGIN TRY
-            SELECT @LastRestore = MAX(restore_date) FROM msdb.dbo.restorehistory WHERE destination_database_name = DB_NAME();
-            SET @RestoreHistoryRead = 1;
-        END TRY
-        BEGIN CATCH
-            SET @LastRestore = NULL;
-        END CATCH;
-
-        -- Newest error log first, stopping at the first log with a startup message for this database.
-        -- Reading the error log needs securityadmin (or sysadmin). The closing quote in the search keeps
-        -- 'Sales' from matching 'Sales2'.
-        IF ISNULL(IS_SRVROLEMEMBER(N'securityadmin'), 0) = 1 OR ISNULL(IS_SRVROLEMEMBER(N'sysadmin'), 0) = 1
-        BEGIN
-            DECLARE @Log int = 0, @Search nvarchar(4000) = CONCAT(N'Starting up database ''', DB_NAME(), N'''.');
-            CREATE TABLE #ErrorLog (LogDate datetime, ProcessInfo nvarchar(100), [Text] nvarchar(max));
-            WHILE @Log < 7 AND @LastStartup IS NULL
-            BEGIN
-                BEGIN TRY
-                    TRUNCATE TABLE #ErrorLog;
-                    INSERT #ErrorLog (LogDate, ProcessInfo, [Text]) EXEC sys.sp_readerrorlog @p1 = @Log, @p2 = 1, @p3 = @Search;
-                    SELECT @LastStartup = MAX(LogDate) FROM #ErrorLog;
-                    SET @ErrorLogsSearched += 1;
-                END TRY
-                BEGIN CATCH
-                    BREAK;   -- past the oldest archive the log does not exist; any other error also ends the search
-                END CATCH;
-                SET @Log += 1;
-            END;
-            DROP TABLE #ErrorLog;
-        END;
-    END;
-
-    -- Later candidates win ties, so the error log, which names every kind of reset, is preferred.
-    IF @StartTime IS NOT NULL SELECT @Since = @StartTime, @SinceSource = N'the SQL Server start time, the latest reset found';
-    IF @CreateDate IS NOT NULL AND (@Since IS NULL OR @CreateDate >= @Since)
-        SELECT @Since = @CreateDate, @SinceSource = N'its create date in sys.databases, which an attach or a restore under a new name sets';
-    IF @LastRestore IS NOT NULL AND (@Since IS NULL OR @LastRestore >= @Since)
-        SELECT @Since = @LastRestore, @SinceSource = N'its latest restore in msdb.dbo.restorehistory';
-    IF @LastStartup IS NOT NULL AND (@Since IS NULL OR @LastStartup >= @Since)
-        SELECT @Since = @LastStartup, @SinceSource = N'its latest "Starting up database" message in the SQL Server error log, which is written whenever it starts: at a server restart, a restore, an attach, a database snapshot revert, an ONLINE after OFFLINE, or an AUTO_CLOSE reopen';
+    EXEC AIIndexTuner.usp_UsageSince
+        @Since = @Since OUTPUT, @SinceSource = @SinceSource OUTPUT, @StartTime = @StartTime OUTPUT, @AutoClose = @AutoClose OUTPUT,
+        @RestoreHistoryRead = @RestoreHistoryRead OUTPUT, @LastStartup = @LastStartup OUTPUT,
+        @ErrorLogsSearched = @ErrorLogsSearched OUTPUT, @HasInstanceLogs = @HasInstanceLogs OUTPUT;
 
     SET @Data += CASE WHEN @StartTime IS NOT NULL
         THEN CONCAT(N'SQL Server Start Time: ', CONVERT(varchar(19), @StartTime, 120), N' (server local time); uptime ',
@@ -1412,11 +1462,41 @@ BEGIN
         N'Return only a JSON object, with no Markdown, code fences or commentary, of the form {"summary": string, "recommendations": [...]}. ',
         N'summary: a short executive summary of the top priorities and the net storage change across all index recommendations. ',
         N'recommendations: one entry per recommendation, ordered by priority, where priority 1 is the most important. ',
-        N'category: CreateIndex for a new nonclustered rowstore index; DropIndex; ConsolidateIndex for merging, widening or replacing existing indexes; RebuildIndex; Constraint; Statistics; Setting; QueryChange; Other for anything else, including columnstore indexes. ',
-        N'For CreateIndex, fill schema_name, table_name, index_name, key_columns (in key order, each with descending), include_columns, filter_predicate (null unless the index is filtered), is_unique, fill_factor (null to use the default), data_compression (NONE, ROW, PAGE, or null to leave it unset) and estimated_size_mb, using object and column names exactly as they appear in the input, without brackets. ',
-        N'For the other categories, fill schema_name, table_name and index_name when the recommendation is about one object, and use empty arrays and null for the fields that do not apply. ',
+        N'category: CreateIndex for a new index, rowstore or columnstore; DropIndex for dropping one existing index; ConsolidateIndex for merging, widening or replacing existing indexes; RebuildIndex; Constraint; Statistics; Setting; QueryChange; Other for anything else. ',
+        N'For CreateIndex, fill schema_name, table_name, index_name, index_type (NONCLUSTERED for a rowstore index, NONCLUSTERED COLUMNSTORE or CLUSTERED COLUMNSTORE), key_columns (in key order, each with descending), include_columns, filter_predicate (null unless the index is filtered), is_unique, fill_factor (null to use the default), data_compression (NONE, ROW, PAGE, or null to leave it unset) and estimated_size_mb, using object and column names exactly as they appear in the input, without brackets. ',
+        N'For a nonclustered columnstore index, list its columns in key_columns with descending false and leave include_columns empty. For a clustered columnstore index, leave key_columns and include_columns empty. A columnstore index takes no is_unique, fill_factor or data_compression: use false and null. ',
+        N'For DropIndex, fill schema_name, table_name and index_name with the index to drop. Use DropIndex only for an index to drop now; put an index to confirm after a longer observation period under Other. ',
+        N'For the other categories, fill schema_name, table_name and index_name when the recommendation is about one object, use null for index_type, and use empty arrays and null for the other fields that do not apply. ',
         N'confidence is High, Medium or Low. rationale gives the evidence from the input. benefiting_queries lists the plan cache statements that benefit, by query hash or a short excerpt, or is empty. ',
         N'script is the complete T-SQL that implements the recommendation, or an empty string when there is nothing to run. Do not put rollback, validation, diagnostic or monitoring scripts in it.');
+END;
+GO
+
+/*
+    The change controls of a run (sp_AIIndexTuner @AllowColumnstore, @AllowDropIndex,
+    @MaxNewIndexes), as instructions appended to the system prompt. Empty when nothing is restricted,
+    so a default run sends the same prompt as before.
+
+    The prompt is only half of each control: usp_ApplyRecommendation enforces the same settings, in
+    case the model does not follow them.
+*/
+CREATE OR ALTER FUNCTION AIIndexTuner.fn_ChangeRules(@AllowColumnstore bit, @AllowDropIndex bit, @MaxNewIndexes int)
+RETURNS nvarchar(max)
+AS
+BEGIN
+    IF ISNULL(@AllowColumnstore, 1) = 1 AND ISNULL(@AllowDropIndex, 1) = 1 AND @MaxNewIndexes IS NULL
+        RETURN N'';
+
+    RETURN CONCAT(CAST(N' ' AS nvarchar(max)),
+        N'Change controls for this run. They override any guidance above, and changes that break them will not be applied: ',
+        CASE WHEN @AllowColumnstore = 0 THEN
+            N'Do not recommend columnstore indexes, clustered or nonclustered, even for large tables; recommend rowstore indexes instead where they help. ' END,
+        CASE WHEN @AllowDropIndex = 0 THEN
+            N'Do not recommend dropping or disabling any existing index, either on its own (DropIndex) or as part of a consolidation; widening an index with CREATE INDEX ... WITH (DROP_EXISTING = ON) is still allowed. You may name unused or redundant indexes in the summary, as candidates to review later. ' END,
+        CASE WHEN @MaxNewIndexes = 0 THEN
+            N'Do not recommend any new indexes (CreateIndex). You may name the most valuable ones in the summary. '
+             WHEN @MaxNewIndexes > 0 THEN
+            CONCAT(N'Recommend at most ', @MaxNewIndexes, N' new indexes (CreateIndex), choosing those with the greatest benefit, and give them the highest priorities. You may name others in the summary. ') END);
 END;
 GO
 
@@ -1437,7 +1517,7 @@ BEGIN
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["priority", "category", "title", "schema_name", "table_name", "index_name", "key_columns", "include_columns",
+        "required": ["priority", "category", "title", "schema_name", "table_name", "index_name", "index_type", "key_columns", "include_columns",
                      "filter_predicate", "is_unique", "fill_factor", "data_compression", "estimated_size_mb", "confidence",
                      "rationale", "benefiting_queries", "script"],
         "properties": {
@@ -1447,6 +1527,7 @@ BEGIN
           "schema_name": { "type": ["string", "null"] },
           "table_name": { "type": ["string", "null"] },
           "index_name": { "type": ["string", "null"] },
+          "index_type": { "type": ["string", "null"], "enum": ["NONCLUSTERED", "NONCLUSTERED COLUMNSTORE", "CLUSTERED COLUMNSTORE", null] },
           "key_columns": {
             "type": "array",
             "items": {
@@ -1685,57 +1766,271 @@ GO
 /*
     AIIndexTuner.usp_ApplyRecommendation
 
-    Applies one stored CreateIndex recommendation. The model's own script is never executed: plan
-    cache text goes into the prompt, so a crafted query could steer what the model writes. The DDL
-    is built here from the structured fields, after every name is checked against the catalog, with
-    QUOTENAME and an allow-list for each option.
+    Applies one stored CreateIndex or DropIndex recommendation. The model's own script is never
+    executed: plan cache text goes into the prompt, so a crafted query could steer what the model
+    writes. The DDL is built here from the structured fields, after every name is checked against
+    the catalog, with QUOTENAME and an allow-list for each option.
 
-    Only CreateIndex is applied. Every other category, and any filtered index, is left for review.
-    The outcome is written to the recommendation row: Applied, Skipped (with the reason) or Failed
-    (with the error).
+    Change controls: the run's settings (sp_AIIndexTuner @AllowColumnstore, @AllowDropIndex,
+    @MaxNewIndexes) are enforced here as well as in the prompt, in case the model ignores them. The
+    caller can pass the same settings: 0 from either side blocks a change, and 1 from either side
+    allows one that the other left NULL (recommend-only). @MaxNewIndexes uses the lower limit.
+
+    Applied: new rowstore indexes; new columnstore indexes when allowed; drops of nonclustered
+    indexes when allowed, nothing depends on them, and either another index makes them redundant
+    or the usage statistics cover at least 7 days. Every other category, and any filtered index,
+    is left for review. The outcome is written to the recommendation row: Applied (with the DDL and
+    the DDL that reverses it), Skipped (with the reason) or Failed (with the error). Skipped and
+    Failed recommendations can be applied again, for example with a setting that allows them.
 */
 CREATE OR ALTER PROCEDURE AIIndexTuner.usp_ApplyRecommendation
-    @RecommendationId int
+    @RecommendationId int,
+    @AllowColumnstore bit = NULL,
+    @AllowDropIndex   bit = NULL,
+    @MaxNewIndexes    int = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
 
     DECLARE @Category varchar(30), @Status varchar(20), @SchemaName sysname, @TableName sysname, @IndexName sysname,
-            @KeyColumns nvarchar(max), @IncludeColumns nvarchar(max), @Filter nvarchar(4000), @IsUnique bit,
-            @FillFactor tinyint, @Compression varchar(10), @RunId int;
+            @IndexType varchar(30), @KeyColumns nvarchar(max), @IncludeColumns nvarchar(max), @Filter nvarchar(4000), @IsUnique bit,
+            @FillFactor tinyint, @Compression varchar(10), @RunId int,
+            @RunColumnstore bit, @RunDropIndex bit, @RunMaxNew int;
 
-    SELECT @Category = Category, @Status = Status, @SchemaName = SchemaName, @TableName = TableName, @IndexName = IndexName,
-           @KeyColumns = KeyColumns, @IncludeColumns = IncludeColumns, @Filter = FilterPredicate, @IsUnique = IsUnique,
-           @FillFactor = [FillFactor], @Compression = DataCompression, @RunId = RunId
-    FROM AIIndexTuner.Recommendation
-    WHERE RecommendationId = @RecommendationId;
+    SELECT @Category = r.Category, @Status = r.Status, @SchemaName = r.SchemaName, @TableName = r.TableName, @IndexName = r.IndexName,
+           @IndexType = r.IndexType, @KeyColumns = r.KeyColumns, @IncludeColumns = r.IncludeColumns, @Filter = r.FilterPredicate,
+           @IsUnique = r.IsUnique, @FillFactor = r.[FillFactor], @Compression = r.DataCompression, @RunId = r.RunId,
+           @RunColumnstore = run.AllowColumnstore, @RunDropIndex = run.AllowDropIndex, @RunMaxNew = run.MaxNewIndexes
+    FROM AIIndexTuner.Recommendation AS r
+    INNER JOIN AIIndexTuner.Run AS run ON run.RunId = r.RunId
+    WHERE r.RecommendationId = @RecommendationId;
 
     IF @Category IS NULL
         THROW 50101, N'No recommendation with that RecommendationId.', 1;
 
-    IF @Status NOT IN ('Recommended', 'Failed')
-        RETURN;   -- already applied or skipped
+    IF @Status = 'Applied'
+        RETURN;
 
-    DECLARE @Reason nvarchar(4000) = NULL, @ObjectId int, @Ddl nvarchar(max);
+    -- The effective settings: 0 from either side wins, then 1 from either side; NULL is recommend-only.
+    SELECT @AllowColumnstore = CASE WHEN @RunColumnstore = 0 OR @AllowColumnstore = 0 THEN 0
+                                    WHEN @RunColumnstore = 1 OR @AllowColumnstore = 1 THEN 1 END,
+           @AllowDropIndex = CASE WHEN @RunDropIndex = 0 OR @AllowDropIndex = 0 THEN 0
+                                  WHEN @RunDropIndex = 1 OR @AllowDropIndex = 1 THEN 1 END,
+           @MaxNewIndexes = CASE WHEN @RunMaxNew IS NULL THEN @MaxNewIndexes
+                                 WHEN @MaxNewIndexes IS NULL OR @RunMaxNew < @MaxNewIndexes THEN @RunMaxNew
+                                 ELSE @MaxNewIndexes END;
+
+    SET @IndexType = CASE WHEN @Category = 'CreateIndex' THEN ISNULL(@IndexType, 'NONCLUSTERED') END;
+
+    DECLARE @Reason nvarchar(4000) = NULL, @ObjectId int, @Ddl nvarchar(max), @Undo nvarchar(max),
+            @IsColumnstore bit = CASE WHEN @IndexType LIKE '%COLUMNSTORE' THEN 1 ELSE 0 END,
+            @Target nvarchar(300) = QUOTENAME(@SchemaName) + N'.' + QUOTENAME(@TableName);
 
     /* ----- Validation: each failed check skips the recommendation with a reason ----- */
-    IF @Category <> 'CreateIndex'
+    IF @Category NOT IN ('CreateIndex', 'DropIndex')
         SET @Reason = CONCAT(N'Category ', @Category, N' is recommend-only; review the script and apply it yourself.');
-    ELSE IF NULLIF(LTRIM(@Filter), N'') IS NOT NULL
+    ELSE IF @Category = 'DropIndex' AND @AllowDropIndex = 0
+        SET @Reason = N'Index drops are not allowed (@AllowDropIndex = 0).';
+    ELSE IF @Category = 'DropIndex' AND @AllowDropIndex IS NULL
+        SET @Reason = CONCAT(N'Index drops are recommend-only for this run. Review it, then apply it with sp_AIIndexTuner_Apply @RecommendationId = ',
+                             @RecommendationId, N', @AllowDropIndex = 1.');
+    ELSE IF @IsColumnstore = 1 AND @AllowColumnstore = 0
+        SET @Reason = N'Columnstore indexes are not allowed (@AllowColumnstore = 0).';
+    ELSE IF @IsColumnstore = 1 AND @AllowColumnstore IS NULL
+        SET @Reason = CONCAT(N'Columnstore indexes are recommend-only for this run. Review it, then apply it with sp_AIIndexTuner_Apply @RecommendationId = ',
+                             @RecommendationId, N', @AllowColumnstore = 1.');
+    ELSE IF @Category = 'CreateIndex' AND @MaxNewIndexes IS NOT NULL
+         AND (SELECT COUNT(*) FROM AIIndexTuner.Recommendation
+              WHERE RunId = @RunId AND Category = 'CreateIndex' AND Status = 'Applied') >= @MaxNewIndexes
+        SET @Reason = CONCAT(N'The limit of ', @MaxNewIndexes, N' new index(es) for this run (@MaxNewIndexes) has been reached.');
+    ELSE IF @Category = 'CreateIndex' AND NULLIF(LTRIM(@Filter), N'') IS NOT NULL
         SET @Reason = N'Filtered indexes are recommend-only: the filter predicate is free text from the model. Review the script and apply it yourself.';
     ELSE IF @SchemaName IS NULL OR @TableName IS NULL
         SET @Reason = N'The recommendation does not name a schema and table.';
     ELSE
     BEGIN
-        SET @ObjectId = OBJECT_ID(QUOTENAME(@SchemaName) + N'.' + QUOTENAME(@TableName), N'U');
+        SET @ObjectId = OBJECT_ID(@Target, N'U');
         IF @ObjectId IS NULL
-            SET @Reason = CONCAT(N'Table ', QUOTENAME(@SchemaName), N'.', QUOTENAME(@TableName), N' does not exist in this database.');
+            SET @Reason = CONCAT(N'Table ', @Target, N' does not exist in this database.');
     END;
 
+    /* ===== DropIndex ===== */
+    IF @Category = 'DropIndex'
+    BEGIN
+        DECLARE @IndexId int, @Type tinyint, @TypeDesc nvarchar(60), @IsPk bit, @IsUq bit;
+
+        IF @Reason IS NULL
+        BEGIN
+            SELECT @IndexId = index_id, @Type = type, @TypeDesc = type_desc, @IsPk = is_primary_key, @IsUq = is_unique_constraint
+            FROM sys.indexes
+            WHERE object_id = @ObjectId AND name = @IndexName;
+
+            IF @IndexId IS NULL
+                SET @Reason = CONCAT(N'Index ', QUOTENAME(@IndexName), N' does not exist on ', @Target, N'.');
+            ELSE IF @Type NOT IN (2, 6)
+                SET @Reason = CONCAT(N'Only nonclustered indexes are dropped here; ', QUOTENAME(@IndexName), N' is ', @TypeDesc, N'.');
+            ELSE IF @IsPk = 1 OR @IsUq = 1
+                SET @Reason = CONCAT(QUOTENAME(@IndexName), N' enforces a primary key or unique constraint.');
+            ELSE IF EXISTS (SELECT 1 FROM sys.foreign_keys WHERE referenced_object_id = @ObjectId AND key_index_id = @IndexId)
+                SET @Reason = CONCAT(N'A foreign key references ', QUOTENAME(@IndexName), N'.');
+        END;
+
+        -- Anything that names the index would break when it is gone: index hints in modules, plan
+        -- guides and Query Store hints, and Query Store plans forced with it (a NO_INDEX failure).
+        IF @Reason IS NULL
+        BEGIN
+            DECLARE @Like nvarchar(1000) = N'%' + AIIndexTuner.fn_EscapeLike(@IndexName) + N'%',
+                    @PlanLike nvarchar(1000) = N'%Index="' + AIIndexTuner.fn_EscapeLike(QUOTENAME(@IndexName)) + N'"%',
+                    @Ref nvarchar(400);
+            BEGIN TRY
+                SELECT TOP (1) @Ref = N'module ' + QUOTENAME(OBJECT_SCHEMA_NAME(object_id)) + N'.' + QUOTENAME(OBJECT_NAME(object_id))
+                FROM sys.sql_modules WHERE definition LIKE @Like ESCAPE N'\';
+                IF @Ref IS NULL
+                    SELECT TOP (1) @Ref = N'plan guide ' + QUOTENAME(name)
+                    FROM sys.plan_guides WHERE is_disabled = 0 AND hints LIKE @Like ESCAPE N'\';
+                IF @Ref IS NULL
+                    SELECT TOP (1) @Ref = CONCAT(N'the Query Store hint on query_id ', query_id)
+                    FROM sys.query_store_query_hints WHERE query_hint_text LIKE @Like ESCAPE N'\';
+                IF @Ref IS NULL
+                    SELECT TOP (1) @Ref = CONCAT(N'the forced Query Store plan_id ', plan_id, N' (query_id ', query_id, N')')
+                    FROM sys.query_store_plan WHERE is_forced_plan = 1 AND query_plan LIKE @PlanLike ESCAPE N'\';
+                IF @Ref IS NOT NULL
+                    SET @Reason = CONCAT(QUOTENAME(@IndexName), N' is named by ', @Ref, N', which would fail without it.');
+            END TRY
+            BEGIN CATCH
+                SET @Reason = CONCAT(N'Could not check what references ', QUOTENAME(@IndexName), N': ', ERROR_MESSAGE());
+            END CATCH;
+        END;
+
+        -- Why it can go. Either another index makes it redundant: it has the same leading keys,
+        -- covers the includes and filter, and keeps any uniqueness, so nothing is lost however short
+        -- the usage history. Or it is little used, which the usage DMVs show only over enough time,
+        -- so a low-use drop needs at least @MinUsageDays of usage statistics.
+        DECLARE @Basis nvarchar(4000), @MinUsageDays int = 7;
+        IF @Reason IS NULL
+        BEGIN
+            DECLARE @Redundant sysname, @Sig nvarchar(max), @DropUnique bit, @DropFilter nvarchar(max);
+            SELECT @DropUnique = is_unique, @DropFilter = filter_definition FROM sys.indexes WHERE object_id = @ObjectId AND index_id = @IndexId;
+            SET @Sig = (SELECT STRING_AGG(CONCAT(column_id, CASE WHEN is_descending_key = 1 THEN 'D' ELSE 'A' END), ',') WITHIN GROUP (ORDER BY key_ordinal)
+                        FROM sys.index_columns WHERE object_id = @ObjectId AND index_id = @IndexId AND key_ordinal > 0);
+
+            IF @Type = 2
+                SELECT TOP (1) @Redundant = i.name
+                FROM sys.indexes AS i
+                CROSS APPLY (SELECT STRING_AGG(CONCAT(ic.column_id, CASE WHEN ic.is_descending_key = 1 THEN 'D' ELSE 'A' END), ',') WITHIN GROUP (ORDER BY ic.key_ordinal) AS sig
+                             FROM sys.index_columns AS ic
+                             WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0) AS k
+                WHERE i.object_id = @ObjectId AND i.index_id <> @IndexId AND i.type IN (1, 2) AND i.is_disabled = 0 AND i.is_hypothetical = 0
+                  AND (i.has_filter = 0 OR i.filter_definition = @DropFilter)
+                  AND (k.sig = @Sig OR LEFT(k.sig, LEN(@Sig) + 1) = @Sig + ',')
+                  AND (@DropUnique = 0 OR (i.is_unique = 1 AND k.sig = @Sig))
+                  AND (i.type = 1   -- the clustered index covers every column
+                       OR NOT EXISTS (SELECT 1 FROM sys.index_columns AS inc
+                                      WHERE inc.object_id = @ObjectId AND inc.index_id = @IndexId AND inc.is_included_column = 1
+                                        AND NOT EXISTS (SELECT 1 FROM sys.index_columns AS ic
+                                                        WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.column_id = inc.column_id)))
+                ORDER BY i.index_id;
+
+            IF @Redundant IS NOT NULL
+                SET @Basis = CONCAT(N'Redundant: ', QUOTENAME(@Redundant), N' has the same leading keys and covers it.');
+            ELSE
+            BEGIN
+                DECLARE @Since datetime2(0), @SinceSource nvarchar(400), @ErrorLogsSearched int, @HasInstanceLogs bit;
+                BEGIN TRY
+                    EXEC AIIndexTuner.usp_UsageSince @Since = @Since OUTPUT, @SinceSource = @SinceSource OUTPUT,
+                                                     @ErrorLogsSearched = @ErrorLogsSearched OUTPUT, @HasInstanceLogs = @HasInstanceLogs OUTPUT;
+                END TRY
+                BEGIN CATCH
+                    SET @Since = NULL;
+                END CATCH;
+
+                IF @Since IS NULL
+                    SET @Reason = CONCAT(N'No other index covers ', QUOTENAME(@IndexName), N', and the period the usage statistics cover is unknown, so it is not dropped for low use.');
+                -- Without the error log, a reset after the times above (an ONLINE after OFFLINE, a
+                -- snapshot revert, an AUTO_CLOSE reopen) would not show, so the period may be shorter.
+                ELSE IF @HasInstanceLogs = 1 AND @ErrorLogsSearched = 0
+                    SET @Reason = CONCAT(N'No other index covers ', QUOTENAME(@IndexName), N', and the error log could not be read (that needs securityadmin or sysadmin, ',
+                                         N'and does not work inside INSERT ... EXEC), so the period the usage statistics cover cannot be confirmed for a low-use drop.');
+                ELSE IF @Since > DATEADD(DAY, -@MinUsageDays, SYSDATETIME())
+                    SET @Reason = CONCAT(N'No other index covers ', QUOTENAME(@IndexName), N', and the usage statistics cover only ',
+                                         AIIndexTuner.fn_FormatUptime(DATEDIFF(MINUTE, @Since, SYSDATETIME())), N' (since ', CONVERT(varchar(19), @Since, 120),
+                                         N', from ', @SinceSource, N'). An index is dropped for low use only after at least ', @MinUsageDays, N' days of them.');
+                ELSE
+                    SET @Basis = CONCAT(N'Low use over ', AIIndexTuner.fn_FormatUptime(DATEDIFF(MINUTE, @Since, SYSDATETIME())), N' of usage statistics (since ',
+                                        CONVERT(varchar(19), @Since, 120), N').');
+            END;
+        END;
+
+        IF @Reason IS NOT NULL
+        BEGIN
+            UPDATE AIIndexTuner.Recommendation SET Status = 'Skipped', StatusReason = @Reason WHERE RecommendationId = @RecommendationId;
+            RETURN;
+        END;
+
+        -- The CREATE that puts the index back, from the catalog.
+        SELECT @Undo = CONCAT(
+            N'CREATE ', CASE WHEN i.is_unique = 1 THEN N'UNIQUE ' END, N'NONCLUSTERED ', CASE WHEN i.type = 6 THEN N'COLUMNSTORE ' END,
+            N'INDEX ', QUOTENAME(i.name), N' ON ', @Target, N' (',
+            CASE WHEN i.type = 6
+                 THEN (SELECT STRING_AGG(CAST(QUOTENAME(c.name) AS nvarchar(max)), N', ') WITHIN GROUP (ORDER BY ic.index_column_id)
+                       FROM sys.index_columns AS ic INNER JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+                       WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id)
+                 ELSE (SELECT STRING_AGG(CAST(QUOTENAME(c.name) + CASE WHEN ic.is_descending_key = 1 THEN N' DESC' ELSE N' ASC' END AS nvarchar(max)), N', ')
+                              WITHIN GROUP (ORDER BY ic.key_ordinal)
+                       FROM sys.index_columns AS ic INNER JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+                       WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0) END,
+            N')',
+            CASE WHEN i.type = 2 THEN
+                (SELECT N' INCLUDE (' + STRING_AGG(CAST(QUOTENAME(c.name) AS nvarchar(max)), N', ') WITHIN GROUP (ORDER BY ic.index_column_id) + N')'
+                 FROM sys.index_columns AS ic INNER JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+                 WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 1) END,
+            CASE WHEN i.has_filter = 1 THEN N' WHERE ' + i.filter_definition END,
+            N' WITH (' + NULLIF(STUFF(CONCAT(
+                CASE WHEN i.fill_factor > 0 THEN CONCAT(N', FILLFACTOR = ', i.fill_factor) END,
+                CASE WHEN i.is_padded = 1 THEN N', PAD_INDEX = ON' END,
+                CASE WHEN i.ignore_dup_key = 1 THEN N', IGNORE_DUP_KEY = ON' END,
+                CASE WHEN i.type = 2 AND i.allow_row_locks = 0 THEN N', ALLOW_ROW_LOCKS = OFF' END,
+                CASE WHEN i.type = 2 AND i.allow_page_locks = 0 THEN N', ALLOW_PAGE_LOCKS = OFF' END,
+                CASE WHEN i.optimize_for_sequential_key = 1 THEN N', OPTIMIZE_FOR_SEQUENTIAL_KEY = ON' END,
+                CASE WHEN p.data_compression_desc IN (N'ROW', N'PAGE', N'COLUMNSTORE_ARCHIVE') THEN N', DATA_COMPRESSION = ' + p.data_compression_desc END),
+                1, 2, N''), N'') + N')',
+            N' ON ', QUOTENAME(ds.name),
+            CASE WHEN ds.type = 'PS' THEN
+                (SELECT N'(' + QUOTENAME(c.name) + N')'
+                 FROM sys.index_columns AS ic INNER JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+                 WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.partition_ordinal = 1) END,
+            N';')
+        FROM sys.indexes AS i
+        INNER JOIN sys.data_spaces AS ds ON ds.data_space_id = i.data_space_id
+        OUTER APPLY (SELECT TOP (1) data_compression_desc FROM sys.partitions
+                     WHERE object_id = i.object_id AND index_id = i.index_id ORDER BY partition_number) AS p
+        WHERE i.object_id = @ObjectId AND i.index_id = @IndexId;
+
+        SET @Ddl = CONCAT(N'DROP INDEX ', QUOTENAME(@IndexName), N' ON ', @Target, N';');
+
+        BEGIN TRY
+            EXEC sys.sp_executesql @Ddl;
+        END TRY
+        BEGIN CATCH
+            UPDATE AIIndexTuner.Recommendation
+            SET Status = 'Failed', StatusReason = ERROR_MESSAGE(), AppliedDDL = @Ddl
+            WHERE RecommendationId = @RecommendationId;
+            RETURN;
+        END CATCH;
+
+        UPDATE AIIndexTuner.Recommendation
+        SET Status = 'Applied', StatusReason = @Basis, AppliedDDL = @Ddl, UndoDDL = @Undo,
+            AppliedAt = SYSDATETIME(), AppliedBy = ORIGINAL_LOGIN()
+        WHERE RecommendationId = @RecommendationId;
+        RETURN;
+    END;
+
+    /* ===== CreateIndex ===== */
     DECLARE @Keys TABLE (ordinal int PRIMARY KEY, column_name nvarchar(4000), is_descending bit, column_id int);
     DECLARE @Includes TABLE (ordinal int PRIMARY KEY, column_name nvarchar(4000), column_id int);
 
-    IF @Reason IS NULL
+    -- A clustered columnstore index takes every column, so its column lists are not used.
+    IF @Reason IS NULL AND @IndexType <> 'CLUSTERED COLUMNSTORE'
     BEGIN
         IF ISJSON(@KeyColumns) = 0 OR ISJSON(ISNULL(@IncludeColumns, N'[]')) = 0
             SET @Reason = N'The key or include column list is not valid JSON.';
@@ -1749,6 +2044,14 @@ BEGIN
             SELECT CAST(i.[key] AS int), i.value
             FROM OPENJSON(ISNULL(@IncludeColumns, N'[]')) AS i;
 
+            -- A nonclustered columnstore index has one column list: keys, then any includes.
+            IF @IsColumnstore = 1
+            BEGIN
+                INSERT @Keys (ordinal, column_name, is_descending)
+                SELECT 10000 + ordinal, column_name, 0 FROM @Includes;
+                DELETE @Includes;
+            END;
+
             -- Exact catalog names only: no brackets, no expressions.
             UPDATE k SET column_id = c.column_id
             FROM @Keys AS k INNER JOIN sys.columns AS c ON c.object_id = @ObjectId AND c.name = k.column_name;
@@ -1757,10 +2060,12 @@ BEGIN
 
             IF NOT EXISTS (SELECT 1 FROM @Keys)
                 SET @Reason = N'The recommendation has no key columns.';
-            ELSE IF (SELECT COUNT(*) FROM @Keys) > 32
+            ELSE IF @IsColumnstore = 0 AND (SELECT COUNT(*) FROM @Keys) > 32
                 SET @Reason = N'More than 32 key columns.';
+            ELSE IF (SELECT COUNT(*) FROM @Keys) > 1024
+                SET @Reason = N'More than 1024 columns.';
             ELSE IF EXISTS (SELECT 1 FROM @Keys WHERE column_id IS NULL) OR EXISTS (SELECT 1 FROM @Includes WHERE column_id IS NULL)
-                SET @Reason = CONCAT(N'Unknown column(s) on ', QUOTENAME(@SchemaName), N'.', QUOTENAME(@TableName), N': ',
+                SET @Reason = CONCAT(N'Unknown column(s) on ', @Target, N': ',
                     (SELECT STRING_AGG(column_name, N', ') FROM (SELECT column_name FROM @Keys WHERE column_id IS NULL
                                                                  UNION ALL SELECT column_name FROM @Includes WHERE column_id IS NULL) AS u), N'.');
             ELSE IF EXISTS (SELECT column_id FROM @Keys GROUP BY column_id HAVING COUNT(*) > 1)
@@ -1770,8 +2075,17 @@ BEGIN
         END;
     END;
 
+    IF @Reason IS NULL AND @IsColumnstore = 1
+    BEGIN
+        DECLARE @Columnstore sysname = (SELECT TOP (1) name FROM sys.indexes WHERE object_id = @ObjectId AND type IN (5, 6));
+        IF @Columnstore IS NOT NULL
+            SET @Reason = CONCAT(N'The table already has columnstore index ', QUOTENAME(@Columnstore), N', and a table can have only one.');
+        ELSE IF @IndexType = 'CLUSTERED COLUMNSTORE' AND EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = @ObjectId AND type = 1)
+            SET @Reason = N'The table has a clustered rowstore index. Converting it to clustered columnstore replaces that index and any primary key on it, so it is recommend-only.';
+    END;
+
     -- An existing index with the same leading keys that already covers the includes makes this one redundant.
-    IF @Reason IS NULL
+    IF @Reason IS NULL AND @IsColumnstore = 0
     BEGIN
         DECLARE @KeySig nvarchar(max) = (SELECT STRING_AGG(CONCAT(column_id, CASE WHEN is_descending = 1 THEN 'D' ELSE 'A' END), ',') WITHIN GROUP (ORDER BY ordinal) FROM @Keys);
         DECLARE @Covering sysname;
@@ -1796,7 +2110,8 @@ BEGIN
     IF @Reason IS NULL
     BEGIN
         IF NULLIF(LTRIM(@IndexName), N'') IS NULL OR LEN(@IndexName) > 128
-            SET @IndexName = LEFT(CONCAT(N'IX_AIT_', @TableName, N'_', @RecommendationId), 128);
+            SET @IndexName = LEFT(CONCAT(CASE @IndexType WHEN 'NONCLUSTERED COLUMNSTORE' THEN N'NCCI' WHEN 'CLUSTERED COLUMNSTORE' THEN N'CCI' ELSE N'IX' END,
+                                         N'_AIT_', @TableName, N'_', @RecommendationId), 128);
 
         IF EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = @ObjectId AND name = @IndexName)
             SET @Reason = CONCAT(N'An index named ', QUOTENAME(@IndexName), N' already exists on the table.');
@@ -1815,23 +2130,28 @@ BEGIN
     -- Online index operations: Enterprise (and Developer), Azure SQL Database and Managed Instance.
     IF @EngineEdition IN (3, 5, 8)
         SET @Options += N', ONLINE = ON';
-    IF @FillFactor BETWEEN 1 AND 100
+    IF @IsColumnstore = 0 AND @FillFactor BETWEEN 1 AND 100
         SET @Options += CONCAT(N', FILLFACTOR = ', @FillFactor);
-    IF @Compression IN ('NONE', 'ROW', 'PAGE')
+    IF @IsColumnstore = 0 AND @Compression IN ('NONE', 'ROW', 'PAGE')
         SET @Options += CONCAT(N', DATA_COMPRESSION = ', @Compression);
 
     SET @Ddl = CONCAT(
-        N'CREATE ', CASE WHEN @IsUnique = 1 THEN N'UNIQUE ' ELSE N'' END, N'NONCLUSTERED INDEX ', QUOTENAME(@IndexName),
-        N' ON ', QUOTENAME(@SchemaName), N'.', QUOTENAME(@TableName), N' (',
-        (SELECT STRING_AGG(QUOTENAME(c.name) + CASE WHEN k.is_descending = 1 THEN N' DESC' ELSE N' ASC' END, N', ') WITHIN GROUP (ORDER BY k.ordinal)
-         FROM @Keys AS k INNER JOIN sys.columns AS c ON c.object_id = @ObjectId AND c.column_id = k.column_id),
-        N')',
+        N'CREATE ',
+        CASE @IndexType WHEN 'CLUSTERED COLUMNSTORE' THEN N'CLUSTERED COLUMNSTORE'
+                        WHEN 'NONCLUSTERED COLUMNSTORE' THEN N'NONCLUSTERED COLUMNSTORE'
+                        ELSE CASE WHEN @IsUnique = 1 THEN N'UNIQUE ' ELSE N'' END + N'NONCLUSTERED' END,
+        N' INDEX ', QUOTENAME(@IndexName), N' ON ', @Target,
+        CASE WHEN @IndexType <> 'CLUSTERED COLUMNSTORE' THEN
+            N' (' + (SELECT STRING_AGG(QUOTENAME(c.name) + CASE WHEN @IsColumnstore = 1 THEN N'' WHEN k.is_descending = 1 THEN N' DESC' ELSE N' ASC' END, N', ')
+                            WITHIN GROUP (ORDER BY k.ordinal)
+                     FROM @Keys AS k INNER JOIN sys.columns AS c ON c.object_id = @ObjectId AND c.column_id = k.column_id) + N')' END,
         CASE WHEN EXISTS (SELECT 1 FROM @Includes)
              THEN N' INCLUDE (' + (SELECT STRING_AGG(QUOTENAME(c.name), N', ') WITHIN GROUP (ORDER BY i.ordinal)
                                    FROM @Includes AS i INNER JOIN sys.columns AS c ON c.object_id = @ObjectId AND c.column_id = i.column_id) + N')'
              ELSE N'' END,
         CASE WHEN @Options <> N'' THEN N' WITH (' + STUFF(@Options, 1, 2, N'') + N')' ELSE N'' END,
         N';');
+    SET @Undo = CONCAT(N'DROP INDEX ', QUOTENAME(@IndexName), N' ON ', @Target, N';');
 
     BEGIN TRY
         EXEC sys.sp_executesql @Ddl;
@@ -1859,7 +2179,7 @@ BEGIN
     END CATCH;
 
     UPDATE AIIndexTuner.Recommendation
-    SET Status = 'Applied', StatusReason = @TagNote, IndexName = @IndexName, AppliedDDL = @Ddl,
+    SET Status = 'Applied', StatusReason = @TagNote, IndexName = @IndexName, IndexType = @IndexType, AppliedDDL = @Ddl, UndoDDL = @Undo,
         AppliedAt = SYSDATETIME(), AppliedBy = ORIGINAL_LOGIN()
     WHERE RecommendationId = @RecommendationId;
 END;
@@ -1884,6 +2204,16 @@ GO
     CREATE does the same, then applies the CreateIndex recommendations that pass validation (see
     AIIndexTuner.usp_ApplyRecommendation). Every other recommendation stays for you to review.
 
+    Change controls (each restricts the prompt, and is enforced again when applying):
+        @AllowColumnstore   NULL (default) columnstore indexes may be recommended but are not created;
+                            1 = they may also be created; 0 = they are not recommended or created.
+        @AllowDropIndex     NULL (default) index drops may be recommended but are not run;
+                            1 = they may also be run; 0 = they are not recommended or run.
+        @MaxNewIndexes      at most this many new indexes are recommended and created (NULL = no limit).
+
+    A recommend-only (NULL) change can be applied after review with sp_AIIndexTuner_Apply and the
+    matching setting set to 1. A 0 cannot be overridden later.
+
     Testing and troubleshooting:
         @CollectOnly = 1    returns the collected data and the system prompt; no AI call, no run row.
         @TestResponse = N'{...}'
@@ -1902,7 +2232,10 @@ CREATE OR ALTER PROCEDURE dbo.sp_AIIndexTuner
     @Mode         varchar(10) = 'RECOMMEND',
     @CollectOnly  bit = 0,
     @TestResponse nvarchar(max) = NULL,
-    @CollectedData nvarchar(max) = NULL
+    @CollectedData nvarchar(max) = NULL,
+    @AllowColumnstore bit = NULL,
+    @AllowDropIndex   bit = NULL,
+    @MaxNewIndexes    int = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -1928,7 +2261,11 @@ BEGIN
            @Endpoint = Endpoint, @Deployment = Deployment, @Effort = ReasoningEffort
     FROM AIIndexTuner.Config WHERE ConfigId = 1;
 
-    DECLARE @Data nvarchar(max), @SystemPrompt nvarchar(max) = AIIndexTuner.fn_SystemPrompt();
+    IF @MaxNewIndexes < 0
+        THROW 50209, N'@MaxNewIndexes must be 0 or more, or NULL for no limit.', 1;
+
+    DECLARE @Data nvarchar(max),
+            @SystemPrompt nvarchar(max) = AIIndexTuner.fn_SystemPrompt() + AIIndexTuner.fn_ChangeRules(@AllowColumnstore, @AllowDropIndex, @MaxNewIndexes);
 
     IF @CollectedData IS NOT NULL AND (@CollectOnly = 1 OR LEN(@CollectedData) = 0)
         THROW 50208, N'@CollectedData cannot be empty, and cannot be combined with @CollectOnly = 1.', 1;
@@ -1945,13 +2282,15 @@ BEGIN
         THROW 50206, N'AIIndexTuner.Config has no row. Run setup/Configure-Endpoint.sql first.', 1;
 
     DECLARE @RunId int;
-    INSERT AIIndexTuner.Run (Mode, SchemaName, TableName, Endpoint, Deployment, ApiShape, ReasoningEffort, SystemPromptHash)
+    INSERT AIIndexTuner.Run (Mode, SchemaName, TableName, Endpoint, Deployment, ApiShape, ReasoningEffort, SystemPromptHash,
+                             AllowColumnstore, AllowDropIndex, MaxNewIndexes)
     VALUES (@Mode, @SchemaName, @TableName,
             CASE WHEN @TestResponse IS NULL THEN @Endpoint END,
             CASE WHEN @TestResponse IS NULL THEN @Deployment END,
             CASE WHEN @TestResponse IS NULL THEN 'OpenAIResponses' ELSE 'Test' END,
             CASE WHEN @TestResponse IS NULL THEN @Effort END,
-            CONVERT(char(64), HASHBYTES('SHA2_256', @SystemPrompt), 2));
+            CONVERT(char(64), HASHBYTES('SHA2_256', @SystemPrompt), 2),
+            @AllowColumnstore, @AllowDropIndex, @MaxNewIndexes);
     SET @RunId = SCOPE_IDENTITY();
 
     BEGIN TRY
@@ -2006,11 +2345,13 @@ BEGIN
         END;
 
         INSERT AIIndexTuner.Recommendation
-            (RunId, Priority, Category, Title, SchemaName, TableName, IndexName, KeyColumns, IncludeColumns, FilterPredicate,
+            (RunId, Priority, Category, Title, SchemaName, TableName, IndexName, IndexType, KeyColumns, IncludeColumns, FilterPredicate,
              IsUnique, [FillFactor], DataCompression, EstimatedSizeMB, Confidence, Rationale, BenefitingQueries, Script)
         SELECT @RunId, r.priority,
                CASE WHEN r.category IN ('CreateIndex', 'DropIndex', 'ConsolidateIndex', 'RebuildIndex', 'Constraint', 'Statistics', 'Setting', 'QueryChange') THEN r.category ELSE 'Other' END,
                LEFT(r.title, 400), LEFT(r.schema_name, 128), LEFT(r.table_name, 128), LEFT(r.index_name, 128),
+               CASE WHEN r.category = 'CreateIndex'
+                    THEN CASE WHEN UPPER(r.index_type) IN ('NONCLUSTERED COLUMNSTORE', 'CLUSTERED COLUMNSTORE') THEN UPPER(r.index_type) ELSE 'NONCLUSTERED' END END,
                ISNULL(r.key_columns, N'[]'), ISNULL(r.include_columns, N'[]'), LEFT(r.filter_predicate, 4000),
                r.is_unique,
                CASE WHEN r.fill_factor BETWEEN 1 AND 100 THEN r.fill_factor END,
@@ -2020,7 +2361,7 @@ BEGIN
                r.rationale, r.benefiting_queries, r.script
         FROM OPENJSON(@Text, '$.recommendations')
              WITH (priority int, category varchar(30), title nvarchar(4000), schema_name nvarchar(4000), table_name nvarchar(4000),
-                   index_name nvarchar(4000), key_columns nvarchar(max) AS JSON, include_columns nvarchar(max) AS JSON,
+                   index_name nvarchar(4000), index_type varchar(40), key_columns nvarchar(max) AS JSON, include_columns nvarchar(max) AS JSON,
                    filter_predicate nvarchar(max), is_unique bit, fill_factor int, data_compression varchar(20),
                    estimated_size_mb float, confidence varchar(20), rationale nvarchar(max),
                    benefiting_queries nvarchar(max) AS JSON, script nvarchar(max)) AS r;
@@ -2044,9 +2385,14 @@ BEGIN
     IF @Mode = 'CREATE'
     BEGIN
         DECLARE @RecId int, @ApplyStarted datetime2(7) = SYSDATETIME();
+        -- New rowstore indexes, plus the columnstore indexes and drops this run has a setting for.
+        -- Recommend-only ones (setting NULL) stay Recommended, for review. A change the run does not
+        -- allow (0) is still passed, so that it is marked Skipped if the model recommended it anyway.
         DECLARE apply_cur CURSOR LOCAL FAST_FORWARD FOR
             SELECT RecommendationId FROM AIIndexTuner.Recommendation
-            WHERE RunId = @RunId AND Category = 'CreateIndex'
+            WHERE RunId = @RunId
+              AND ((Category = 'CreateIndex' AND (IndexType = 'NONCLUSTERED' OR @AllowColumnstore IS NOT NULL))
+                   OR (Category = 'DropIndex' AND @AllowDropIndex IS NOT NULL))
             ORDER BY Priority, RecommendationId;
         OPEN apply_cur;
         FETCH NEXT FROM apply_cur INTO @RecId;
@@ -2065,8 +2411,8 @@ BEGIN
            N'Free and open source from AI SQL Tuner. For deadlocks, code review, server health, query tuning and more, see https://www.aisqltuner.com' AS MoreFrom
     FROM AIIndexTuner.Run AS r WHERE r.RunId = @RunId;
 
-    SELECT RecommendationId, Priority, Category, Title, SchemaName, TableName, IndexName, Confidence, EstimatedSizeMB,
-           Status, StatusReason, Rationale, Script, AppliedDDL
+    SELECT RecommendationId, Priority, Category, Title, SchemaName, TableName, IndexName, IndexType, Confidence, EstimatedSizeMB,
+           Status, StatusReason, Rationale, Script, AppliedDDL, UndoDDL
     FROM AIIndexTuner.Recommendation
     WHERE RunId = @RunId
     ORDER BY Priority, RecommendationId;
@@ -2077,34 +2423,61 @@ GO
     dbo.sp_AIIndexTuner_Apply: apply stored recommendations after reviewing them.
 
         EXEC dbo.sp_AIIndexTuner_Apply @RecommendationId = 42;   -- one recommendation
-        EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7;               -- every CreateIndex of a run
+        EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7;               -- the new rowstore indexes of a run
+        EXEC dbo.sp_AIIndexTuner_Apply @RecommendationId = 43, @AllowDropIndex = 1;
+        EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @AllowColumnstore = 1, @AllowDropIndex = 1;
+
+    @AllowColumnstore and @AllowDropIndex = 1 apply changes that the run left recommend-only (NULL);
+    0 blocks them. Neither can override a run that did not allow the change (0). @MaxNewIndexes
+    limits the new indexes of a run, together with the run's own limit.
 */
 CREATE OR ALTER PROCEDURE dbo.sp_AIIndexTuner_Apply
     @RecommendationId int = NULL,
-    @RunId            int = NULL
+    @RunId            int = NULL,
+    @AllowColumnstore bit = NULL,
+    @AllowDropIndex   bit = NULL,
+    @MaxNewIndexes    int = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
 
     IF (@RecommendationId IS NULL AND @RunId IS NULL) OR (@RecommendationId IS NOT NULL AND @RunId IS NOT NULL)
         THROW 50301, N'Pass either @RecommendationId or @RunId.', 1;
+    IF @MaxNewIndexes < 0
+        THROW 50302, N'@MaxNewIndexes must be 0 or more, or NULL for no limit.', 1;
 
-    DECLARE @Ids TABLE (RecommendationId int PRIMARY KEY);
+    DECLARE @Ids TABLE (RecommendationId int PRIMARY KEY, Priority int);
 
     IF @RecommendationId IS NOT NULL
-        INSERT @Ids VALUES (@RecommendationId);
+        INSERT @Ids VALUES (@RecommendationId, NULL);
     ELSE
-        INSERT @Ids SELECT RecommendationId FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Category = 'CreateIndex';
+        -- As in sp_AIIndexTuner CREATE mode, with this call's settings added to the run's.
+        INSERT @Ids
+        SELECT r.RecommendationId, r.Priority
+        FROM AIIndexTuner.Recommendation AS r
+        INNER JOIN AIIndexTuner.Run AS run ON run.RunId = r.RunId
+        WHERE r.RunId = @RunId
+          AND ((r.Category = 'CreateIndex' AND (ISNULL(r.IndexType, 'NONCLUSTERED') = 'NONCLUSTERED'
+                                                OR run.AllowColumnstore IS NOT NULL OR @AllowColumnstore IS NOT NULL))
+               OR (r.Category = 'DropIndex' AND (run.AllowDropIndex IS NOT NULL OR @AllowDropIndex IS NOT NULL)));
 
-    DECLARE @Id int = (SELECT MIN(RecommendationId) FROM @Ids);
-    WHILE @Id IS NOT NULL
+    -- In priority order, so a @MaxNewIndexes limit keeps the most important indexes.
+    DECLARE @Id int;
+    DECLARE apply_cur CURSOR LOCAL FAST_FORWARD FOR
+        SELECT RecommendationId FROM @Ids ORDER BY Priority, RecommendationId;
+    OPEN apply_cur;
+    FETCH NEXT FROM apply_cur INTO @Id;
+    WHILE @@FETCH_STATUS = 0
     BEGIN
-        EXEC AIIndexTuner.usp_ApplyRecommendation @RecommendationId = @Id;
-        SET @Id = (SELECT MIN(RecommendationId) FROM @Ids WHERE RecommendationId > @Id);
+        EXEC AIIndexTuner.usp_ApplyRecommendation @RecommendationId = @Id, @AllowColumnstore = @AllowColumnstore,
+                                                  @AllowDropIndex = @AllowDropIndex, @MaxNewIndexes = @MaxNewIndexes;
+        FETCH NEXT FROM apply_cur INTO @Id;
     END;
+    CLOSE apply_cur;
+    DEALLOCATE apply_cur;
 
     SELECT r.RecommendationId, r.RunId, r.Priority, r.Category, r.Title, r.SchemaName, r.TableName, r.IndexName,
-           r.Status, r.StatusReason, r.AppliedDDL, r.AppliedAt
+           r.Status, r.StatusReason, r.AppliedDDL, r.AppliedAt, r.UndoDDL
     FROM AIIndexTuner.Recommendation AS r
     INNER JOIN @Ids AS i ON i.RecommendationId = r.RecommendationId
     ORDER BY r.Priority, r.RecommendationId;

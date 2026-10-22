@@ -2,6 +2,92 @@ SET ANSI_NULLS ON;
 SET QUOTED_IDENTIFIER ON;
 GO
 /*
+    AIIndexTuner.usp_UsageSince
+
+    The period the usage DMVs cover for the current database (GetUsageStatisticsSinceAsync in the
+    desktop collector). Usage DMVs and the plan cache start empty when SQL Server starts, and for one
+    database when it is restored, attached, reverted from a snapshot, brought ONLINE or reopened
+    under AUTO_CLOSE. @Since is the latest of those times that can be read; @SinceSource names it.
+
+    Used by usp_CollectData for the "Database Usage Statistics Since" line, and by
+    usp_ApplyRecommendation, which drops an index for low use only after a long enough period.
+*/
+CREATE OR ALTER PROCEDURE AIIndexTuner.usp_UsageSince
+    @Since              datetime2(0)  = NULL OUTPUT,
+    @SinceSource        nvarchar(400) = NULL OUTPUT,
+    @StartTime          datetime2(0)  = NULL OUTPUT,
+    @AutoClose          bit           = NULL OUTPUT,
+    @RestoreHistoryRead bit           = NULL OUTPUT,
+    @LastStartup        datetime2(0)  = NULL OUTPUT,
+    @ErrorLogsSearched  int           = NULL OUTPUT,
+    @HasInstanceLogs    bit           = NULL OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @CreateDate datetime2(0), @LastRestore datetime2(0);
+    SELECT @Since = NULL, @SinceSource = NULL, @StartTime = NULL, @RestoreHistoryRead = 0, @LastStartup = NULL, @ErrorLogsSearched = 0,
+           -- Azure SQL Database, Synapse and Fabric have no msdb restore history or error log to read.
+           @HasInstanceLogs = CASE WHEN CAST(SERVERPROPERTY('EngineEdition') AS int) IN (5, 6, 11, 12) THEN 0 ELSE 1 END;
+
+    BEGIN TRY
+        SELECT @StartTime = sqlserver_start_time FROM sys.dm_os_sys_info;
+    END TRY
+    BEGIN CATCH
+        SET @StartTime = NULL;
+    END CATCH;
+
+    SELECT @CreateDate = create_date, @AutoClose = is_auto_close_on FROM sys.databases WHERE database_id = DB_ID();
+
+    IF @HasInstanceLogs = 1
+    BEGIN
+        BEGIN TRY
+            SELECT @LastRestore = MAX(restore_date) FROM msdb.dbo.restorehistory WHERE destination_database_name = DB_NAME();
+            SET @RestoreHistoryRead = 1;
+        END TRY
+        BEGIN CATCH
+            SET @LastRestore = NULL;
+        END CATCH;
+
+        -- Newest error log first, stopping at the first log with a startup message for this database.
+        -- Reading the error log needs securityadmin (or sysadmin). The closing quote in the search keeps
+        -- 'Sales' from matching 'Sales2'.
+        IF ISNULL(IS_SRVROLEMEMBER(N'securityadmin'), 0) = 1 OR ISNULL(IS_SRVROLEMEMBER(N'sysadmin'), 0) = 1
+        BEGIN
+            DECLARE @Log int = 0, @Search nvarchar(4000) = CONCAT(N'Starting up database ''', DB_NAME(), N'''.');
+            CREATE TABLE #ErrorLog (LogDate datetime, ProcessInfo nvarchar(100), [Text] nvarchar(max));
+            WHILE @Log < 7 AND @LastStartup IS NULL
+            BEGIN
+                BEGIN TRY
+                    TRUNCATE TABLE #ErrorLog;
+                    INSERT #ErrorLog (LogDate, ProcessInfo, [Text]) EXEC sys.sp_readerrorlog @p1 = @Log, @p2 = 1, @p3 = @Search;
+                    SELECT @LastStartup = MAX(LogDate) FROM #ErrorLog;
+                    SET @ErrorLogsSearched += 1;
+                END TRY
+                BEGIN CATCH
+                    BREAK;   -- past the oldest archive the log does not exist; any other error also ends the search
+                END CATCH;
+                SET @Log += 1;
+            END;
+            DROP TABLE #ErrorLog;
+        END;
+    END;
+
+    -- Later candidates win ties, so the error log, which names every kind of reset, is preferred.
+    IF @StartTime IS NOT NULL SELECT @Since = @StartTime, @SinceSource = N'the SQL Server start time, the latest reset found';
+    IF @CreateDate IS NOT NULL AND (@Since IS NULL OR @CreateDate >= @Since)
+        SELECT @Since = @CreateDate, @SinceSource = N'its create date in sys.databases, which an attach or a restore under a new name sets';
+    IF @LastRestore IS NOT NULL AND (@Since IS NULL OR @LastRestore >= @Since)
+        SELECT @Since = @LastRestore, @SinceSource = N'its latest restore in msdb.dbo.restorehistory';
+    IF @LastStartup IS NOT NULL AND (@Since IS NULL OR @LastStartup >= @Since)
+        SELECT @Since = @LastStartup, @SinceSource = N'its latest "Starting up database" message in the SQL Server error log, which is written whenever it starts: at a server restart, a restore, an attach, a database snapshot revert, an ONLINE after OFFLINE, or an AUTO_CLOSE reopen';
+END;
+GO
+
+SET ANSI_NULLS ON;
+SET QUOTED_IDENTIFIER ON;
+GO
+/*
     AIIndexTuner.usp_CollectData
 
     Collects the Index Tuning diagnostics for the current database into one text payload for the
@@ -60,66 +146,14 @@ BEGIN
         N'Major Version: ', CASE WHEN @MajorVersion >= 17 THEN N'SQL Server 2025' WHEN @MajorVersion = 16 THEN N'SQL Server 2022' ELSE CONCAT(N'Version ', @MajorVersion) END, @nl,
         N'Full Version: ', @@VERSION, @nl);
 
-    /* Start time and the period the usage DMVs cover (GetUsageStatisticsSinceAsync). Usage DMVs and
-       the plan cache start empty when SQL Server starts, and for one database when it is restored,
-       attached, reverted from a snapshot, brought ONLINE or reopened under AUTO_CLOSE. */
-    DECLARE @StartTime datetime2(0), @Now datetime2(0) = SYSDATETIME(), @CreateDate datetime2(0), @AutoClose bit,
-            @LastRestore datetime2(0), @RestoreHistoryRead bit = 0, @LastStartup datetime2(0), @ErrorLogsSearched int = 0,
-            @Since datetime2(0), @SinceSource nvarchar(400),
-            -- Azure SQL Database, Synapse and Fabric have no msdb restore history or error log to read.
-            @HasInstanceLogs bit = CASE WHEN CAST(SERVERPROPERTY('EngineEdition') AS int) IN (5, 6, 11, 12) THEN 0 ELSE 1 END;
+    /* Start time and the period the usage DMVs cover (GetUsageStatisticsSinceAsync); see usp_UsageSince. */
+    DECLARE @StartTime datetime2(0), @Now datetime2(0) = SYSDATETIME(), @AutoClose bit, @RestoreHistoryRead bit,
+            @LastStartup datetime2(0), @ErrorLogsSearched int, @Since datetime2(0), @SinceSource nvarchar(400), @HasInstanceLogs bit;
 
-    BEGIN TRY
-        SELECT @StartTime = sqlserver_start_time FROM sys.dm_os_sys_info;
-    END TRY
-    BEGIN CATCH
-        SET @StartTime = NULL;
-    END CATCH;
-
-    SELECT @CreateDate = create_date, @AutoClose = is_auto_close_on FROM sys.databases WHERE database_id = DB_ID();
-
-    IF @HasInstanceLogs = 1
-    BEGIN
-        BEGIN TRY
-            SELECT @LastRestore = MAX(restore_date) FROM msdb.dbo.restorehistory WHERE destination_database_name = DB_NAME();
-            SET @RestoreHistoryRead = 1;
-        END TRY
-        BEGIN CATCH
-            SET @LastRestore = NULL;
-        END CATCH;
-
-        -- Newest error log first, stopping at the first log with a startup message for this database.
-        -- Reading the error log needs securityadmin (or sysadmin). The closing quote in the search keeps
-        -- 'Sales' from matching 'Sales2'.
-        IF ISNULL(IS_SRVROLEMEMBER(N'securityadmin'), 0) = 1 OR ISNULL(IS_SRVROLEMEMBER(N'sysadmin'), 0) = 1
-        BEGIN
-            DECLARE @Log int = 0, @Search nvarchar(4000) = CONCAT(N'Starting up database ''', DB_NAME(), N'''.');
-            CREATE TABLE #ErrorLog (LogDate datetime, ProcessInfo nvarchar(100), [Text] nvarchar(max));
-            WHILE @Log < 7 AND @LastStartup IS NULL
-            BEGIN
-                BEGIN TRY
-                    TRUNCATE TABLE #ErrorLog;
-                    INSERT #ErrorLog (LogDate, ProcessInfo, [Text]) EXEC sys.sp_readerrorlog @p1 = @Log, @p2 = 1, @p3 = @Search;
-                    SELECT @LastStartup = MAX(LogDate) FROM #ErrorLog;
-                    SET @ErrorLogsSearched += 1;
-                END TRY
-                BEGIN CATCH
-                    BREAK;   -- past the oldest archive the log does not exist; any other error also ends the search
-                END CATCH;
-                SET @Log += 1;
-            END;
-            DROP TABLE #ErrorLog;
-        END;
-    END;
-
-    -- Later candidates win ties, so the error log, which names every kind of reset, is preferred.
-    IF @StartTime IS NOT NULL SELECT @Since = @StartTime, @SinceSource = N'the SQL Server start time, the latest reset found';
-    IF @CreateDate IS NOT NULL AND (@Since IS NULL OR @CreateDate >= @Since)
-        SELECT @Since = @CreateDate, @SinceSource = N'its create date in sys.databases, which an attach or a restore under a new name sets';
-    IF @LastRestore IS NOT NULL AND (@Since IS NULL OR @LastRestore >= @Since)
-        SELECT @Since = @LastRestore, @SinceSource = N'its latest restore in msdb.dbo.restorehistory';
-    IF @LastStartup IS NOT NULL AND (@Since IS NULL OR @LastStartup >= @Since)
-        SELECT @Since = @LastStartup, @SinceSource = N'its latest "Starting up database" message in the SQL Server error log, which is written whenever it starts: at a server restart, a restore, an attach, a database snapshot revert, an ONLINE after OFFLINE, or an AUTO_CLOSE reopen';
+    EXEC AIIndexTuner.usp_UsageSince
+        @Since = @Since OUTPUT, @SinceSource = @SinceSource OUTPUT, @StartTime = @StartTime OUTPUT, @AutoClose = @AutoClose OUTPUT,
+        @RestoreHistoryRead = @RestoreHistoryRead OUTPUT, @LastStartup = @LastStartup OUTPUT,
+        @ErrorLogsSearched = @ErrorLogsSearched OUTPUT, @HasInstanceLogs = @HasInstanceLogs OUTPUT;
 
     SET @Data += CASE WHEN @StartTime IS NOT NULL
         THEN CONCAT(N'SQL Server Start Time: ', CONVERT(varchar(19), @StartTime, 120), N' (server local time); uptime ',
