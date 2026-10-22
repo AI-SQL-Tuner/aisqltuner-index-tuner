@@ -128,6 +128,47 @@ BEGIN
 END;
 GO
 
+/* ===== Helpers ===== */
+
+/* Uptime in the largest sensible unit: "3.2 days", "5.5 hours" or "40 minutes" (as FormatUptime in the desktop collector). */
+CREATE OR ALTER FUNCTION AIIndexTuner.fn_FormatUptime(@Minutes int)
+RETURNS nvarchar(40)
+AS
+BEGIN
+    SET @Minutes = CASE WHEN @Minutes < 0 THEN 0 ELSE @Minutes END;
+    RETURN CASE
+        WHEN @Minutes >= 2 * 24 * 60 THEN CONCAT(CAST(ROUND(@Minutes / 1440.0, 1) AS decimal(10, 1)), N' days')
+        WHEN @Minutes >= 120 THEN CONCAT(CAST(ROUND(@Minutes / 60.0, 1) AS decimal(10, 1)), N' hours')
+        WHEN @Minutes = 1 THEN N'1 minute'
+        ELSE CONCAT(@Minutes, N' minutes')
+    END;
+END;
+GO
+
+/* Query text on one line: CR/LF to spaces, runs of spaces collapsed, trimmed, cut to @MaxChars (as CleanAndTruncate). */
+CREATE OR ALTER FUNCTION AIIndexTuner.fn_CleanText(@Text nvarchar(max), @MaxChars int)
+RETURNS nvarchar(max)
+AS
+BEGIN
+    IF @Text IS NULL RETURN NULL;
+    SET @Text = REPLACE(REPLACE(REPLACE(@Text, NCHAR(13), N' '), NCHAR(10), N' '), NCHAR(9), N' ');
+    WHILE CHARINDEX(N'  ', @Text) > 0
+        SET @Text = REPLACE(@Text, N'  ', N' ');
+    SET @Text = LTRIM(RTRIM(@Text));
+    RETURN CASE WHEN LEN(@Text) > @MaxChars THEN LEFT(@Text, @MaxChars) + N'...' ELSE @Text END;
+END;
+GO
+
+/* A literal made safe for LIKE ... ESCAPE N'\'. Plan XML object names are bracketed, and an
+   unescaped '[' would open a character class. */
+CREATE OR ALTER FUNCTION AIIndexTuner.fn_EscapeLike(@Value nvarchar(400))
+RETURNS nvarchar(800)
+AS
+BEGIN
+    RETURN REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@Value, N'\', N'\\'), N'%', N'\%'), N'_', N'\_'), N'[', N'\['), N']', N'\]');
+END;
+GO
+
 /* ===== 02_usp_CollectData.sql ===== */
 SET ANSI_NULLS ON;
 SET QUOTED_IDENTIFIER ON;
@@ -142,10 +183,13 @@ GO
     Each section runs in its own TRY...CATCH: a section that fails adds a warning line and the run
     goes on, as the C# collector does. Rows are written as JSON arrays.
 
-    Not collected yet (the full product's IndexTuning goal has them): Query Store workload, write
-    mix and forced plan failures, index page density, index operational hotspots, automatic tuning
-    options, CE feedback, OPTIMIZED_SP_EXECUTESQL settings, and the error-log part of
-    "Database Usage Statistics Since".
+    Differences from the desktop collector:
+      - No per-section command timeouts (T-SQL has none). Work is bounded by row caps instead,
+        including the 20,000-plan cap on Query Store scope resolution.
+      - Only the SQL Server 2017+ Query Store query (with wait stats), since only SQL Server 2025
+        and Azure SQL are supported.
+      - The plan cache and the missing-index candidate lists are limited to this database
+        (AI-SQL-Tuner/aisqltuner#232).
 */
 CREATE OR ALTER PROCEDURE AIIndexTuner.usp_CollectData
     @SchemaName       sysname = NULL,
@@ -188,9 +232,14 @@ BEGIN
         N'Major Version: ', CASE WHEN @MajorVersion >= 17 THEN N'SQL Server 2025' WHEN @MajorVersion = 16 THEN N'SQL Server 2022' ELSE CONCAT(N'Version ', @MajorVersion) END, @nl,
         N'Full Version: ', @@VERSION, @nl);
 
-    /* Start time and the period the usage DMVs cover. */
-    DECLARE @StartTime datetime2(0), @Now datetime2(0) = SYSDATETIME(), @CreateDate datetime2(0),
-            @LastRestore datetime2(0), @Since datetime2(0), @SinceSource nvarchar(400);
+    /* Start time and the period the usage DMVs cover (GetUsageStatisticsSinceAsync). Usage DMVs and
+       the plan cache start empty when SQL Server starts, and for one database when it is restored,
+       attached, reverted from a snapshot, brought ONLINE or reopened under AUTO_CLOSE. */
+    DECLARE @StartTime datetime2(0), @Now datetime2(0) = SYSDATETIME(), @CreateDate datetime2(0), @AutoClose bit,
+            @LastRestore datetime2(0), @RestoreHistoryRead bit = 0, @LastStartup datetime2(0), @ErrorLogsSearched int = 0,
+            @Since datetime2(0), @SinceSource nvarchar(400),
+            -- Azure SQL Database, Synapse and Fabric have no msdb restore history or error log to read.
+            @HasInstanceLogs bit = CASE WHEN CAST(SERVERPROPERTY('EngineEdition') AS int) IN (5, 6, 11, 12) THEN 0 ELSE 1 END;
 
     BEGIN TRY
         SELECT @StartTime = sqlserver_start_time FROM sys.dm_os_sys_info;
@@ -199,42 +248,81 @@ BEGIN
         SET @StartTime = NULL;
     END CATCH;
 
-    SELECT @CreateDate = create_date FROM sys.databases WHERE database_id = DB_ID();
+    SELECT @CreateDate = create_date, @AutoClose = is_auto_close_on FROM sys.databases WHERE database_id = DB_ID();
 
-    IF @EngineEdition NOT IN (5, 12)   -- Azure SQL Database and Fabric have no msdb restore history
+    IF @HasInstanceLogs = 1
     BEGIN
         BEGIN TRY
             SELECT @LastRestore = MAX(restore_date) FROM msdb.dbo.restorehistory WHERE destination_database_name = DB_NAME();
+            SET @RestoreHistoryRead = 1;
         END TRY
         BEGIN CATCH
             SET @LastRestore = NULL;
         END CATCH;
+
+        -- Newest error log first, stopping at the first log with a startup message for this database.
+        -- Reading the error log needs securityadmin (or sysadmin). The closing quote in the search keeps
+        -- 'Sales' from matching 'Sales2'.
+        IF ISNULL(IS_SRVROLEMEMBER(N'securityadmin'), 0) = 1 OR ISNULL(IS_SRVROLEMEMBER(N'sysadmin'), 0) = 1
+        BEGIN
+            DECLARE @Log int = 0, @Search nvarchar(4000) = CONCAT(N'Starting up database ''', DB_NAME(), N'''.');
+            CREATE TABLE #ErrorLog (LogDate datetime, ProcessInfo nvarchar(100), [Text] nvarchar(max));
+            WHILE @Log < 7 AND @LastStartup IS NULL
+            BEGIN
+                BEGIN TRY
+                    TRUNCATE TABLE #ErrorLog;
+                    INSERT #ErrorLog (LogDate, ProcessInfo, [Text]) EXEC sys.sp_readerrorlog @p1 = @Log, @p2 = 1, @p3 = @Search;
+                    SELECT @LastStartup = MAX(LogDate) FROM #ErrorLog;
+                    SET @ErrorLogsSearched += 1;
+                END TRY
+                BEGIN CATCH
+                    BREAK;   -- past the oldest archive the log does not exist; any other error also ends the search
+                END CATCH;
+                SET @Log += 1;
+            END;
+            DROP TABLE #ErrorLog;
+        END;
     END;
 
-    -- Later candidates win ties, matching the C# collector's order.
+    -- Later candidates win ties, so the error log, which names every kind of reset, is preferred.
     IF @StartTime IS NOT NULL SELECT @Since = @StartTime, @SinceSource = N'the SQL Server start time, the latest reset found';
     IF @CreateDate IS NOT NULL AND (@Since IS NULL OR @CreateDate >= @Since)
         SELECT @Since = @CreateDate, @SinceSource = N'its create date in sys.databases, which an attach or a restore under a new name sets';
     IF @LastRestore IS NOT NULL AND (@Since IS NULL OR @LastRestore >= @Since)
         SELECT @Since = @LastRestore, @SinceSource = N'its latest restore in msdb.dbo.restorehistory';
-
-    DECLARE @UptimeMin int = DATEDIFF(MINUTE, @StartTime, @Now),
-            @SinceMin int = DATEDIFF(MINUTE, @Since, @Now);
+    IF @LastStartup IS NOT NULL AND (@Since IS NULL OR @LastStartup >= @Since)
+        SELECT @Since = @LastStartup, @SinceSource = N'its latest "Starting up database" message in the SQL Server error log, which is written whenever it starts: at a server restart, a restore, an attach, a database snapshot revert, an ONLINE after OFFLINE, or an AUTO_CLOSE reopen';
 
     SET @Data += CASE WHEN @StartTime IS NOT NULL
         THEN CONCAT(N'SQL Server Start Time: ', CONVERT(varchar(19), @StartTime, 120), N' (server local time); uptime ',
-                    @UptimeMin / 1440, N' days ', (@UptimeMin % 1440) / 60, N' hours ', @UptimeMin % 60, N' minutes. ',
+                    AIIndexTuner.fn_FormatUptime(DATEDIFF(MINUTE, @StartTime, @Now)), N'. ',
                     @RestartCleared, N' cover only this period, because SQL Server clears them when it restarts.', @nl)
         ELSE CONCAT(N'SQL Server Start Time: unknown (reading it needs VIEW SERVER STATE), so how long ', LOWER(@RestartCleared), N' have been accumulating is unknown.', @nl)
     END;
 
-    SET @Data += CASE WHEN @Since IS NOT NULL
-        THEN CONCAT(N'Database Usage Statistics Since: ', CONVERT(varchar(19), @Since, 120), N' (server local time), ',
-                    @SinceMin / 1440, N' days ', (@SinceMin % 1440) / 60, N' hours ', @SinceMin % 60, N' minutes ago, from ', @SinceSource, N'. ',
-                    @RestartCleared, N' for this database cover only this period. ',
-                    N'The SQL Server error log was not searched, so a database snapshot revert, an ONLINE after OFFLINE or an AUTO_CLOSE reopen since then would not be seen; the statistics may cover less than this period.', @nl)
-        ELSE CONCAT(N'Database Usage Statistics Since: unknown; when this database was last started could not be read.', @nl)
+    DECLARE @SinceLine nvarchar(max) = N'Database Usage Statistics Since: ' + CASE WHEN @Since IS NOT NULL
+        THEN CONCAT(CONVERT(varchar(19), @Since, 120), N' (server local time), ', AIIndexTuner.fn_FormatUptime(DATEDIFF(MINUTE, @Since, @Now)),
+                    N' ago, from ', @SinceSource, N'. ', @RestartCleared, N' for this database cover only this period.')
+        ELSE N'unknown.' END;
+
+    IF @HasInstanceLogs = 0
+        SET @SinceLine += N' The error log and restore history cannot be read on this platform, and a failover or reconfiguration can clear these statistics without changing the times above, so they may cover less than this.';
+    ELSE IF @ErrorLogsSearched = 0
+    BEGIN
+        DECLARE @Missed nvarchar(400) = CONCAT(
+            CASE WHEN @StartTime IS NULL THEN N'a server restart, ' ELSE N'' END,
+            CASE WHEN @RestoreHistoryRead = 0 THEN N'a restore over the existing database, ' ELSE N'' END,
+            N'an ONLINE after OFFLINE, an AUTO_CLOSE reopen or a database snapshot revert');
+        SET @SinceLine += CONCAT(N' The error log could not be read (that needs membership in securityadmin or sysadmin), so ', @Missed,
+                                 N' since then would not show here, and the statistics may cover less than this.');
     END;
+    ELSE IF @LastStartup IS NULL
+        SET @SinceLine += CONCAT(N' The ', @ErrorLogsSearched, N' most recent error logs have no "Starting up database" message for it, so it last started before the oldest of them begins, possibly after the time above, and the statistics may cover less than this.');
+
+    IF @AutoClose = 1
+        SET @SinceLine += N' AUTO_CLOSE is ON for this database, so these statistics are also cleared whenever its last connection closes.';
+
+    SET @Data += @SinceLine + @nl;
 
     SET @Data += CONCAT(@nl, N'=== PLATFORM CAPABILITIES ===', @nl,
         CASE @EngineEdition
@@ -253,9 +341,9 @@ BEGIN
             ELSE N'' END);
 
     IF @SchemaName IS NOT NULL AND @TableName IS NOT NULL
-        SET @Data += CONCAT(N'Object-scoped analysis is limited to table: ', QUOTENAME(@SchemaName), N'.', QUOTENAME(@TableName), N'. Plan cache and database-level sections remain database-scoped.', @nl);
+        SET @Data += CONCAT(N'Object-scoped analysis is limited to table: ', QUOTENAME(@SchemaName), N'.', QUOTENAME(@TableName), N'. Query Store sections are filtered to queries that reference that table; the Query Store section below states how that scope was resolved. Other database-level sections remain database-scoped.', @nl);
     ELSE IF @SchemaName IS NOT NULL
-        SET @Data += CONCAT(N'Object-scoped analysis is limited to schema: ', QUOTENAME(@SchemaName), N'. Plan cache and database-level sections remain database-scoped.', @nl);
+        SET @Data += CONCAT(N'Object-scoped analysis is limited to schema: ', QUOTENAME(@SchemaName), N'. Query Store sections are filtered to queries that reference that schema; the Query Store section below states how that scope was resolved. Other database-level sections remain database-scoped.', @nl);
 
     /* sys.indexes.fill_factor is 0 for an index created without FILLFACTOR, meaning the server's
        'fill factor (%)' applies. Printed as 0, models copy it into WITH (FILLFACTOR = 0), which
@@ -628,6 +716,38 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== UNTRUSTED OR DISABLED CONSTRAINTS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    /* ===== INDEX OPERATIONAL HOTSPOTS ===== per-index lock, latch and leaf-operation pressure, top 15 */
+    BEGIN TRY
+        SET @j = (
+            SELECT TOP (15)
+                sch.name + N'.' + obj.name AS TableName,
+                i.name AS IndexName,
+                CASE WHEN i.fill_factor = 0 THEN CONCAT(@ServerFillFactor, ' (default)') ELSE CAST(i.fill_factor AS varchar(3)) END AS [FillFactor],
+                ISNULL(ios.leaf_insert_count, 0) AS LeafInserts,
+                ISNULL(ios.leaf_update_count, 0) AS LeafUpdates,
+                ISNULL(ios.leaf_delete_count, 0) AS LeafDeletes,
+                ISNULL(ios.row_lock_wait_count, 0) AS RowLockWaits,
+                ISNULL(ios.row_lock_wait_in_ms, 0) AS RowLockWaitMs,
+                ISNULL(ios.page_lock_wait_count, 0) AS PageLockWaits,
+                ISNULL(ios.page_lock_wait_in_ms, 0) AS PageLockWaitMs,
+                ISNULL(ios.page_latch_wait_count, 0) AS PageLatchWaits,
+                ISNULL(ios.page_latch_wait_in_ms, 0) AS PageLatchWaitMs
+            FROM sys.indexes AS i
+            INNER JOIN sys.objects AS obj ON i.object_id = obj.object_id
+            INNER JOIN sys.schemas AS sch ON obj.schema_id = sch.schema_id
+            OUTER APPLY sys.dm_db_index_operational_stats(DB_ID(), i.object_id, i.index_id, NULL) AS ios
+            WHERE obj.type = 'U' AND i.index_id > 0 AND i.is_hypothetical = 0
+              AND sch.name <> N'AIIndexTuner' AND (@SchemaName IS NULL OR sch.name = @SchemaName)
+              AND (@TableName IS NULL OR obj.name = @TableName)
+            ORDER BY ISNULL(ios.row_lock_wait_in_ms, 0) + ISNULL(ios.page_lock_wait_in_ms, 0) + ISNULL(ios.page_latch_wait_in_ms, 0) DESC,
+                     ISNULL(ios.leaf_update_count, 0) DESC
+            FOR JSON PATH);
+        SET @Data += CONCAT(@nl, N'=== INDEX OPERATIONAL HOTSPOTS ===', @nl, ISNULL(@j, N'No index operational hotspots found.'), @nl);
+    END TRY
+    BEGIN CATCH
+        SET @Data += CONCAT(@nl, N'=== INDEX OPERATIONAL HOTSPOTS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
+    END CATCH;
+
     /* ===== COLUMN CARDINALITY =====
        Density vectors for the tables behind the top 20 high-impact missing indexes and the 20 largest
        tables over 10,000 rows (plus the scoped table), via DBCC SHOW_STATISTICS ... WITH DENSITY_VECTOR. */
@@ -732,9 +852,496 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== DATABASE STATISTICS SETTINGS ===', @nl, @j, @nl,
             CASE WHEN EXISTS (SELECT 1 FROM sys.databases WHERE database_id = DB_ID() AND (is_auto_create_stats_on = 0 OR is_auto_update_stats_on = 0))
                  THEN N'Warning: automatic statistics management is not fully enabled for this database.' + @nl ELSE N'' END);
+
+        -- OPTIMIZED_SP_EXECUTESQL and ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY: a row exists only where the
+        -- option does, so a missing row is NOT_AVAILABLE (AppendSpExecuteSqlSettingsAsync).
+        DECLARE @OptimizedSpExecuteSql int, @AsyncLowPriority int;
+        SELECT @OptimizedSpExecuteSql = MAX(CASE WHEN name = N'OPTIMIZED_SP_EXECUTESQL' THEN CONVERT(int, value) END),
+               @AsyncLowPriority = MAX(CASE WHEN name = N'ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY' THEN CONVERT(int, value) END)
+        FROM sys.database_scoped_configurations
+        WHERE name IN (N'OPTIMIZED_SP_EXECUTESQL', N'ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY');
+        SET @Data += CONCAT(
+            N'  OPTIMIZED_SP_EXECUTESQL: ', CASE @OptimizedSpExecuteSql WHEN 1 THEN N'ON' WHEN 0 THEN N'OFF' ELSE N'NOT_AVAILABLE' END, @nl,
+            N'  ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY: ', CASE @AsyncLowPriority WHEN 1 THEN N'ON' WHEN 0 THEN N'OFF' ELSE N'NOT_AVAILABLE' END, @nl);
     END TRY
     BEGIN CATCH
         SET @Data += CONCAT(@nl, N'=== DATABASE STATISTICS SETTINGS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
+    END CATCH;
+
+    /* ===== INDEX PAGE DENSITY =====
+       sys.dm_db_index_physical_stats (SAMPLED) once per candidate table, never with a NULL object_id,
+       which would scan every object in the database. Candidates: the scoped table; otherwise the top
+       20 high-impact missing-index tables plus up to 20 of the largest tables over 10,000 rows, in
+       the scoped schema when there is one. */
+    BEGIN TRY
+        CREATE TABLE #DensityCandidates (object_id int NOT NULL PRIMARY KEY);
+        CREATE TABLE #PageDensity (TableName nvarchar(300), IndexName sysname, IndexType nvarchar(60), AvgPageDensityPct float,
+                                   AvgFragmentationPct float, PageCount bigint, RecordCount bigint);
+
+        IF @TableName IS NOT NULL
+            INSERT #DensityCandidates (object_id) SELECT OBJECT_ID(QUOTENAME(@SchemaName) + N'.' + QUOTENAME(@TableName));
+        ELSE
+        BEGIN
+            INSERT #DensityCandidates (object_id)
+            SELECT TOP (20) d.object_id
+            FROM sys.dm_db_missing_index_details AS d
+            INNER JOIN sys.dm_db_missing_index_groups AS g ON d.index_handle = g.index_handle
+            INNER JOIN sys.dm_db_missing_index_group_stats AS st ON g.index_group_handle = st.group_handle
+            INNER JOIN sys.objects AS o ON d.object_id = o.object_id
+            INNER JOIN sys.schemas AS s ON o.schema_id = s.schema_id
+            WHERE d.database_id = DB_ID()
+              AND st.avg_total_user_cost * st.avg_user_impact * (st.user_seeks + st.user_scans) > 100000
+              AND s.name <> N'AIIndexTuner' AND (@SchemaName IS NULL OR s.name = @SchemaName)
+            GROUP BY d.object_id
+            ORDER BY MAX(st.avg_total_user_cost * st.avg_user_impact * (st.user_seeks + st.user_scans)) DESC;
+
+            INSERT #DensityCandidates (object_id)
+            SELECT TOP (20) ps.object_id
+            FROM sys.dm_db_partition_stats AS ps
+            INNER JOIN sys.tables AS t ON ps.object_id = t.object_id
+            INNER JOIN sys.schemas AS s ON t.schema_id = s.schema_id
+            WHERE ps.index_id IN (0, 1)
+              AND s.name <> N'AIIndexTuner' AND (@SchemaName IS NULL OR s.name = @SchemaName)
+              AND ps.object_id NOT IN (SELECT object_id FROM #DensityCandidates)
+            GROUP BY ps.object_id
+            HAVING SUM(ps.row_count) > 10000
+            ORDER BY SUM(ps.row_count) DESC;
+        END;
+
+        DECLARE @DensityObjectId int;
+        DECLARE density_cur CURSOR LOCAL FAST_FORWARD FOR SELECT object_id FROM #DensityCandidates;
+        OPEN density_cur;
+        FETCH NEXT FROM density_cur INTO @DensityObjectId;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            IF EXISTS (SELECT 1 FROM sys.objects WHERE object_id = @DensityObjectId)   -- dropped since the list was built
+                INSERT #PageDensity
+                SELECT SCHEMA_NAME(o.schema_id) + N'.' + o.name, i.name, i.type_desc, ips.avg_page_space_used_in_percent,
+                       ips.avg_fragmentation_in_percent, ips.page_count, ips.record_count
+                FROM sys.dm_db_index_physical_stats(DB_ID(), @DensityObjectId, NULL, NULL, 'SAMPLED') AS ips
+                INNER JOIN sys.objects AS o ON ips.object_id = o.object_id
+                INNER JOIN sys.indexes AS i ON ips.object_id = i.object_id AND ips.index_id = i.index_id
+                WHERE o.type = 'U' AND ips.alloc_unit_type_desc = 'IN_ROW_DATA' AND ips.page_count > 128
+                  AND ips.avg_page_space_used_in_percent IS NOT NULL AND i.name IS NOT NULL;
+            FETCH NEXT FROM density_cur INTO @DensityObjectId;
+        END;
+        CLOSE density_cur;
+        DEALLOCATE density_cur;
+
+        SET @j = (
+            SELECT TOP (50) TableName, IndexName, IndexType,
+                   CAST(AvgPageDensityPct AS decimal(5, 2)) AS AvgPageDensityPct,
+                   CAST(AvgFragmentationPct AS decimal(5, 2)) AS AvgFragmentationPct,
+                   PageCount, CAST(PageCount * 8.0 / 1024 AS decimal(18, 1)) AS SizeMB, RecordCount
+            FROM #PageDensity
+            ORDER BY AvgPageDensityPct ASC
+            FOR JSON PATH);
+        SET @Data += CONCAT(@nl, N'=== INDEX PAGE DENSITY ===', @nl, ISNULL(@j, N'No index page density rows found.'), @nl);
+        DROP TABLE #PageDensity;
+        DROP TABLE #DensityCandidates;
+    END TRY
+    BEGIN CATCH
+        IF CURSOR_STATUS('local', 'density_cur') >= -1 BEGIN CLOSE density_cur; DEALLOCATE density_cur; END;
+        SET @Data += CONCAT(@nl, N'=== INDEX PAGE DENSITY ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
+    END CATCH;
+
+    /* ===== Query Store ===== */
+    DECLARE @QsActualState int, @QsDesiredState int, @QsStateDesc nvarchar(60), @QsUsable bit = 0;
+    SELECT TOP (1) @QsActualState = actual_state, @QsDesiredState = desired_state, @QsStateDesc = actual_state_desc
+    FROM sys.database_query_store_options;
+    IF @QsActualState IN (1, 2) SET @QsUsable = 1;   -- READ_ONLY or READ_WRITE
+
+    DECLARE @QsSince datetimeoffset = DATEADD(DAY, -7, SYSUTCDATETIME()),
+            @QsMinInterval bigint;
+    -- Runtime stats are indexed by interval, so the 7-day window is resolved to an interval id. Match
+    -- on end_time so the interval straddling the cutoff is kept.
+    IF @QsUsable = 1
+        SELECT @QsMinInterval = MIN(runtime_stats_interval_id)
+        FROM sys.query_store_runtime_stats_interval
+        WHERE end_time >= @QsSince;
+
+    /* Object scope (ResolveQueryStoreScopeAsync): the Query Store query_ids that touch the scoped
+       schema or table, resolved once into #qs_scope, which every Query Store section joins.
+         1. bound the plan set: plans executed in the window, most recent first, at most 20,000
+         2. text prefilter: the plan XML text mentions Schema="[s]" (and Table="[t]")
+         3. confirm by shredding the plan XML with exist()
+       A step that fails degrades to the coarser scope (text match, then module dependencies), and the
+       section says which one it reached. T-SQL has no per-statement timeout, so the plan cap is what
+       bounds the work. */
+    CREATE TABLE #qs_scope (query_id bigint NOT NULL PRIMARY KEY);
+    DECLARE @QsScoped bit = 0, @QsTier varchar(20) = 'Unresolved', @QsScopeCount int = 0, @QsPlansScanned int = 0,
+            @QsPlanCap int = 20000, @QsCapped bit = 0, @QsDegradeReason nvarchar(1000), @QsScopeNote nvarchar(max) = N'';
+
+    IF @SchemaName IS NOT NULL AND @QsUsable = 1
+    BEGIN
+        DECLARE @qs_schema_br nvarchar(260) = QUOTENAME(@SchemaName),
+                @qs_table_br nvarchar(260) = QUOTENAME(@TableName),
+                @qs_object nvarchar(600) = QUOTENAME(@SchemaName) + ISNULL(N'.' + QUOTENAME(@TableName), N''),
+                @qs_schema_like nvarchar(1000), @qs_table_like nvarchar(1000);
+        SET @qs_schema_like = N'%Schema="' + AIIndexTuner.fn_EscapeLike(@qs_schema_br) + N'"%';
+        SET @qs_table_like = N'%Table="' + AIIndexTuner.fn_EscapeLike(@qs_table_br) + N'"%';   -- NULL without a table
+
+        CREATE TABLE #qs_plan_cand (plan_id bigint NOT NULL PRIMARY KEY, query_id bigint NOT NULL);
+        CREATE TABLE #qs_plan_hit (plan_id bigint NOT NULL PRIMARY KEY, query_id bigint NOT NULL);
+        DECLARE @QsPrefilterDone bit = 0;
+
+        BEGIN TRY
+            -- One past the cap, so "hit the cap" can be told apart from "exactly cap plans".
+            INSERT #qs_plan_cand (plan_id, query_id)
+            SELECT TOP (@QsPlanCap + 1) p.plan_id, p.query_id
+            FROM sys.query_store_plan AS p
+            INNER JOIN sys.query_store_query AS q ON q.query_id = p.query_id
+            WHERE q.is_internal_query = 0 AND p.last_execution_time >= @QsSince
+            ORDER BY p.last_execution_time DESC
+            OPTION (RECOMPILE);
+
+            SET @QsPlansScanned = @@ROWCOUNT;
+            IF @QsPlansScanned > @QsPlanCap SELECT @QsCapped = 1, @QsPlansScanned = @QsPlanCap;
+
+            INSERT #qs_plan_hit (plan_id, query_id)
+            SELECT c.plan_id, c.query_id
+            FROM #qs_plan_cand AS c
+            INNER JOIN sys.query_store_plan AS p ON p.plan_id = c.plan_id
+            WHERE p.query_plan LIKE @qs_schema_like ESCAPE N'\'
+              AND (@qs_table_like IS NULL OR p.query_plan LIKE @qs_table_like ESCAPE N'\')
+            OPTION (RECOMPILE);
+            SET @QsPrefilterDone = 1;
+        END TRY
+        BEGIN CATCH
+            SET @QsDegradeReason = CONCAT(N'the plan-text prefilter failed (', ERROR_MESSAGE(), N')');
+        END CATCH;
+
+        IF @QsPrefilterDone = 1
+        BEGIN
+            BEGIN TRY
+                -- exist() stops at the first matching Object node; nodes() would shred every node.
+                IF @TableName IS NULL
+                    INSERT #qs_scope (query_id)
+                    SELECT DISTINCT h.query_id
+                    FROM #qs_plan_hit AS h
+                    INNER JOIN sys.query_store_plan AS p ON p.plan_id = h.plan_id
+                    CROSS APPLY (SELECT TRY_CAST(p.query_plan AS xml) AS plan_xml) AS qp
+                    WHERE qp.plan_xml IS NOT NULL
+                      AND qp.plan_xml.exist('//*[local-name()="Object"][@Schema=sql:variable("@qs_schema_br")]') = 1
+                    OPTION (RECOMPILE);
+                ELSE
+                    INSERT #qs_scope (query_id)
+                    SELECT DISTINCT h.query_id
+                    FROM #qs_plan_hit AS h
+                    INNER JOIN sys.query_store_plan AS p ON p.plan_id = h.plan_id
+                    CROSS APPLY (SELECT TRY_CAST(p.query_plan AS xml) AS plan_xml) AS qp
+                    WHERE qp.plan_xml IS NOT NULL
+                      AND qp.plan_xml.exist('//*[local-name()="Object"][@Schema=sql:variable("@qs_schema_br")][@Table=sql:variable("@qs_table_br")]') = 1
+                    OPTION (RECOMPILE);
+                SET @QsTier = 'PlanXmlConfirmed';
+            END TRY
+            BEGIN CATCH
+                -- The prefilter hits are a superset of the confirmed set: still a usable, approximate scope.
+                SET @QsDegradeReason = CONCAT(N'the plan-XML confirmation failed (', ERROR_MESSAGE(), N')');
+                DELETE #qs_scope;
+                INSERT #qs_scope (query_id) SELECT DISTINCT query_id FROM #qs_plan_hit;
+                SET @QsTier = 'TextPrefilter';
+            END CATCH;
+        END;
+
+        -- Last resort: module dependencies. Query Store records the containing module, so this pulls in
+        -- every statement of a module that references the object, and no ad hoc statements.
+        IF @QsTier = 'Unresolved'
+        BEGIN
+            BEGIN TRY
+                INSERT #qs_scope (query_id)
+                SELECT DISTINCT q.query_id
+                FROM sys.query_store_query AS q
+                WHERE q.is_internal_query = 0 AND q.object_id <> 0
+                  AND q.object_id IN (
+                        SELECT sed.referencing_id
+                        FROM sys.sql_expression_dependencies AS sed
+                        INNER JOIN sys.objects AS ro ON ro.object_id = sed.referenced_id
+                        INNER JOIN sys.schemas AS rs ON rs.schema_id = ro.schema_id
+                        WHERE sed.referenced_class = 1 AND sed.referenced_database_name IS NULL
+                          AND rs.name = @SchemaName AND (@TableName IS NULL OR ro.name = @TableName));
+                SET @QsTier = 'DependenciesOnly';
+            END TRY
+            BEGIN CATCH
+                SET @QsDegradeReason = CONCAT(ISNULL(@QsDegradeReason + N'; ', N''), N'the dependency fallback failed (', ERROR_MESSAGE(), N')');
+            END CATCH;
+        END;
+
+        SELECT @QsScopeCount = COUNT(*) FROM #qs_scope;
+        SET @QsScoped = CASE WHEN @QsTier = 'Unresolved' THEN 0 ELSE 1 END;
+        SET @QsDegradeReason = ISNULL(@QsDegradeReason, N'scope resolution did not complete');
+
+        SET @QsScopeNote = CASE @QsTier
+            WHEN 'PlanXmlConfirmed' THEN CONCAT(N'Query Store object scope: ', @QsScopeCount, N' queries reference ', @qs_object,
+                                                N' (confirmed from plan XML; ', @QsPlansScanned, N' recent plans scanned).')
+            WHEN 'TextPrefilter' THEN CONCAT(N'Warning: Query Store object scope for ', @qs_object, N' is approximate because ', @QsDegradeReason,
+                                             N'. Scope fell back to a plan-text match (', @QsScopeCount, N' queries) and may include queries that only mention the object incidentally.')
+            WHEN 'DependenciesOnly' THEN CONCAT(N'Warning: Query Store object scope for ', @qs_object, N' is approximate because ', @QsDegradeReason,
+                                                N'. Scope fell back to module dependencies (', @QsScopeCount, N' queries): Query Store records the containing module, so this includes statements in those modules that never touch the object, and excludes ad-hoc statements and dynamic SQL.')
+            ELSE CONCAT(N'Warning: Query Store object scope for ', @qs_object, N' could not be resolved because ', @QsDegradeReason,
+                        N'. Query Store sections below are database-scoped, not limited to that object.')
+        END
+        + CASE WHEN @QsCapped = 1 THEN CONCAT(N' More than ', @QsPlanCap, N' plans were eligible, so the scan was capped at that many, most recently executed first; less recently executed plans are not represented in this scope.') ELSE N'' END
+        + CASE WHEN @QsScoped = 1 AND @QsScopeCount = 0 THEN N' No Query Store queries matched, so the Query Store sections below are empty; that means no captured workload touched the object, not that the sections failed.' ELSE N'' END;
+
+        DROP TABLE #qs_plan_cand;
+        DROP TABLE #qs_plan_hit;
+    END;
+
+    /* ===== QUERY STORE WORKLOAD INSIGHTS ===== top 50 queries by total duration over the last 7 days */
+    SET @Data += CONCAT(@nl, N'=== QUERY STORE WORKLOAD INSIGHTS ===', @nl, CASE WHEN @QsScopeNote <> N'' THEN @QsScopeNote + @nl ELSE N'' END);
+    IF @QsActualState IS NULL
+        SET @Data += N'Query Store is not supported on this SQL Server version/edition.' + @nl;
+    ELSE IF @QsUsable = 0
+        SET @Data += CONCAT(N'Query Store is disabled for this database (desired_state=', @QsDesiredState, N', actual_state=', @QsActualState, N').', @nl);
+    ELSE BEGIN
+    BEGIN TRY
+        WITH rs_agg AS (
+            SELECT rs.plan_id,
+                   SUM(rs.count_executions) AS count_executions,
+                   SUM(rs.avg_duration * rs.count_executions) / NULLIF(SUM(rs.count_executions), 0) AS avg_duration,
+                   SUM(rs.avg_cpu_time * rs.count_executions) / NULLIF(SUM(rs.count_executions), 0) AS avg_cpu_time,
+                   SUM(rs.avg_logical_io_reads * rs.count_executions) / NULLIF(SUM(rs.count_executions), 0) AS avg_logical_reads,
+                   SUM(rs.avg_logical_io_writes * rs.count_executions) / NULLIF(SUM(rs.count_executions), 0) AS avg_logical_writes,
+                   SUM(rs.avg_rowcount * rs.count_executions) / NULLIF(SUM(rs.count_executions), 0) AS avg_rowcount,
+                   MIN(rs.first_execution_time) AS first_execution_time,
+                   MAX(rs.last_execution_time) AS last_execution_time
+            FROM sys.query_store_runtime_stats AS rs
+            WHERE rs.runtime_stats_interval_id >= @QsMinInterval
+              AND (@QsScoped = 0 OR EXISTS (SELECT 1 FROM sys.query_store_plan AS sp INNER JOIN #qs_scope AS sc ON sc.query_id = sp.query_id WHERE sp.plan_id = rs.plan_id))
+            GROUP BY rs.plan_id
+        ),
+        waits AS (
+            SELECT ws.plan_id, SUM(ws.total_query_wait_time_ms) AS total_wait_ms
+            FROM sys.query_store_wait_stats AS ws
+            WHERE ws.runtime_stats_interval_id >= @QsMinInterval
+            GROUP BY ws.plan_id
+        ),
+        qs AS (
+            SELECT q.query_id, q.query_hash, qt.query_sql_text, p.plan_id, rs.count_executions, rs.avg_duration, rs.avg_cpu_time,
+                   rs.avg_logical_reads, rs.avg_logical_writes, rs.avg_rowcount, rs.first_execution_time, rs.last_execution_time,
+                   ISNULL(w.total_wait_ms, 0) AS total_wait_ms
+            FROM rs_agg AS rs
+            INNER JOIN sys.query_store_plan AS p ON rs.plan_id = p.plan_id
+            INNER JOIN sys.query_store_query AS q ON p.query_id = q.query_id
+            INNER JOIN sys.query_store_query_text AS qt ON q.query_text_id = qt.query_text_id
+            LEFT JOIN waits AS w ON rs.plan_id = w.plan_id
+            WHERE q.is_internal_query = 0
+              AND (q.object_id = 0 OR OBJECT_SCHEMA_NAME(q.object_id) IS NULL OR OBJECT_SCHEMA_NAME(q.object_id) <> N'AIIndexTuner')
+        ),
+        param_sens AS (
+            SELECT query_id, COUNT(*) AS distinct_plan_count,
+                   AVG(avg_duration) AS avg_duration_across_plans, STDEV(avg_duration) AS stdev_duration_across_plans,
+                   AVG(avg_rowcount) AS avg_rowcount_across_plans, STDEV(avg_rowcount) AS stdev_rowcount_across_plans
+            FROM qs GROUP BY query_id
+        )
+        SELECT @j = (
+            SELECT TOP (50)
+                q.query_id AS QueryId,
+                CONVERT(varchar(18), q.query_hash, 1) AS QueryHash,
+                -- avg_duration and avg_cpu_time are microseconds; total_query_wait_time_ms is milliseconds.
+                ROUND(SUM(q.avg_duration * q.count_executions) / 1000000.0, 2) AS TotalTimeSecs,
+                ROUND(SUM(q.total_wait_ms) / 1000.0, 2) AS TotalWaitSecs,
+                SUM(q.count_executions) AS Executions7d,
+                ROUND(SUM(q.avg_duration * q.count_executions) / NULLIF(SUM(q.count_executions), 0) / 1000.0, 2) AS AvgDurationMs,
+                ROUND(SUM(q.avg_cpu_time * q.count_executions) / NULLIF(SUM(q.count_executions), 0) / 1000.0, 2) AS AvgCpuMs,
+                ROUND(SUM(q.avg_logical_reads * q.count_executions) / NULLIF(SUM(q.count_executions), 0), 0) AS AvgLogicalReads,
+                ROUND(SUM(q.avg_logical_writes * q.count_executions) / NULLIF(SUM(q.count_executions), 0), 0) AS AvgLogicalWrites,
+                ROUND(SUM(q.avg_rowcount * q.count_executions) / NULLIF(SUM(q.count_executions), 0), 0) AS AvgActualRows,
+                CONVERT(varchar(16), MIN(q.first_execution_time), 120) AS FirstExecution,
+                CONVERT(varchar(16), MAX(q.last_execution_time), 120) AS LastExecution,
+                COUNT(DISTINCT q.plan_id) AS DistinctPlans,
+                MAX(ps.distinct_plan_count) AS ParamSensitivityPlansSampled,
+                ROUND(MAX(ps.avg_duration_across_plans) / 1000.0, 2) AS ParamSensitivityAvgDurationMs,
+                ROUND(MAX(ps.stdev_duration_across_plans) / 1000.0, 2) AS ParamSensitivityStdevDurationMs,
+                ROUND(MAX(ps.avg_rowcount_across_plans), 0) AS ParamSensitivityAvgRows,
+                ROUND(MAX(ps.stdev_rowcount_across_plans), 0) AS ParamSensitivityStdevRows,
+                CASE WHEN @IncludeQueryText = 1 THEN AIIndexTuner.fn_CleanText(q.query_sql_text, 600) ELSE N'(query text omitted by configuration)' END AS QueryText
+            FROM qs AS q
+            LEFT JOIN param_sens AS ps ON q.query_id = ps.query_id
+            GROUP BY q.query_id, q.query_hash, q.query_sql_text
+            ORDER BY SUM(q.avg_duration * q.count_executions) DESC
+            FOR JSON PATH)
+        OPTION (RECOMPILE);
+        SET @Data += ISNULL(@j, N'No Query Store workload rows available for this database.') + @nl;
+    END TRY
+    BEGIN CATCH
+        SET @Data += CONCAT(N'Query Store workload insights unavailable: ', ERROR_MESSAGE(), @nl);
+    END CATCH;
+    END;
+
+    /* ===== QUERY STORE WRITE WORKLOAD MIX =====
+       INSERT/UPDATE/DELETE/MERGE executions by type and UTC hour. The type comes from the leading
+       keyword of the statement. Auto-parameterized and sp_executesql statements start with their
+       parameter declarations, as in "(@1 tinyint,@2 int)UPDATE [dbo].[Orders] ...", so the
+       statement is read from after that prefix and counted under its real type. Statements that
+       are not one of the four write types are left out; there is no OTHER bucket. (The desktop
+       collector reads only the leading characters, so it leaves parameterized writes out.) */
+    SET @Data += CONCAT(@nl, N'=== QUERY STORE WRITE WORKLOAD MIX ===', @nl);
+    IF @QsUsable = 0
+        SET @Data += N'Query Store write workload mix is not available on this database.' + @nl;
+    ELSE BEGIN
+    BEGIN TRY
+        WITH typed AS (
+            SELECT CASE WHEN stmt.s LIKE 'INSERT %' THEN 'INSERT'
+                        WHEN stmt.s LIKE 'UPDATE %' THEN 'UPDATE'
+                        WHEN stmt.s LIKE 'DELETE %' THEN 'DELETE'
+                        WHEN stmt.s LIKE 'MERGE %' THEN 'MERGE'
+                   END AS StatementType,
+                   DATEPART(HOUR, rsi.start_time) AS HourOfDayUtc,
+                   CAST(rs.count_executions AS bigint) AS count_executions
+            FROM sys.query_store_query_text AS qt
+            INNER JOIN sys.query_store_query AS q ON qt.query_text_id = q.query_text_id
+            INNER JOIN sys.query_store_plan AS qp ON q.query_id = qp.query_id
+            INNER JOIN sys.query_store_runtime_stats AS rs ON qp.plan_id = rs.plan_id
+            INNER JOIN sys.query_store_runtime_stats_interval AS rsi ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
+            -- Upper-cased head of the text, with line breaks and tabs as spaces.
+            CROSS APPLY (SELECT UPPER(LTRIM(REPLACE(REPLACE(REPLACE(LEFT(qt.query_sql_text, 4000), NCHAR(13), N' '), NCHAR(10), N' '), NCHAR(9), N' '))) AS t) AS head
+            -- Where the statement starts after a "(@...)" parameter-declaration prefix: the first ')'
+            -- followed by a write keyword. Searching for the keyword, not the first ')', copes with
+            -- types such as decimal(18,2) inside the declarations.
+            CROSS APPLY (SELECT CASE WHEN head.t LIKE N'(@%'
+                                     THEN (SELECT MIN(v.pos) FROM (VALUES (CHARINDEX(N')INSERT ', head.t)), (CHARINDEX(N')UPDATE ', head.t)),
+                                                                          (CHARINDEX(N')DELETE ', head.t)), (CHARINDEX(N')MERGE ', head.t))) AS v(pos)
+                                           WHERE v.pos > 0)
+                                END AS p) AS prefix
+            CROSS APPLY (SELECT LEFT(CASE WHEN prefix.p IS NOT NULL THEN SUBSTRING(head.t, prefix.p + 1, 4000) ELSE head.t END, 200) AS s) AS stmt
+            WHERE rs.runtime_stats_interval_id >= @QsMinInterval
+              AND (@QsScoped = 0 OR EXISTS (SELECT 1 FROM #qs_scope AS sc WHERE sc.query_id = q.query_id))
+        )
+        SELECT @j = (
+            SELECT TOP (12) StatementType, HourOfDayUtc, SUM(count_executions) AS Executions
+            FROM typed
+            WHERE StatementType IS NOT NULL
+            GROUP BY StatementType, HourOfDayUtc
+            ORDER BY SUM(count_executions) DESC, StatementType
+            FOR JSON PATH)
+        OPTION (RECOMPILE);
+        SET @Data += CASE WHEN @j IS NULL THEN N'No recent write workload mix found in Query Store.'
+                          ELSE N'Executions over the last 7 days per statement type and UTC hour of day (0-23), the 12 largest buckets; a statement type can appear in several rows.' + @nl + @j
+                     END + @nl;
+    END TRY
+    BEGIN CATCH
+        SET @Data += CONCAT(N'Query Store write workload mix unavailable: ', ERROR_MESSAGE(), @nl);
+    END CATCH;
+    END;
+
+    /* ===== QUERY STORE FORCED PLAN FAILURES ===== */
+    SET @Data += CONCAT(@nl, N'=== QUERY STORE FORCED PLAN FAILURES ===', @nl);
+    IF @QsUsable = 0
+        SET @Data += N'Query Store is not available or not enabled; forced plan failure data skipped.' + @nl;
+    ELSE BEGIN
+    BEGIN TRY
+        WITH recent_runtime AS (
+            SELECT rs.plan_id,
+                   SUM(rs.count_executions) AS executions_last_7d,
+                   SUM(CONVERT(bigint, rs.avg_duration) * rs.count_executions) / NULLIF(SUM(rs.count_executions), 0) AS avg_duration_us_last_7d
+            FROM sys.query_store_runtime_stats AS rs
+            WHERE rs.runtime_stats_interval_id >= @QsMinInterval
+            GROUP BY rs.plan_id
+        )
+        SELECT @j = (
+            SELECT TOP (25)
+                qsq.query_id AS QueryId,
+                qsp.plan_id AS PlanId,
+                qsp.force_failure_count AS ForceFailureCount,
+                qsp.last_force_failure_reason_desc AS LastFailureReason,
+                ISNULL(rr.executions_last_7d, 0) AS ExecutionsLast7d,
+                CAST(ISNULL(rr.avg_duration_us_last_7d, 0) / 1000.0 AS decimal(18, 2)) AS AvgDurationMsLast7d,
+                CASE WHEN @IncludeQueryText = 1 THEN AIIndexTuner.fn_CleanText(qt.query_sql_text, 600) ELSE N'(query text omitted by configuration)' END AS QueryText
+            FROM sys.query_store_plan AS qsp
+            INNER JOIN sys.query_store_query AS qsq ON qsp.query_id = qsq.query_id
+            INNER JOIN sys.query_store_query_text AS qt ON qsq.query_text_id = qt.query_text_id
+            LEFT JOIN recent_runtime AS rr ON qsp.plan_id = rr.plan_id
+            WHERE qsp.is_forced_plan = 1 AND qsp.force_failure_count >= 1
+              AND (@QsScoped = 0 OR EXISTS (SELECT 1 FROM #qs_scope AS sc WHERE sc.query_id = qsq.query_id))
+            ORDER BY qsp.force_failure_count DESC, ISNULL(rr.executions_last_7d, 0) DESC, ISNULL(rr.avg_duration_us_last_7d, 0) DESC
+            FOR JSON PATH)
+        OPTION (RECOMPILE);
+        SET @Data += ISNULL(@j, N'No forced plan failures detected.') + @nl;
+    END TRY
+    BEGIN CATCH
+        SET @Data += CONCAT(N'Forced plan failure data unavailable: ', ERROR_MESSAGE(), @nl);
+    END CATCH;
+    END;
+
+    /* ===== AUTOMATIC TUNING OPTIONS ===== FORCE_LAST_GOOD_PLAN */
+    BEGIN TRY
+        SET @j = (
+            SELECT DB_NAME() AS DatabaseName, name AS [Option], desired_state_desc AS DesiredState,
+                   actual_state_desc AS ActualState, reason_desc AS Reason
+            FROM sys.database_automatic_tuning_options
+            WHERE name = N'FORCE_LAST_GOOD_PLAN'
+            FOR JSON PATH);
+        SET @Data += CONCAT(@nl, N'=== AUTOMATIC TUNING OPTIONS ===', @nl, ISNULL(@j, N'FORCE_LAST_GOOD_PLAN option not found.'), @nl);
+    END TRY
+    BEGIN CATCH
+        SET @Data += CONCAT(@nl, N'=== AUTOMATIC TUNING OPTIONS ===', @nl, N'Automatic tuning options unavailable: ', ERROR_MESSAGE(), @nl);
+    END CATCH;
+
+    /* ===== CARDINALITY ESTIMATION FEEDBACK ===== (AppendCeFeedbackSummaryAsync)
+       Next to automatic tuning: a forced plan turns CE feedback off for its query, and automatic plan
+       correction can roll CE feedback back (ROLLEDBACK_BY_APRC). */
+    SET @Data += CONCAT(@nl, N'=== CARDINALITY ESTIMATION FEEDBACK ===', @nl);
+    BEGIN TRY
+        DECLARE @Compat int, @CeFeedback int, @CeExpressions int, @Blockers nvarchar(1000) = N'';
+        SELECT @Compat = compatibility_level FROM sys.databases WHERE database_id = DB_ID();
+        SELECT @CeFeedback = MAX(CASE WHEN name = N'CE_FEEDBACK' THEN CONVERT(int, value) END),
+               @CeExpressions = MAX(CASE WHEN name = N'CE_FEEDBACK_FOR_EXPRESSIONS' THEN CONVERT(int, value) END)
+        FROM sys.database_scoped_configurations
+        WHERE name IN (N'CE_FEEDBACK', N'CE_FEEDBACK_FOR_EXPRESSIONS');
+
+        IF @CeFeedback = 0 SET @Blockers += N'; CE_FEEDBACK is OFF';
+        IF @Compat < 160 SET @Blockers += CONCAT(N'; compatibility level is ', @Compat, N' (needs 160 or higher)');
+        IF ISNULL(@QsStateDesc, N'') <> N'READ_WRITE'
+            SET @Blockers += CASE WHEN @QsStateDesc IS NULL THEN N'; the Query Store state could not be read (needs READ_WRITE)'
+                                  ELSE CONCAT(N'; Query Store is ', @QsStateDesc, N' (needs READ_WRITE)') END;
+
+        SET @Data += CASE
+            WHEN @CeFeedback IS NULL THEN N'CE feedback: NOT_AVAILABLE (it needs SQL Server 2022 or later, Azure SQL Database or Azure SQL Managed Instance).'
+            WHEN @Blockers = N'' THEN CONCAT(N'CE feedback: can run for this database (CE_FEEDBACK ON, compatibility level ', @Compat, N', Query Store READ_WRITE).')
+            ELSE CONCAT(N'CE feedback: cannot run for this database: ', STUFF(@Blockers, 1, 2, N''), N'.')
+        END + @nl;
+
+        SET @Data += CASE
+            WHEN @CeExpressions IS NULL THEN N'CE feedback for expressions: NOT_AVAILABLE (it needs SQL Server 2025, Azure SQL Database, Azure SQL Managed Instance or SQL database in Microsoft Fabric).'
+            WHEN @CeExpressions = 0 THEN N'CE feedback for expressions: OFF (CE_FEEDBACK_FOR_EXPRESSIONS).'
+            WHEN @Compat < 160 THEN CONCAT(N'CE feedback for expressions: CE_FEEDBACK_FOR_EXPRESSIONS is ON, but compatibility level ', @Compat, N' is below 160, the minimum Microsoft''s feature page gives.')
+            WHEN @Compat < 170 THEN CONCAT(N'CE feedback for expressions: ON (CE_FEEDBACK_FOR_EXPRESSIONS), at compatibility level ', @Compat, N'. Microsoft''s feature page gives 160 or later; its intelligent query processing overview lists 170 for Azure SQL Database.')
+            ELSE N'CE feedback for expressions: ON (CE_FEEDBACK_FOR_EXPRESSIONS).'
+        END + @nl;
+
+        IF @QsUsable = 1
+        BEGIN
+            SET @Data += N'CE feedback rows by state (sys.query_store_plan_feedback):' + @nl
+                + ISNULL((SELECT STRING_AGG(CAST(CONCAT(N'  ', state_desc, N': ', n) AS nvarchar(max)) COLLATE DATABASE_DEFAULT, NCHAR(10)) WITHIN GROUP (ORDER BY n DESC)
+                          FROM (SELECT state_desc, COUNT(*) AS n FROM sys.query_store_plan_feedback WHERE feature_id = 1 GROUP BY state_desc) AS x), N'  none') + @nl;
+
+            SET @Data += N'Query Store hints by source (sys.query_store_query_hints; source 0 is set by a user, others are system-generated):' + @nl
+                + ISNULL((SELECT STRING_AGG(CAST(CONCAT(N'  ', ISNULL(source_desc, CONCAT(N'source ', source)), N': ', n, CASE WHEN n = 1 THEN N' hint, ' ELSE N' hints, ' END, f, N' failures to apply') AS nvarchar(max)) COLLATE DATABASE_DEFAULT, NCHAR(10)) WITHIN GROUP (ORDER BY source)
+                          FROM (SELECT source, source_desc, COUNT(*) AS n, SUM(CAST(query_hint_failure_count AS bigint)) AS f FROM sys.query_store_query_hints GROUP BY source, source_desc) AS x), N'  none') + @nl;
+
+            DECLARE @Recent nvarchar(max) = (
+                SELECT STRING_AGG(CAST(CONCAT(N'  query_id ', query_id, N', plan_id ', plan_id, N': ', state_desc, N'; hints: ', hints,
+                                         N'; last updated ', CONVERT(varchar(16), last_updated_time AT TIME ZONE 'UTC', 120), N' UTC',
+                                         CASE WHEN @IncludeQueryText = 1 THEN N'; query: ' + AIIndexTuner.fn_CleanText(query_sql_text, 200) ELSE N'' END) AS nvarchar(max)) COLLATE DATABASE_DEFAULT, NCHAR(10))
+                       WITHIN GROUP (ORDER BY last_updated_time DESC)
+                FROM (SELECT TOP (20) p.query_id, pf.plan_id, pf.state_desc, pf.last_updated_time, qt.query_sql_text,
+                             -- feedback_data is {"Feedback hints":"..."}; anything else is shown as it is.
+                             ISNULL(NULLIF(COALESCE(CASE WHEN ISJSON(pf.feedback_data) = 1 THEN JSON_VALUE(pf.feedback_data, '$."Feedback hints"') END, pf.feedback_data), N''), N'none') AS hints
+                      FROM sys.query_store_plan_feedback AS pf
+                      INNER JOIN sys.query_store_plan AS p ON p.plan_id = pf.plan_id
+                      INNER JOIN sys.query_store_query AS q ON q.query_id = p.query_id
+                      INNER JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
+                      WHERE pf.feature_id = 1
+                      ORDER BY pf.last_updated_time DESC) AS r);
+            SET @Data += N'Most recent CE feedback rows (top 20):' + @nl + ISNULL(@Recent, N'  none') + @nl;
+            IF @Recent IS NOT NULL
+                SET @Data += N'  States: PENDING_VALIDATION and IN_VALIDATION, a different model assumption is waiting to be or being tested; VERIFICATION_PASSED, the tested assumption did better; FEEDBACK_VALID, the assumption is in use as a Query Store hint from CE feedback; VERIFICATION_REGRESSED, it was tried and not kept because the query ran worse; ROLLEDBACK_BY_APRC, automatic plan correction reverted it; NO_RECOMMENDATION, CE feedback found no alternative assumption to try.' + @nl;
+        END;
+    END TRY
+    BEGIN CATCH
+        SET @Data += CONCAT(N'The CE feedback settings could not be read: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 END;
 GO
@@ -756,16 +1363,23 @@ AS
 BEGIN
     RETURN CONCAT(CAST(N'' AS nvarchar(max)),
         N'You are a SQL Server expert specializing in index and code optimization. ',
-        N'Analyze the provided missing index recommendations, missing index overlap signals, column cardinality, index usage statistics (including key/included columns, index sizes and compression), duplicate and overlapping indexes, heap tables, large tables, query patterns from the plan cache, constraints, untrusted or disabled constraints, and database statistics settings. ',
+        N'Analyze the provided missing index recommendations, missing index overlap signals, column cardinality, index usage statistics (including key/included columns, index sizes and compression), duplicate and overlapping indexes, index page density, index operational hotspots, heap tables, large tables, query patterns from the plan cache, Query Store workload insights, Query Store write workload mix, Query Store forced plan failures, automatic tuning options, cardinality estimation feedback, constraints, untrusted or disabled constraints, and database statistics settings. ',
         N'Carefully consider the additional overhead of adding indexes. Analyze the number of user_updates compared to user_seeks and user_scans for each table when recommending indexes, especially when the index is not included in the missing indexes report. Consider clustered and nonclustered columnstore indexes for tables with more than 1000000 rows. Consider filtered indexes. ',
         N'If recommendation includes dropping and recreating a primary key, also include dropping and recreating any foreign keys that reference it. ',
         N'Recommend indexes only when beneficial: avoid on tables under ~1000 rows; consider selectively for 1000–10000 rows; generally add for tables with more than 10000 rows when predicates are selective. ',
         N'Prioritize high‑cardinality columns, frequent queries, and operations involving WHERE, JOIN, ORDER BY, or GROUP BY. Avoid indexing low‑cardinality columns or write‑heavy tables unless strongly justified by usage patterns and performance impact. ',
-        N'Provide specific, prioritized recommendations for index changes including creates, drops, and modifications. Provide examples of statements from the plan cache that will benefit from the index recommendation if possible. ',
+        N'Provide specific, prioritized recommendations for index changes including creates, drops, and modifications. Provide examples of statements from the plan cache or Query Store that will benefit from the index recommendation if possible. ',
+        N'If Query Store forced-plan failures are reported, list each affected query_id and plan_id with its failure count, last failure reason, and its executions and average duration over the last 7 days, as reported. Explain what the failure reason means (for example, NO_INDEX when an index the forced plan uses has been dropped or changed, and NO_PLAN or GENERAL_FAILURE when the forced plan can no longer be produced), and recommend a fix that matches it: recreate the missing index or object, update statistics, rewrite or parameterize the query, or unforce the plan with sys.sp_query_store_unforce_plan. Take the reported automatic tuning state into account: when FORCE_LAST_GOOD_PLAN is on, prefer letting it handle plan regressions and find the cause before unforcing. Plan history, runtime percentiles, compile times and schema-change history are not in the input, so do not present them. ',
+        N'Review automatic tuning options: if FORCE_LAST_GOOD_PLAN is not enabled, recommend enabling it to allow SQL Server to automatically revert to the last known good plan when a regression is detected; if it is enabled but the actual state differs from the desired state, report the reason and recommend corrective action. ',
+        N'Analyze index page density to identify indexes with low page utilization (below ~75%) which may benefit from rebuild operations, fill factor adjustments, or indicate excessive page splits from random inserts. ',
         N'If duplicate or left-prefix overlapping indexes are reported, recommend consolidation: for exact key duplicates recommend dropping the redundant index (keeping unique indexes and indexes that back constraints); for left-prefix overlaps evaluate whether the narrower index can be dropped or merged into the wider index by adding included columns, using the reported reads, writes, and size to justify each recommendation. Never recommend dropping an index that enforces a primary key or unique constraint without replacing the constraint. ',
         N'Index usage statistics, missing index statistics, index operational statistics and the plan cache accumulate only since the time in the input''s "Database Usage Statistics Since" line, which is the later of the SQL Server start time and the database''s last restore, attach, snapshot revert, ONLINE or AUTO_CLOSE reopen. Before recommending that an index be dropped because it shows no or few reads, check that period: if it is shorter than one week, do not recommend dropping it outright; list it as a candidate to confirm after a longer observation period, and give the period and its source as the reason. With at least a week you may recommend dropping it, noting that monthly or quarterly work may not have run in that time. If that line says the statistics may cover less than the period, say so with any drop you recommend. If the time is unknown, say so and apply the same caution. ',
         N'If untrusted or disabled foreign keys or check constraints are reported, explain that they block optimizer join elimination and predicate pruning, and recommend re-enabling them WITH CHECK (ALTER TABLE ... WITH CHECK CHECK CONSTRAINT ...) after validating that existing data complies, noting the validation scan cost on large tables. In the script, make each re-trust conditional on that validation: wrap every ALTER TABLE ... WITH CHECK CHECK CONSTRAINT in IF NOT EXISTS (a query returning rows that violate that constraint), and report which constraints were skipped because violating rows exist. ',
         N'Recommend statistics updates, creation, or drops when beneficial. Recommend query code changes to improve performance. ',
+        N'Use the CARDINALITY ESTIMATION FEEDBACK section. When it says CE feedback cannot run, report that as one settings finding with its reasons, not as a main section. Treat VERIFICATION_REGRESSED and NO_RECOMMENDATION rows as CE feedback working as designed, not as problems. When you recommend forcing a plan or fixing a forced plan failure, apply the rule below on forced plans. When CE feedback for expressions is ON, its own protection checks only cardinality estimates, not run time; Microsoft points to automatic plan correction (FORCE_LAST_GOOD_PLAN, or sys.dm_db_tuning_recommendations when automatic tuning is off) to catch run-time regressions, so mention this with the automatic tuning recommendation. ',
+        N'CE feedback (cardinality estimation feedback, SQL Server 2022 and later, Azure SQL Database and Azure SQL Managed Instance) runs only where the input says it can run: CE_FEEDBACK ON, compatibility level 160 or higher and Query Store in READ_WRITE. Microsoft also applies it to a query that has the USE HINT QUERY_OPTIMIZER_COMPATIBILITY_LEVEL_160 hint or a higher one. It does not run for a query that has a plan forced through Query Store, hard-coded query hints (an OPTION clause), or Query Store hints set by a user. So wherever CE feedback can run, any recommendation to force a plan, add a query hint, or set a Query Store hint for a query must say that it stops CE feedback from adjusting that query''s estimates. Recommend raising the compatibility level only together with the usual advice for that change: test the workload at the new level and use Query Store to find and fix regressions. Never recommend it for CE feedback alone. Where CE_FEEDBACK is NOT_AVAILABLE, do not present CE feedback as available, and do not say CE feedback for expressions is on unless CE_FEEDBACK_FOR_EXPRESSIONS is reported ON. ',
+        N'DATABASE STATISTICS SETTINGS also reports OPTIMIZED_SP_EXECUTESQL and ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY. Do not recommend enabling OPTIMIZED_SP_EXECUTESQL from this input, which has no evidence of compilation storms, and do not mention it when it is OFF or NOT_AVAILABLE. When it is ON, Auto Update Stats is True, and Auto Update Stats Async is False or ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY is OFF, report one settings finding recommending ALTER DATABASE [db] SET AUTO_UPDATE_STATISTICS_ASYNC ON and ALTER DATABASE SCOPED CONFIGURATION SET ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY = ON, whichever are off. ',
+        N'Microsoft recommends, when AUTO_UPDATE_STATISTICS is ON, also enabling AUTO_UPDATE_STATISTICS_ASYNC and the ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY database scoped configuration, which reduces long compiles, LCK_M_X waits and WAIT_ON_SYNC_STATISTICS_REFRESH waits while other callers wait for one compile. ',
         N'Consider both query performance and maintenance overhead. Provide scripts for all recommendations. Consider compression settings and fillfactor in scripts. ',
         N'Whenever you recommend adding, dropping, or modifying an index, state its estimated size: the estimated size a new index will occupy once built, the storage a dropped index will reclaim, and the before size, after size, and net change for a modified index. Use an index size the input already reports, whether that is the size of an existing index or the estimated storage of a missing-index candidate, rather than recomputing it, and estimate any other new index from the table row count multiplied by the combined width of its key columns, included columns, and clustering key, plus per-row and per-page overhead, adjusting for any data compression or fill factor you recommend. Report each estimate in MB, next to the row count and the assumptions behind it, and give a range rather than a single figure when the input lacks the row counts or column widths needed for a firm estimate. Summarize the net storage change across all index recommendations so the reader can see the total space impact of applying them. ',
         N'Do not recommend index changes for system databases. ',

@@ -116,3 +116,44 @@ BEGIN
     CREATE INDEX IX_AIIndexTuner_Recommendation_Run ON AIIndexTuner.Recommendation (RunId, Priority);
 END;
 GO
+
+/* ===== Helpers ===== */
+
+/* Uptime in the largest sensible unit: "3.2 days", "5.5 hours" or "40 minutes" (as FormatUptime in the desktop collector). */
+CREATE OR ALTER FUNCTION AIIndexTuner.fn_FormatUptime(@Minutes int)
+RETURNS nvarchar(40)
+AS
+BEGIN
+    SET @Minutes = CASE WHEN @Minutes < 0 THEN 0 ELSE @Minutes END;
+    RETURN CASE
+        WHEN @Minutes >= 2 * 24 * 60 THEN CONCAT(CAST(ROUND(@Minutes / 1440.0, 1) AS decimal(10, 1)), N' days')
+        WHEN @Minutes >= 120 THEN CONCAT(CAST(ROUND(@Minutes / 60.0, 1) AS decimal(10, 1)), N' hours')
+        WHEN @Minutes = 1 THEN N'1 minute'
+        ELSE CONCAT(@Minutes, N' minutes')
+    END;
+END;
+GO
+
+/* Query text on one line: CR/LF to spaces, runs of spaces collapsed, trimmed, cut to @MaxChars (as CleanAndTruncate). */
+CREATE OR ALTER FUNCTION AIIndexTuner.fn_CleanText(@Text nvarchar(max), @MaxChars int)
+RETURNS nvarchar(max)
+AS
+BEGIN
+    IF @Text IS NULL RETURN NULL;
+    SET @Text = REPLACE(REPLACE(REPLACE(@Text, NCHAR(13), N' '), NCHAR(10), N' '), NCHAR(9), N' ');
+    WHILE CHARINDEX(N'  ', @Text) > 0
+        SET @Text = REPLACE(@Text, N'  ', N' ');
+    SET @Text = LTRIM(RTRIM(@Text));
+    RETURN CASE WHEN LEN(@Text) > @MaxChars THEN LEFT(@Text, @MaxChars) + N'...' ELSE @Text END;
+END;
+GO
+
+/* A literal made safe for LIKE ... ESCAPE N'\'. Plan XML object names are bracketed, and an
+   unescaped '[' would open a character class. */
+CREATE OR ALTER FUNCTION AIIndexTuner.fn_EscapeLike(@Value nvarchar(400))
+RETURNS nvarchar(800)
+AS
+BEGIN
+    RETURN REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@Value, N'\', N'\\'), N'%', N'\%'), N'_', N'\_'), N'[', N'\['), N']', N'\]');
+END;
+GO

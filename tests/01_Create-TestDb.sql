@@ -21,6 +21,8 @@ GO
 CREATE DATABASE AIIndexTunerTest;
 GO
 ALTER DATABASE AIIndexTunerTest SET RECOVERY SIMPLE;
+-- Capture every query, so the Query Store sections see the setup writes and the small workload.
+ALTER DATABASE AIIndexTunerTest SET QUERY_STORE = ON (OPERATION_MODE = READ_WRITE, QUERY_CAPTURE_MODE = ALL);
 GO
 USE AIIndexTunerTest;
 GO

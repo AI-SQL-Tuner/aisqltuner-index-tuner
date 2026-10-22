@@ -12,8 +12,11 @@ $root = Split-Path $PSScriptRoot -Parent
 function Invoke-Sql([string]$File, [string]$Database = 'master', [string]$Output) {
     $sqlArgs = @('-S', $Server, '-E', '-C', '-f', '65001', '-b', '-d', $Database, '-i', $File)
     if ($Output) { $sqlArgs += @('-o', $Output) }
-    & sqlcmd @sqlArgs | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "sqlcmd failed on $File (exit $LASTEXITCODE)" }
+    $output = & sqlcmd @sqlArgs
+    if ($LASTEXITCODE -ne 0) {
+        $output | Where-Object { $_ } | ForEach-Object { Write-Host $_ }
+        throw "sqlcmd failed on $File (exit $LASTEXITCODE)"
+    }
 }
 
 & (Join-Path $root 'build.ps1') | Out-Null

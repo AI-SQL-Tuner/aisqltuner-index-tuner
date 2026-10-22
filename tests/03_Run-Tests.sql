@@ -119,7 +119,41 @@ IF @Data LIKE N'%"TableName":"dbo.Orders"%' OR @Data LIKE N'%"TableName":"\[dbo\
     THROW 50999, N'FAIL T1b: table-scoped collection includes another table.', 1;
 IF @Data NOT LIKE N'%limited to table: \[dbo\].\[Customers\]%' ESCAPE N'\'
     THROW 50999, N'FAIL T1b: the scope note is missing.', 1;
-PRINT 'PASS T1b: table scope filters object-level sections';
+IF @Data NOT LIKE N'%Query Store object scope: % queries reference \[dbo\].\[Customers\] (confirmed from plan XML;%' ESCAPE N'\'
+   OR @Data LIKE N'%Query Store object scope: 0 queries%'
+    THROW 50999, N'FAIL T1b: Query Store scope was not resolved from plan XML, or matched nothing.', 1;
+-- The plan cache section stays database-wide, so check only the Query Store workload section.
+DECLARE @QsStart int = CHARINDEX(N'=== QUERY STORE WORKLOAD INSIGHTS ===', @Data),
+        @QsEnd int = CHARINDEX(N'=== QUERY STORE WRITE WORKLOAD MIX ===', @Data);
+DECLARE @QsSection nvarchar(max) = SUBSTRING(@Data, @QsStart, @QsEnd - @QsStart);
+IF @QsSection NOT LIKE N'%"QueryId"%' OR @QsSection LIKE N'%AuditLog%'
+    THROW 50999, N'FAIL T1b: the scoped Query Store workload is empty or includes a query that does not touch the scoped table.', 1;
+PRINT 'PASS T1b: table scope filters object-level sections and resolves the Query Store scope from plan XML';
+GO
+
+/* ===== T11: the sections added after the first prototype ===== */
+DECLARE @Data nvarchar(max);
+EXEC AIIndexTuner.usp_CollectData @Data = @Data OUTPUT;
+DECLARE @Missing nvarchar(max) = CONCAT(
+    CASE WHEN @Data NOT LIKE N'%=== INDEX OPERATIONAL HOTSPOTS ===%"IndexName":"PK_Orders"%' THEN N' operational-hotspots' END,
+    CASE WHEN @Data NOT LIKE N'%=== INDEX PAGE DENSITY ===%"IndexName":"PK_Orders"%"SizeMB"%' THEN N' page-density' END,
+    CASE WHEN @Data NOT LIKE N'%OPTIMIZED_SP_EXECUTESQL: %ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY: %' THEN N' sp_executesql-settings' END,
+    CASE WHEN @Data NOT LIKE N'%=== QUERY STORE WORKLOAD INSIGHTS ===%"QueryId"%"TotalWaitSecs"%' THEN N' qs-workload' END,
+    CASE WHEN @Data NOT LIKE N'%=== QUERY STORE WRITE WORKLOAD MIX ===%"StatementType":"INSERT"%' THEN N' qs-write-mix' END,
+    -- The workload's UPDATE is auto-parameterized: "(@1 tinyint,@2 tinyint)UPDATE ...".
+    CASE WHEN SUBSTRING(@Data, CHARINDEX(N'=== QUERY STORE WRITE WORKLOAD MIX ===', @Data), 2000) NOT LIKE N'%"StatementType":"UPDATE"%' THEN N' qs-write-mix-parameterized-update' END,
+    CASE WHEN @Data NOT LIKE N'%=== QUERY STORE FORCED PLAN FAILURES ===%"LastFailureReason":"NO_INDEX"%' THEN N' qs-forced-plan-failures' END,
+    CASE WHEN @Data NOT LIKE N'%=== AUTOMATIC TUNING OPTIONS ===%FORCE_LAST_GOOD_PLAN%' THEN N' automatic-tuning' END,
+    CASE WHEN @Data NOT LIKE N'%=== CARDINALITY ESTIMATION FEEDBACK ===%CE feedback: %CE feedback for expressions: %' THEN N' ce-feedback' END,
+    CASE WHEN @Data NOT LIKE N'%Database Usage Statistics Since: %"Starting up database" message in the SQL Server error log%' THEN N' error-log-usage-window' END);
+IF @Missing <> N''
+BEGIN
+    SET @Missing = N'FAIL T11: missing or empty:' + @Missing;
+    THROW 50999, @Missing, 1;
+END;
+IF @Data LIKE N'%unavailable: %' OR @Data LIKE N'%could not be read: %' OR @Data LIKE N'%Warning: section skipped%'
+    THROW 50999, N'FAIL T11: a section reported an error.', 1;
+PRINT 'PASS T11: hotspots, page density, sp_executesql settings, Query Store workload / write mix / forced plan failures, automatic tuning, CE feedback, error-log usage window';
 GO
 
 /* ===== T1c: @CollectOnly writes no run ===== */
