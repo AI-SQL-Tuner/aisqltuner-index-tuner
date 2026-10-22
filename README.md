@@ -275,7 +275,7 @@ Results on SQL Server 2025 Standard Developer with `gpt-5.6-luna`, medium effort
 | `index_type` | Filled correctly on every new-index recommendation |
 | Change controls | With columnstore and drops disallowed and `@MaxNewIndexes = 1`, the model recommended no columnstore index, no drop and one new index |
 | CREATE mode | Created the one index that passed validation, with the model's fill factor and compression, and stored its `UndoDDL`. Other categories stayed for review. |
-| Usage window | On a few hours of usage data, the model deferred unused indexes rather than dropping them, and files them under `Other` |
+| Usage window | On a few hours of usage data, the model deferred unused indexes rather than dropping them, and filed them under `Other` |
 
 ## Benchmark
 
