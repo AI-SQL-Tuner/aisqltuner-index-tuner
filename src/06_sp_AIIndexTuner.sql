@@ -20,6 +20,10 @@ GO
         @CollectOnly = 1    returns the collected data and the system prompt; no AI call, no run row.
         @TestResponse = N'{...}'
                             uses this text as the model's answer instead of calling the endpoint.
+        @CollectedData = N'...'
+                            uses this text as the collected diagnostics instead of collecting them,
+                            for example a run's AIIndexTuner.Run.CollectedData. Benchmarks use it to
+                            give every run the same input. Nothing is collected.
 
     Requires SQL Server 2025, Azure SQL Database or Azure SQL Managed Instance
     (sp_invoke_external_rest_endpoint). Only OpenAI models are supported for now.
@@ -29,7 +33,8 @@ CREATE OR ALTER PROCEDURE dbo.sp_AIIndexTuner
     @TableName    sysname = NULL,
     @Mode         varchar(10) = 'RECOMMEND',
     @CollectOnly  bit = 0,
-    @TestResponse nvarchar(max) = NULL
+    @TestResponse nvarchar(max) = NULL,
+    @CollectedData nvarchar(max) = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -57,6 +62,9 @@ BEGIN
 
     DECLARE @Data nvarchar(max), @SystemPrompt nvarchar(max) = AIIndexTuner.fn_SystemPrompt();
 
+    IF @CollectedData IS NOT NULL AND (@CollectOnly = 1 OR LEN(@CollectedData) = 0)
+        THROW 50208, N'@CollectedData cannot be empty, and cannot be combined with @CollectOnly = 1.', 1;
+
     IF @CollectOnly = 1
     BEGIN
         EXEC AIIndexTuner.usp_CollectData @SchemaName = @SchemaName, @TableName = @TableName,
@@ -79,15 +87,24 @@ BEGIN
     SET @RunId = SCOPE_IDENTITY();
 
     BEGIN TRY
-        EXEC AIIndexTuner.usp_CollectData @SchemaName = @SchemaName, @TableName = @TableName,
-                                          @IncludeQueryText = @IncludeQueryText, @Data = @Data OUTPUT;
+        DECLARE @Started datetime2(7) = SYSDATETIME();
+
+        IF @CollectedData IS NOT NULL
+            SET @Data = @CollectedData;
+        ELSE
+            EXEC AIIndexTuner.usp_CollectData @SchemaName = @SchemaName, @TableName = @TableName,
+                                              @IncludeQueryText = @IncludeQueryText, @Data = @Data OUTPUT;
 
         UPDATE AIIndexTuner.Run
-        SET CollectedChars = LEN(@Data), CollectedData = CASE WHEN @KeepDetail = 1 THEN @Data END
+        SET CollectedChars = LEN(@Data), CollectedData = CASE WHEN @KeepDetail = 1 THEN @Data END,
+            PayloadSupplied = CASE WHEN @CollectedData IS NOT NULL THEN 1 ELSE 0 END,
+            PayloadHash = CONVERT(char(64), HASHBYTES('SHA2_256', @Data), 2),
+            CollectMs = CASE WHEN @CollectedData IS NULL THEN DATEDIFF(MILLISECOND, @Started, SYSDATETIME()) END
         WHERE RunId = @RunId;
 
         DECLARE @UserPrompt nvarchar(max) = CONCAT(CAST(N'Analyze this SQL Server data:' AS nvarchar(max)), NCHAR(10), NCHAR(10), @Data);
-        DECLARE @Text nvarchar(max), @ModelUsed nvarchar(128), @InputTokens int, @OutputTokens int, @Truncated bit, @Raw nvarchar(max);
+        DECLARE @Text nvarchar(max), @ModelUsed nvarchar(128), @InputTokens int, @OutputTokens int, @Truncated bit, @Raw nvarchar(max),
+                @PollCount int, @ModelStarted datetime2(7) = SYSDATETIME();
 
         IF @TestResponse IS NOT NULL
             SELECT @Text = @TestResponse, @Truncated = 0;
@@ -95,11 +112,13 @@ BEGIN
             EXEC AIIndexTuner.usp_InvokeModel
                 @SystemPrompt = @SystemPrompt, @UserPrompt = @UserPrompt,
                 @Text = @Text OUTPUT, @ModelUsed = @ModelUsed OUTPUT, @InputTokens = @InputTokens OUTPUT,
-                @OutputTokens = @OutputTokens OUTPUT, @Truncated = @Truncated OUTPUT, @RawResponse = @Raw OUTPUT;
+                @OutputTokens = @OutputTokens OUTPUT, @Truncated = @Truncated OUTPUT, @RawResponse = @Raw OUTPUT,
+                @PollCount = @PollCount OUTPUT;
 
         UPDATE AIIndexTuner.Run
         SET ModelUsed = @ModelUsed, InputTokens = @InputTokens, OutputTokens = @OutputTokens, Truncated = @Truncated,
-            RawResponse = CASE WHEN @KeepDetail = 1 THEN ISNULL(@Raw, @Text) END
+            RawResponse = CASE WHEN @KeepDetail = 1 THEN ISNULL(@Raw, @Text) END,
+            ModelMs = DATEDIFF(MILLISECOND, @ModelStarted, SYSDATETIME()), PollCount = @PollCount
         WHERE RunId = @RunId;
 
         -- Some models wrap JSON in a Markdown fence even when told not to.
@@ -156,7 +175,7 @@ BEGIN
 
     IF @Mode = 'CREATE'
     BEGIN
-        DECLARE @RecId int;
+        DECLARE @RecId int, @ApplyStarted datetime2(7) = SYSDATETIME();
         DECLARE apply_cur CURSOR LOCAL FAST_FORWARD FOR
             SELECT RecommendationId FROM AIIndexTuner.Recommendation
             WHERE RunId = @RunId AND Category = 'CreateIndex'
@@ -170,6 +189,7 @@ BEGIN
         END;
         CLOSE apply_cur;
         DEALLOCATE apply_cur;
+        UPDATE AIIndexTuner.Run SET ApplyMs = DATEDIFF(MILLISECOND, @ApplyStarted, SYSDATETIME()) WHERE RunId = @RunId;
     END;
 
     SELECT r.RunId, r.Status AS RunStatus, r.ModelUsed, r.InputTokens, r.OutputTokens, r.Summary,

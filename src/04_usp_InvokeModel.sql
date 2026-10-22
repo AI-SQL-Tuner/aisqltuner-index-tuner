@@ -80,10 +80,12 @@ CREATE OR ALTER PROCEDURE AIIndexTuner.usp_InvokeModel
     @InputTokens  int OUTPUT,
     @OutputTokens int OUTPUT,
     @Truncated    bit OUTPUT,
-    @RawResponse  nvarchar(max) OUTPUT
+    @RawResponse  nvarchar(max) OUTPUT,
+    @PollCount    int = NULL OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET @PollCount = 0;
 
     DECLARE @Endpoint nvarchar(400), @Deployment nvarchar(128), @Credential sysname, @Effort varchar(10),
             @MaxOutputTokens int, @Timeout smallint, @Background bit, @MaxWaitSec int, @PollSec tinyint,
@@ -145,6 +147,7 @@ BEGIN
         END;
 
         WAITFOR DELAY @Delay;
+        SET @PollCount += 1;
 
         DECLARE @PollUrl nvarchar(4000) = CONCAT(@Url, N'/', @ResponseId);
         EXEC @rc = sys.sp_invoke_external_rest_endpoint
