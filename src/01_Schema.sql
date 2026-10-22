@@ -82,6 +82,17 @@ BEGIN
 END;
 GO
 
+/* Columns added after the first release. ALTER, so an existing install keeps its runs. */
+IF COL_LENGTH(N'AIIndexTuner.Run', N'PayloadSupplied') IS NULL
+    ALTER TABLE AIIndexTuner.Run ADD
+        PayloadSupplied bit      NOT NULL CONSTRAINT DF_AIIndexTuner_Run_PayloadSupplied DEFAULT (0),  -- @CollectedData was passed in
+        PayloadHash     char(64) NULL,   -- SHA-256 of the collected data, so runs with the same input can be identified
+        CollectMs       int      NULL,
+        ModelMs         int      NULL,
+        ApplyMs         int      NULL,
+        PollCount       int      NULL;   -- background-mode polls of the AI response
+GO
+
 IF OBJECT_ID(N'AIIndexTuner.Recommendation', N'U') IS NULL
 BEGIN
     CREATE TABLE AIIndexTuner.Recommendation

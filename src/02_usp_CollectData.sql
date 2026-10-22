@@ -203,7 +203,7 @@ BEGIN
             INNER JOIN sys.schemas AS s ON o.schema_id = s.schema_id
             WHERE d.database_id = DB_ID()
               AND st.avg_total_user_cost * st.avg_user_impact * (st.user_seeks + st.user_scans) > 100000
-              AND s.name <> N'AIIndexTuner' AND (@SchemaName IS NULL OR s.name = @SchemaName)
+              AND s.name NOT LIKE N'AIIndexTuner%' AND (@SchemaName IS NULL OR s.name = @SchemaName)
               AND (@TableName IS NULL OR o.name = @TableName)
             ORDER BY st.avg_total_user_cost * st.avg_user_impact * (st.user_seeks + st.user_scans) DESC
             FOR JSON PATH);
@@ -258,7 +258,7 @@ BEGIN
                        FROM sys.partitions GROUP BY object_id, index_id) AS p
                    ON p.object_id = i.object_id AND p.index_id = i.index_id
             WHERE obj.type = 'U'
-              AND sch.name <> N'AIIndexTuner' AND (@SchemaName IS NULL OR sch.name = @SchemaName)
+              AND sch.name NOT LIKE N'AIIndexTuner%' AND (@SchemaName IS NULL OR sch.name = @SchemaName)
               AND (@TableName IS NULL OR obj.name = @TableName)
         ),
         ranked AS (
@@ -300,7 +300,7 @@ BEGIN
             INNER JOIN sys.objects AS o ON d.object_id = o.object_id
             INNER JOIN sys.schemas AS s ON o.schema_id = s.schema_id
             WHERE d.database_id = DB_ID()
-              AND s.name <> N'AIIndexTuner' AND (@SchemaName IS NULL OR s.name = @SchemaName)
+              AND s.name NOT LIKE N'AIIndexTuner%' AND (@SchemaName IS NULL OR s.name = @SchemaName)
               AND (@TableName IS NULL OR o.name = @TableName)
             ORDER BY impact_score DESC
         ),
@@ -392,7 +392,7 @@ BEGIN
             INNER JOIN sys.objects AS o ON o.object_id = i.object_id
             INNER JOIN sys.schemas AS s ON s.schema_id = o.schema_id
             WHERE o.type = 'U' AND i.index_id > 0 AND i.is_hypothetical = 0 AND i.is_disabled = 0 AND i.type IN (1, 2)
-              AND s.name <> N'AIIndexTuner' AND (@SchemaName IS NULL OR s.name = @SchemaName)
+              AND s.name NOT LIKE N'AIIndexTuner%' AND (@SchemaName IS NULL OR s.name = @SchemaName)
               AND (@TableName IS NULL OR o.name = @TableName)
         ),
         sizes AS (
@@ -449,7 +449,10 @@ BEGIN
             -- for every ad hoc batch, which would pull in other databases' queries.
             CROSS APPLY (SELECT CAST(pa.value AS int) AS dbid FROM sys.dm_exec_plan_attributes(qs.plan_handle) AS pa WHERE pa.attribute = N'dbid') AS pdb
             WHERE pdb.dbid = DB_ID()
-              AND (st.objectid IS NULL OR OBJECT_SCHEMA_NAME(st.objectid, st.dbid) IS NULL OR OBJECT_SCHEMA_NAME(st.objectid, st.dbid) <> N'AIIndexTuner')
+              -- Leave out this tool's own statements: its AIIndexTuner* schemas, the sp_AIIndexTuner* procs in dbo,
+              -- and ad hoc batches that call or query them.
+              AND (st.objectid IS NULL OR OBJECT_SCHEMA_NAME(st.objectid, st.dbid) IS NULL OR OBJECT_SCHEMA_NAME(st.objectid, st.dbid) NOT LIKE N'AIIndexTuner%')
+              AND st.text NOT LIKE N'%AIIndexTuner%'
             ORDER BY qs.total_worker_time DESC
             FOR JSON PATH);
         SET @Data += CONCAT(@nl, N'=== PLAN CACHE QUERY STATISTICS ===', @nl, ISNULL(@j, N'(none)'), @nl);
@@ -467,7 +470,7 @@ BEGIN
         FROM sys.tables AS t
         INNER JOIN sys.schemas AS s ON t.schema_id = s.schema_id
         INNER JOIN sys.dm_db_partition_stats AS ps ON t.object_id = ps.object_id AND ps.index_id = 0
-        WHERE s.name <> N'AIIndexTuner' AND (@SchemaName IS NULL OR s.name = @SchemaName)
+        WHERE s.name NOT LIKE N'AIIndexTuner%' AND (@SchemaName IS NULL OR s.name = @SchemaName)
           AND (@TableName IS NULL OR t.name = @TableName)
         GROUP BY t.object_id, s.name, t.name
         HAVING SUM(ps.row_count) >= 10000
@@ -507,7 +510,7 @@ BEGIN
             LEFT JOIN sys.objects AS rt ON fkc.referenced_object_id = rt.object_id
             LEFT JOIN sys.columns AS rcol ON fkc.referenced_object_id = rcol.object_id AND fkc.referenced_column_id = rcol.column_id
             WHERE c.type IN ('F', 'PK', 'UQ')
-              AND SCHEMA_NAME(t.schema_id) <> N'AIIndexTuner' AND (@SchemaName IS NULL OR SCHEMA_NAME(t.schema_id) = @SchemaName)
+              AND SCHEMA_NAME(t.schema_id) NOT LIKE N'AIIndexTuner%' AND (@SchemaName IS NULL OR SCHEMA_NAME(t.schema_id) = @SchemaName)
               AND (@TableName IS NULL OR t.name = @TableName)
             ORDER BY t.name, c.type_desc, c.name
             FOR JSON PATH);
@@ -527,14 +530,14 @@ BEGIN
                 INNER JOIN sys.objects AS o ON o.object_id = fk.parent_object_id
                 INNER JOIN sys.schemas AS s ON s.schema_id = o.schema_id
                 WHERE (fk.is_not_trusted = 1 OR fk.is_disabled = 1)
-                  AND s.name <> N'AIIndexTuner' AND (@SchemaName IS NULL OR s.name = @SchemaName) AND (@TableName IS NULL OR o.name = @TableName)
+                  AND s.name NOT LIKE N'AIIndexTuner%' AND (@SchemaName IS NULL OR s.name = @SchemaName) AND (@TableName IS NULL OR o.name = @TableName)
                 UNION ALL
                 SELECT SCHEMA_NAME(o.schema_id) + N'.' + o.name, cc.name, 'CHECK', cc.is_not_trusted, cc.is_disabled
                 FROM sys.check_constraints AS cc
                 INNER JOIN sys.objects AS o ON o.object_id = cc.parent_object_id
                 INNER JOIN sys.schemas AS s ON s.schema_id = o.schema_id
                 WHERE (cc.is_not_trusted = 1 OR cc.is_disabled = 1)
-                  AND s.name <> N'AIIndexTuner' AND (@SchemaName IS NULL OR s.name = @SchemaName) AND (@TableName IS NULL OR o.name = @TableName)
+                  AND s.name NOT LIKE N'AIIndexTuner%' AND (@SchemaName IS NULL OR s.name = @SchemaName) AND (@TableName IS NULL OR o.name = @TableName)
             ) AS u
             ORDER BY u.TableName, u.ConstraintName
             FOR JSON PATH);
@@ -565,7 +568,7 @@ BEGIN
             INNER JOIN sys.schemas AS sch ON obj.schema_id = sch.schema_id
             OUTER APPLY sys.dm_db_index_operational_stats(DB_ID(), i.object_id, i.index_id, NULL) AS ios
             WHERE obj.type = 'U' AND i.index_id > 0 AND i.is_hypothetical = 0
-              AND sch.name <> N'AIIndexTuner' AND (@SchemaName IS NULL OR sch.name = @SchemaName)
+              AND sch.name NOT LIKE N'AIIndexTuner%' AND (@SchemaName IS NULL OR sch.name = @SchemaName)
               AND (@TableName IS NULL OR obj.name = @TableName)
             ORDER BY ISNULL(ios.row_lock_wait_in_ms, 0) + ISNULL(ios.page_lock_wait_in_ms, 0) + ISNULL(ios.page_latch_wait_in_ms, 0) DESC,
                      ISNULL(ios.leaf_update_count, 0) DESC
@@ -590,7 +593,7 @@ BEGIN
             FROM sys.stats AS s
             INNER JOIN sys.objects AS o ON s.object_id = o.object_id
             WHERE o.type = 'U'
-              AND OBJECT_SCHEMA_NAME(s.object_id) <> N'AIIndexTuner' AND (@SchemaName IS NULL OR OBJECT_SCHEMA_NAME(s.object_id) = @SchemaName)
+              AND OBJECT_SCHEMA_NAME(s.object_id) NOT LIKE N'AIIndexTuner%' AND (@SchemaName IS NULL OR OBJECT_SCHEMA_NAME(s.object_id) = @SchemaName)
               AND (@TableName IS NULL OR OBJECT_NAME(s.object_id) = @TableName)
               AND (   s.object_id IN (SELECT TOP (20) d.object_id
                                       FROM sys.dm_db_missing_index_details AS d
@@ -658,7 +661,7 @@ BEGIN
             FROM LargeTables AS lt
             INNER JOIN sys.tables AS t ON lt.object_id = t.object_id
             INNER JOIN sys.schemas AS s ON t.schema_id = s.schema_id
-            WHERE s.name <> N'AIIndexTuner' AND (@SchemaName IS NULL OR s.name = @SchemaName) AND (@TableName IS NULL OR t.name = @TableName)
+            WHERE s.name NOT LIKE N'AIIndexTuner%' AND (@SchemaName IS NULL OR s.name = @SchemaName) AND (@TableName IS NULL OR t.name = @TableName)
             ORDER BY lt.TotalRows DESC
             FOR JSON PATH);
         SET @Data += CONCAT(@nl, N'=== LARGE TABLES ===', @nl, ISNULL(@j, N'(no tables over 1,000,000 rows)'), @nl);
@@ -719,7 +722,7 @@ BEGIN
             INNER JOIN sys.schemas AS s ON o.schema_id = s.schema_id
             WHERE d.database_id = DB_ID()
               AND st.avg_total_user_cost * st.avg_user_impact * (st.user_seeks + st.user_scans) > 100000
-              AND s.name <> N'AIIndexTuner' AND (@SchemaName IS NULL OR s.name = @SchemaName)
+              AND s.name NOT LIKE N'AIIndexTuner%' AND (@SchemaName IS NULL OR s.name = @SchemaName)
             GROUP BY d.object_id
             ORDER BY MAX(st.avg_total_user_cost * st.avg_user_impact * (st.user_seeks + st.user_scans)) DESC;
 
@@ -729,7 +732,7 @@ BEGIN
             INNER JOIN sys.tables AS t ON ps.object_id = t.object_id
             INNER JOIN sys.schemas AS s ON t.schema_id = s.schema_id
             WHERE ps.index_id IN (0, 1)
-              AND s.name <> N'AIIndexTuner' AND (@SchemaName IS NULL OR s.name = @SchemaName)
+              AND s.name NOT LIKE N'AIIndexTuner%' AND (@SchemaName IS NULL OR s.name = @SchemaName)
               AND ps.object_id NOT IN (SELECT object_id FROM #DensityCandidates)
             GROUP BY ps.object_id
             HAVING SUM(ps.row_count) > 10000
@@ -955,7 +958,10 @@ BEGIN
             INNER JOIN sys.query_store_query_text AS qt ON q.query_text_id = qt.query_text_id
             LEFT JOIN waits AS w ON rs.plan_id = w.plan_id
             WHERE q.is_internal_query = 0
-              AND (q.object_id = 0 OR OBJECT_SCHEMA_NAME(q.object_id) IS NULL OR OBJECT_SCHEMA_NAME(q.object_id) <> N'AIIndexTuner')
+              -- Leave out this tool's own statements, as in the plan cache section.
+              AND (q.object_id = 0 OR OBJECT_SCHEMA_NAME(q.object_id) IS NULL OR OBJECT_SCHEMA_NAME(q.object_id) NOT LIKE N'AIIndexTuner%')
+              AND (q.object_id = 0 OR OBJECT_NAME(q.object_id) IS NULL OR OBJECT_NAME(q.object_id) NOT LIKE N'sp[_]AIIndexTuner%')
+              AND qt.query_sql_text NOT LIKE N'%AIIndexTuner%'
         ),
         param_sens AS (
             SELECT query_id, COUNT(*) AS distinct_plan_count,
@@ -1036,6 +1042,7 @@ BEGIN
             CROSS APPLY (SELECT LEFT(CASE WHEN prefix.p IS NOT NULL THEN SUBSTRING(head.t, prefix.p + 1, 4000) ELSE head.t END, 200) AS s) AS stmt
             WHERE rs.runtime_stats_interval_id >= @QsMinInterval
               AND (@QsScoped = 0 OR EXISTS (SELECT 1 FROM #qs_scope AS sc WHERE sc.query_id = q.query_id))
+              AND qt.query_sql_text NOT LIKE N'%AIIndexTuner%'   -- this tool's own writes (runs, recommendations)
         )
         SELECT @j = (
             SELECT TOP (12) StatementType, HourOfDayUtc, SUM(count_executions) AS Executions

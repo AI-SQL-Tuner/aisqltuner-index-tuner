@@ -339,5 +339,52 @@ IF AIIndexTuner.fn_ResponseText(N'{"response":{},"result":{"status":"completed",
 PRINT 'PASS T10: answer text over 4,000 characters is read whole, in order, skipping reasoning items';
 GO
 
+/* ===== T12: @CollectedData pins the input ===== */
+DECLARE @Pinned nvarchar(max) = N'Server Name: pinned' + NCHAR(10) + N'=== MISSING INDEX RECOMMENDATIONS ===' + NCHAR(10) + N'(none)';
+DECLARE @Answer nvarchar(max) = N'{"summary": "pinned", "recommendations": []}';
+EXEC dbo.sp_AIIndexTuner @CollectedData = @Pinned, @TestResponse = @Answer;
+EXEC dbo.sp_AIIndexTuner @CollectedData = @Pinned, @TestResponse = @Answer;
+DECLARE @A int = (SELECT MAX(RunId) FROM AIIndexTuner.Run) - 1, @B int = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
+IF EXISTS (SELECT 1 FROM AIIndexTuner.Run WHERE RunId IN (@A, @B)
+           AND (Status <> 'Succeeded' OR PayloadSupplied <> 1 OR CollectedData <> @Pinned OR CollectedChars <> LEN(@Pinned)
+                OR CollectMs IS NOT NULL OR ModelMs IS NULL
+                OR PayloadHash <> CONVERT(char(64), HASHBYTES('SHA2_256', @Pinned), 2)))
+    THROW 50999, N'FAIL T12: a pinned run did not record the supplied payload, its hash and timings.', 1;
+IF (SELECT COUNT(DISTINCT PayloadHash) FROM AIIndexTuner.Run WHERE RunId IN (@A, @B)) <> 1
+    THROW 50999, N'FAIL T12: two runs with the same payload have different hashes.', 1;
+IF (SELECT PayloadSupplied FROM AIIndexTuner.Run WHERE RunId = (SELECT MIN(RunId) FROM AIIndexTuner.Run)) <> 0
+   OR (SELECT CollectMs FROM AIIndexTuner.Run WHERE RunId = (SELECT MIN(RunId) FROM AIIndexTuner.Run)) IS NULL
+    THROW 50999, N'FAIL T12: a collecting run is not marked as collected, or has no collect time.', 1;
+BEGIN TRY
+    EXEC dbo.sp_AIIndexTuner @CollectedData = N'', @TestResponse = @Answer;
+    THROW 50999, N'FAIL T12: an empty @CollectedData was accepted.', 1;
+END TRY
+BEGIN CATCH
+    IF ERROR_NUMBER() <> 50208 THROW;
+END CATCH;
+BEGIN TRY
+    EXEC dbo.sp_AIIndexTuner @CollectedData = @Pinned, @CollectOnly = 1;
+    THROW 50999, N'FAIL T12: @CollectedData with @CollectOnly = 1 was accepted.', 1;
+END TRY
+BEGIN CATCH
+    IF ERROR_NUMBER() <> 50208 THROW;
+END CATCH;
+PRINT 'PASS T12: @CollectedData pins the input, with its hash and timings recorded';
+GO
+
+/* ===== T13: the collector leaves out this tool's own statements =====
+   By now the tests have run sp_AIIndexTuner many times, so its statements are in the plan cache
+   and Query Store. */
+DECLARE @Data nvarchar(max);
+EXEC AIIndexTuner.usp_CollectData @Data = @Data OUTPUT;
+DECLARE @PlanCache nvarchar(max) = SUBSTRING(@Data, CHARINDEX(N'=== PLAN CACHE QUERY STATISTICS ===', @Data), CHARINDEX(N'=== HEAP TABLE ANALYSIS ===', @Data) - CHARINDEX(N'=== PLAN CACHE QUERY STATISTICS ===', @Data)),
+        @QueryStore nvarchar(max) = SUBSTRING(@Data, CHARINDEX(N'=== QUERY STORE WORKLOAD INSIGHTS ===', @Data), CHARINDEX(N'=== AUTOMATIC TUNING OPTIONS ===', @Data) - CHARINDEX(N'=== QUERY STORE WORKLOAD INSIGHTS ===', @Data));
+IF @PlanCache LIKE N'%AIIndexTuner%' OR @QueryStore LIKE N'%AIIndexTuner%'
+    THROW 50999, N'FAIL T13: the plan cache or Query Store sections include this tool''s own statements.', 1;
+IF @QueryStore NOT LIKE N'%"QueryId"%'
+    THROW 50999, N'FAIL T13: the Query Store section is empty, so the check above proves nothing.', 1;
+PRINT 'PASS T13: the plan cache, Query Store workload and write mix leave out this tool''s own statements';
+GO
+
 PRINT 'ALL TESTS PASSED';
 GO
