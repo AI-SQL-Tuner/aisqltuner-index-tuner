@@ -1,5 +1,5 @@
 ﻿/*
-    Creates AIIndexTunerTest: a small database with the problems the collectors look for.
+    Creates the test database (default AIIndexTunerTest): a small database with the problems the collectors look for.
 
         - dbo.Orders (300,000 rows) queried by CustomerId and OrderDate with no index to support it,
           so the missing-index DMVs fill up
@@ -7,24 +7,24 @@
         - an untrusted foreign key
         - a 20,000-row heap
 
-    sqlcmd -S localhost -E -C -f 65001 -i tests\01_Create-TestDb.sql
+    sqlcmd -S localhost -E -C -f 65001 -v TestDb=AIIndexTunerTest -i tests\01_Create-TestDb.sql
 */
 SET NOCOUNT ON;
 USE master;
 GO
-IF DB_ID(N'AIIndexTunerTest') IS NOT NULL
+IF DB_ID(N'$(TestDb)') IS NOT NULL
 BEGIN
-    ALTER DATABASE AIIndexTunerTest SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
-    DROP DATABASE AIIndexTunerTest;
+    ALTER DATABASE $(TestDb) SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+    DROP DATABASE $(TestDb);
 END;
 GO
-CREATE DATABASE AIIndexTunerTest;
+CREATE DATABASE $(TestDb);
 GO
-ALTER DATABASE AIIndexTunerTest SET RECOVERY SIMPLE;
+ALTER DATABASE $(TestDb) SET RECOVERY SIMPLE;
 -- Capture every query, so the Query Store sections see the setup writes and the small workload.
-ALTER DATABASE AIIndexTunerTest SET QUERY_STORE = ON (OPERATION_MODE = READ_WRITE, QUERY_CAPTURE_MODE = ALL);
+ALTER DATABASE $(TestDb) SET QUERY_STORE = ON (OPERATION_MODE = READ_WRITE, QUERY_CAPTURE_MODE = ALL);
 GO
-USE AIIndexTunerTest;
+USE $(TestDb);
 GO
 
 CREATE TABLE dbo.Customers

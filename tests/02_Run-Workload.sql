@@ -1,12 +1,10 @@
 ﻿/*
-    Runs the test workload against AIIndexTunerTest. Rerun it after a restart or a plan cache flush,
+    Runs the test workload against the test database (default AIIndexTunerTest). Rerun it after a restart or a plan cache flush,
     since the collectors read the plan cache and the missing-index DMVs.
 
     sqlcmd -S localhost -E -C -f 65001 -d AIIndexTunerTest -i tests\02_Run-Workload.sql
 */
 SET NOCOUNT ON;
-USE AIIndexTunerTest;
-GO
 
 -- A forced plan that fails: force a plan that uses an index, then drop the index, so the next
 -- compile cannot use the forced plan (NO_INDEX). This runs before the workload below because

@@ -201,6 +201,92 @@ SET ANSI_NULLS ON;
 SET QUOTED_IDENTIFIER ON;
 GO
 /*
+    AIIndexTuner.usp_UsageSince
+
+    The period the usage DMVs cover for the current database (GetUsageStatisticsSinceAsync in the
+    desktop collector). Usage DMVs and the plan cache start empty when SQL Server starts, and for one
+    database when it is restored, attached, reverted from a snapshot, brought ONLINE or reopened
+    under AUTO_CLOSE. @Since is the latest of those times that can be read; @SinceSource names it.
+
+    Used by usp_CollectData for the "Database Usage Statistics Since" line, and by
+    usp_ApplyRecommendation, which drops an index for low use only after a long enough period.
+*/
+CREATE OR ALTER PROCEDURE AIIndexTuner.usp_UsageSince
+    @Since              datetime2(0)  = NULL OUTPUT,
+    @SinceSource        nvarchar(400) = NULL OUTPUT,
+    @StartTime          datetime2(0)  = NULL OUTPUT,
+    @AutoClose          bit           = NULL OUTPUT,
+    @RestoreHistoryRead bit           = NULL OUTPUT,
+    @LastStartup        datetime2(0)  = NULL OUTPUT,
+    @ErrorLogsSearched  int           = NULL OUTPUT,
+    @HasInstanceLogs    bit           = NULL OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @CreateDate datetime2(0), @LastRestore datetime2(0);
+    SELECT @Since = NULL, @SinceSource = NULL, @StartTime = NULL, @RestoreHistoryRead = 0, @LastStartup = NULL, @ErrorLogsSearched = 0,
+           -- Azure SQL Database, Synapse and Fabric have no msdb restore history or error log to read.
+           @HasInstanceLogs = CASE WHEN CAST(SERVERPROPERTY('EngineEdition') AS int) IN (5, 6, 11, 12) THEN 0 ELSE 1 END;
+
+    BEGIN TRY
+        SELECT @StartTime = sqlserver_start_time FROM sys.dm_os_sys_info;
+    END TRY
+    BEGIN CATCH
+        SET @StartTime = NULL;
+    END CATCH;
+
+    SELECT @CreateDate = create_date, @AutoClose = is_auto_close_on FROM sys.databases WHERE database_id = DB_ID();
+
+    IF @HasInstanceLogs = 1
+    BEGIN
+        BEGIN TRY
+            SELECT @LastRestore = MAX(restore_date) FROM msdb.dbo.restorehistory WHERE destination_database_name = DB_NAME();
+            SET @RestoreHistoryRead = 1;
+        END TRY
+        BEGIN CATCH
+            SET @LastRestore = NULL;
+        END CATCH;
+
+        -- Newest error log first, stopping at the first log with a startup message for this database.
+        -- Reading the error log needs securityadmin (or sysadmin). The closing quote in the search keeps
+        -- 'Sales' from matching 'Sales2'.
+        IF ISNULL(IS_SRVROLEMEMBER(N'securityadmin'), 0) = 1 OR ISNULL(IS_SRVROLEMEMBER(N'sysadmin'), 0) = 1
+        BEGIN
+            DECLARE @Log int = 0, @Search nvarchar(4000) = CONCAT(N'Starting up database ''', DB_NAME(), N'''.');
+            CREATE TABLE #ErrorLog (LogDate datetime, ProcessInfo nvarchar(100), [Text] nvarchar(max));
+            WHILE @Log < 7 AND @LastStartup IS NULL
+            BEGIN
+                BEGIN TRY
+                    TRUNCATE TABLE #ErrorLog;
+                    INSERT #ErrorLog (LogDate, ProcessInfo, [Text]) EXEC sys.sp_readerrorlog @p1 = @Log, @p2 = 1, @p3 = @Search;
+                    SELECT @LastStartup = MAX(LogDate) FROM #ErrorLog;
+                    SET @ErrorLogsSearched += 1;
+                END TRY
+                BEGIN CATCH
+                    BREAK;   -- past the oldest archive the log does not exist; any other error also ends the search
+                END CATCH;
+                SET @Log += 1;
+            END;
+            DROP TABLE #ErrorLog;
+        END;
+    END;
+
+    -- Later candidates win ties, so the error log, which names every kind of reset, is preferred.
+    IF @StartTime IS NOT NULL SELECT @Since = @StartTime, @SinceSource = N'the SQL Server start time, the latest reset found';
+    IF @CreateDate IS NOT NULL AND (@Since IS NULL OR @CreateDate >= @Since)
+        SELECT @Since = @CreateDate, @SinceSource = N'its create date in sys.databases, which an attach or a restore under a new name sets';
+    IF @LastRestore IS NOT NULL AND (@Since IS NULL OR @LastRestore >= @Since)
+        SELECT @Since = @LastRestore, @SinceSource = N'its latest restore in msdb.dbo.restorehistory';
+    IF @LastStartup IS NOT NULL AND (@Since IS NULL OR @LastStartup >= @Since)
+        SELECT @Since = @LastStartup, @SinceSource = N'its latest "Starting up database" message in the SQL Server error log, which is written whenever it starts: at a server restart, a restore, an attach, a database snapshot revert, an ONLINE after OFFLINE, or an AUTO_CLOSE reopen';
+END;
+GO
+
+SET ANSI_NULLS ON;
+SET QUOTED_IDENTIFIER ON;
+GO
+/*
     AIIndexTuner.usp_CollectData
 
     Collects the Index Tuning diagnostics for the current database into one text payload for the
@@ -259,66 +345,14 @@ BEGIN
         N'Major Version: ', CASE WHEN @MajorVersion >= 17 THEN N'SQL Server 2025' WHEN @MajorVersion = 16 THEN N'SQL Server 2022' ELSE CONCAT(N'Version ', @MajorVersion) END, @nl,
         N'Full Version: ', @@VERSION, @nl);
 
-    /* Start time and the period the usage DMVs cover (GetUsageStatisticsSinceAsync). Usage DMVs and
-       the plan cache start empty when SQL Server starts, and for one database when it is restored,
-       attached, reverted from a snapshot, brought ONLINE or reopened under AUTO_CLOSE. */
-    DECLARE @StartTime datetime2(0), @Now datetime2(0) = SYSDATETIME(), @CreateDate datetime2(0), @AutoClose bit,
-            @LastRestore datetime2(0), @RestoreHistoryRead bit = 0, @LastStartup datetime2(0), @ErrorLogsSearched int = 0,
-            @Since datetime2(0), @SinceSource nvarchar(400),
-            -- Azure SQL Database, Synapse and Fabric have no msdb restore history or error log to read.
-            @HasInstanceLogs bit = CASE WHEN CAST(SERVERPROPERTY('EngineEdition') AS int) IN (5, 6, 11, 12) THEN 0 ELSE 1 END;
+    /* Start time and the period the usage DMVs cover (GetUsageStatisticsSinceAsync); see usp_UsageSince. */
+    DECLARE @StartTime datetime2(0), @Now datetime2(0) = SYSDATETIME(), @AutoClose bit, @RestoreHistoryRead bit,
+            @LastStartup datetime2(0), @ErrorLogsSearched int, @Since datetime2(0), @SinceSource nvarchar(400), @HasInstanceLogs bit;
 
-    BEGIN TRY
-        SELECT @StartTime = sqlserver_start_time FROM sys.dm_os_sys_info;
-    END TRY
-    BEGIN CATCH
-        SET @StartTime = NULL;
-    END CATCH;
-
-    SELECT @CreateDate = create_date, @AutoClose = is_auto_close_on FROM sys.databases WHERE database_id = DB_ID();
-
-    IF @HasInstanceLogs = 1
-    BEGIN
-        BEGIN TRY
-            SELECT @LastRestore = MAX(restore_date) FROM msdb.dbo.restorehistory WHERE destination_database_name = DB_NAME();
-            SET @RestoreHistoryRead = 1;
-        END TRY
-        BEGIN CATCH
-            SET @LastRestore = NULL;
-        END CATCH;
-
-        -- Newest error log first, stopping at the first log with a startup message for this database.
-        -- Reading the error log needs securityadmin (or sysadmin). The closing quote in the search keeps
-        -- 'Sales' from matching 'Sales2'.
-        IF ISNULL(IS_SRVROLEMEMBER(N'securityadmin'), 0) = 1 OR ISNULL(IS_SRVROLEMEMBER(N'sysadmin'), 0) = 1
-        BEGIN
-            DECLARE @Log int = 0, @Search nvarchar(4000) = CONCAT(N'Starting up database ''', DB_NAME(), N'''.');
-            CREATE TABLE #ErrorLog (LogDate datetime, ProcessInfo nvarchar(100), [Text] nvarchar(max));
-            WHILE @Log < 7 AND @LastStartup IS NULL
-            BEGIN
-                BEGIN TRY
-                    TRUNCATE TABLE #ErrorLog;
-                    INSERT #ErrorLog (LogDate, ProcessInfo, [Text]) EXEC sys.sp_readerrorlog @p1 = @Log, @p2 = 1, @p3 = @Search;
-                    SELECT @LastStartup = MAX(LogDate) FROM #ErrorLog;
-                    SET @ErrorLogsSearched += 1;
-                END TRY
-                BEGIN CATCH
-                    BREAK;   -- past the oldest archive the log does not exist; any other error also ends the search
-                END CATCH;
-                SET @Log += 1;
-            END;
-            DROP TABLE #ErrorLog;
-        END;
-    END;
-
-    -- Later candidates win ties, so the error log, which names every kind of reset, is preferred.
-    IF @StartTime IS NOT NULL SELECT @Since = @StartTime, @SinceSource = N'the SQL Server start time, the latest reset found';
-    IF @CreateDate IS NOT NULL AND (@Since IS NULL OR @CreateDate >= @Since)
-        SELECT @Since = @CreateDate, @SinceSource = N'its create date in sys.databases, which an attach or a restore under a new name sets';
-    IF @LastRestore IS NOT NULL AND (@Since IS NULL OR @LastRestore >= @Since)
-        SELECT @Since = @LastRestore, @SinceSource = N'its latest restore in msdb.dbo.restorehistory';
-    IF @LastStartup IS NOT NULL AND (@Since IS NULL OR @LastStartup >= @Since)
-        SELECT @Since = @LastStartup, @SinceSource = N'its latest "Starting up database" message in the SQL Server error log, which is written whenever it starts: at a server restart, a restore, an attach, a database snapshot revert, an ONLINE after OFFLINE, or an AUTO_CLOSE reopen';
+    EXEC AIIndexTuner.usp_UsageSince
+        @Since = @Since OUTPUT, @SinceSource = @SinceSource OUTPUT, @StartTime = @StartTime OUTPUT, @AutoClose = @AutoClose OUTPUT,
+        @RestoreHistoryRead = @RestoreHistoryRead OUTPUT, @LastStartup = @LastStartup OUTPUT,
+        @ErrorLogsSearched = @ErrorLogsSearched OUTPUT, @HasInstanceLogs = @HasInstanceLogs OUTPUT;
 
     SET @Data += CASE WHEN @StartTime IS NOT NULL
         THEN CONCAT(N'SQL Server Start Time: ', CONVERT(varchar(19), @StartTime, 120), N' (server local time); uptime ',
@@ -1431,7 +1465,7 @@ BEGIN
         N'category: CreateIndex for a new index, rowstore or columnstore; DropIndex for dropping one existing index; ConsolidateIndex for merging, widening or replacing existing indexes; RebuildIndex; Constraint; Statistics; Setting; QueryChange; Other for anything else. ',
         N'For CreateIndex, fill schema_name, table_name, index_name, index_type (NONCLUSTERED for a rowstore index, NONCLUSTERED COLUMNSTORE or CLUSTERED COLUMNSTORE), key_columns (in key order, each with descending), include_columns, filter_predicate (null unless the index is filtered), is_unique, fill_factor (null to use the default), data_compression (NONE, ROW, PAGE, or null to leave it unset) and estimated_size_mb, using object and column names exactly as they appear in the input, without brackets. ',
         N'For a nonclustered columnstore index, list its columns in key_columns with descending false and leave include_columns empty. For a clustered columnstore index, leave key_columns and include_columns empty. A columnstore index takes no is_unique, fill_factor or data_compression: use false and null. ',
-        N'For DropIndex, fill schema_name, table_name and index_name with the index to drop. ',
+        N'For DropIndex, fill schema_name, table_name and index_name with the index to drop. Use DropIndex only for an index to drop now; put an index to confirm after a longer observation period under Other. ',
         N'For the other categories, fill schema_name, table_name and index_name when the recommendation is about one object, use null for index_type, and use empty arrays and null for the other fields that do not apply. ',
         N'confidence is High, Medium or Low. rationale gives the evidence from the input. benefiting_queries lists the plan cache statements that benefit, by query hash or a short excerpt, or is empty. ',
         N'script is the complete T-SQL that implements the recommendation, or an empty string when there is nothing to run. Do not put rollback, validation, diagnostic or monitoring scripts in it.');
@@ -1743,7 +1777,8 @@ GO
     allows one that the other left NULL (recommend-only). @MaxNewIndexes uses the lower limit.
 
     Applied: new rowstore indexes; new columnstore indexes when allowed; drops of nonclustered
-    indexes when allowed and nothing depends on them. Every other category, and any filtered index,
+    indexes when allowed, nothing depends on them, and either another index makes them redundant
+    or the usage statistics cover at least 7 days. Every other category, and any filtered index,
     is left for review. The outcome is written to the recommendation row: Applied (with the DDL and
     the DDL that reverses it), Skipped (with the reason) or Failed (with the error). Skipped and
     Failed recommendations can be applied again, for example with a setting that allows them.
@@ -1867,6 +1902,65 @@ BEGIN
             END CATCH;
         END;
 
+        -- Why it can go. Either another index makes it redundant: it has the same leading keys,
+        -- covers the includes and filter, and keeps any uniqueness, so nothing is lost however short
+        -- the usage history. Or it is little used, which the usage DMVs show only over enough time,
+        -- so a low-use drop needs at least @MinUsageDays of usage statistics.
+        DECLARE @Basis nvarchar(4000), @MinUsageDays int = 7;
+        IF @Reason IS NULL
+        BEGIN
+            DECLARE @Redundant sysname, @Sig nvarchar(max), @DropUnique bit, @DropFilter nvarchar(max);
+            SELECT @DropUnique = is_unique, @DropFilter = filter_definition FROM sys.indexes WHERE object_id = @ObjectId AND index_id = @IndexId;
+            SET @Sig = (SELECT STRING_AGG(CONCAT(column_id, CASE WHEN is_descending_key = 1 THEN 'D' ELSE 'A' END), ',') WITHIN GROUP (ORDER BY key_ordinal)
+                        FROM sys.index_columns WHERE object_id = @ObjectId AND index_id = @IndexId AND key_ordinal > 0);
+
+            IF @Type = 2
+                SELECT TOP (1) @Redundant = i.name
+                FROM sys.indexes AS i
+                CROSS APPLY (SELECT STRING_AGG(CONCAT(ic.column_id, CASE WHEN ic.is_descending_key = 1 THEN 'D' ELSE 'A' END), ',') WITHIN GROUP (ORDER BY ic.key_ordinal) AS sig
+                             FROM sys.index_columns AS ic
+                             WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0) AS k
+                WHERE i.object_id = @ObjectId AND i.index_id <> @IndexId AND i.type IN (1, 2) AND i.is_disabled = 0 AND i.is_hypothetical = 0
+                  AND (i.has_filter = 0 OR i.filter_definition = @DropFilter)
+                  AND (k.sig = @Sig OR LEFT(k.sig, LEN(@Sig) + 1) = @Sig + ',')
+                  AND (@DropUnique = 0 OR (i.is_unique = 1 AND k.sig = @Sig))
+                  AND (i.type = 1   -- the clustered index covers every column
+                       OR NOT EXISTS (SELECT 1 FROM sys.index_columns AS inc
+                                      WHERE inc.object_id = @ObjectId AND inc.index_id = @IndexId AND inc.is_included_column = 1
+                                        AND NOT EXISTS (SELECT 1 FROM sys.index_columns AS ic
+                                                        WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.column_id = inc.column_id)))
+                ORDER BY i.index_id;
+
+            IF @Redundant IS NOT NULL
+                SET @Basis = CONCAT(N'Redundant: ', QUOTENAME(@Redundant), N' has the same leading keys and covers it.');
+            ELSE
+            BEGIN
+                DECLARE @Since datetime2(0), @SinceSource nvarchar(400), @ErrorLogsSearched int, @HasInstanceLogs bit;
+                BEGIN TRY
+                    EXEC AIIndexTuner.usp_UsageSince @Since = @Since OUTPUT, @SinceSource = @SinceSource OUTPUT,
+                                                     @ErrorLogsSearched = @ErrorLogsSearched OUTPUT, @HasInstanceLogs = @HasInstanceLogs OUTPUT;
+                END TRY
+                BEGIN CATCH
+                    SET @Since = NULL;
+                END CATCH;
+
+                IF @Since IS NULL
+                    SET @Reason = CONCAT(N'No other index covers ', QUOTENAME(@IndexName), N', and the period the usage statistics cover is unknown, so it is not dropped for low use.');
+                -- Without the error log, a reset after the times above (an ONLINE after OFFLINE, a
+                -- snapshot revert, an AUTO_CLOSE reopen) would not show, so the period may be shorter.
+                ELSE IF @HasInstanceLogs = 1 AND @ErrorLogsSearched = 0
+                    SET @Reason = CONCAT(N'No other index covers ', QUOTENAME(@IndexName), N', and the error log could not be read (that needs securityadmin or sysadmin, ',
+                                         N'and does not work inside INSERT ... EXEC), so the period the usage statistics cover cannot be confirmed for a low-use drop.');
+                ELSE IF @Since > DATEADD(DAY, -@MinUsageDays, SYSDATETIME())
+                    SET @Reason = CONCAT(N'No other index covers ', QUOTENAME(@IndexName), N', and the usage statistics cover only ',
+                                         AIIndexTuner.fn_FormatUptime(DATEDIFF(MINUTE, @Since, SYSDATETIME())), N' (since ', CONVERT(varchar(19), @Since, 120),
+                                         N', from ', @SinceSource, N'). An index is dropped for low use only after at least ', @MinUsageDays, N' days of them.');
+                ELSE
+                    SET @Basis = CONCAT(N'Low use over ', AIIndexTuner.fn_FormatUptime(DATEDIFF(MINUTE, @Since, SYSDATETIME())), N' of usage statistics (since ',
+                                        CONVERT(varchar(19), @Since, 120), N').');
+            END;
+        END;
+
         IF @Reason IS NOT NULL
         BEGIN
             UPDATE AIIndexTuner.Recommendation SET Status = 'Skipped', StatusReason = @Reason WHERE RecommendationId = @RecommendationId;
@@ -1925,7 +2019,7 @@ BEGIN
         END CATCH;
 
         UPDATE AIIndexTuner.Recommendation
-        SET Status = 'Applied', StatusReason = NULL, AppliedDDL = @Ddl, UndoDDL = @Undo,
+        SET Status = 'Applied', StatusReason = @Basis, AppliedDDL = @Ddl, UndoDDL = @Undo,
             AppliedAt = SYSDATETIME(), AppliedBy = ORIGINAL_LOGIN()
         WHERE RecommendationId = @RecommendationId;
         RETURN;

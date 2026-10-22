@@ -122,6 +122,12 @@ EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @AllowColumnstore = 1, @AllowDropInde
   - indexes a foreign key references
   - indexes named by an index hint in a module, a plan guide or a Query Store hint
   - indexes a forced Query Store plan uses, since the plan would fail with `NO_INDEX`
+  - low-use drops before the usage statistics cover 7 days. An index that another index makes
+    redundant can be dropped at any time. Redundant here means the other index has the same leading
+    keys, covers its includes and filter, and keeps any uniqueness. On SQL Server, a low-use drop
+    also needs the error log to confirm the period, which takes securityadmin or sysadmin and doesn't
+    work inside `INSERT ... EXEC`. On Azure SQL Database a failover can reset the statistics without
+    a trace, so the 7 days are counted from the times it can see.
 - **What it adds:** `ONLINE = ON` where the edition supports it (Enterprise, Azure SQL Database,
   Managed Instance).
 - **Tagging:** each index it creates gets the extended property `AIIndexTuner`, naming the run and
@@ -195,15 +201,20 @@ exactly what would be sent, run `EXEC dbo.sp_AIIndexTuner @CollectOnly = 1;`.
 ## Testing
 
 ```powershell
-.\tests\Run-All.ps1            # localhost, Windows authentication
+.\tests\Run-All.ps1                               # localhost, Windows authentication
+.\tests\Run-All.ps1 -Database AIIndexTunerTest2   # another test database
 ```
 
 The test runner:
 
 1. rebuilds the install script
-2. recreates the `AIIndexTunerTest` database, with Query Store capturing every query:
+2. recreates the test database (`AIIndexTunerTest` by default), with Query Store capturing every
+   query:
    - 300,000 orders with no supporting index
    - a duplicate index, an untrusted foreign key and a heap
+
+   It stops if that database has a database scoped credential, because recreating it would delete
+   your endpoint setup. Use `-Database` for another database, or `-Force`.
 3. installs the tool and runs a workload, including a forced plan whose index is then dropped
    (a `NO_INDEX` forced-plan failure)
 4. runs [tests/03_Run-Tests.sql](tests/03_Run-Tests.sql)

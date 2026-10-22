@@ -15,7 +15,8 @@ GO
     allows one that the other left NULL (recommend-only). @MaxNewIndexes uses the lower limit.
 
     Applied: new rowstore indexes; new columnstore indexes when allowed; drops of nonclustered
-    indexes when allowed and nothing depends on them. Every other category, and any filtered index,
+    indexes when allowed, nothing depends on them, and either another index makes them redundant
+    or the usage statistics cover at least 7 days. Every other category, and any filtered index,
     is left for review. The outcome is written to the recommendation row: Applied (with the DDL and
     the DDL that reverses it), Skipped (with the reason) or Failed (with the error). Skipped and
     Failed recommendations can be applied again, for example with a setting that allows them.
@@ -139,6 +140,65 @@ BEGIN
             END CATCH;
         END;
 
+        -- Why it can go. Either another index makes it redundant: it has the same leading keys,
+        -- covers the includes and filter, and keeps any uniqueness, so nothing is lost however short
+        -- the usage history. Or it is little used, which the usage DMVs show only over enough time,
+        -- so a low-use drop needs at least @MinUsageDays of usage statistics.
+        DECLARE @Basis nvarchar(4000), @MinUsageDays int = 7;
+        IF @Reason IS NULL
+        BEGIN
+            DECLARE @Redundant sysname, @Sig nvarchar(max), @DropUnique bit, @DropFilter nvarchar(max);
+            SELECT @DropUnique = is_unique, @DropFilter = filter_definition FROM sys.indexes WHERE object_id = @ObjectId AND index_id = @IndexId;
+            SET @Sig = (SELECT STRING_AGG(CONCAT(column_id, CASE WHEN is_descending_key = 1 THEN 'D' ELSE 'A' END), ',') WITHIN GROUP (ORDER BY key_ordinal)
+                        FROM sys.index_columns WHERE object_id = @ObjectId AND index_id = @IndexId AND key_ordinal > 0);
+
+            IF @Type = 2
+                SELECT TOP (1) @Redundant = i.name
+                FROM sys.indexes AS i
+                CROSS APPLY (SELECT STRING_AGG(CONCAT(ic.column_id, CASE WHEN ic.is_descending_key = 1 THEN 'D' ELSE 'A' END), ',') WITHIN GROUP (ORDER BY ic.key_ordinal) AS sig
+                             FROM sys.index_columns AS ic
+                             WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0) AS k
+                WHERE i.object_id = @ObjectId AND i.index_id <> @IndexId AND i.type IN (1, 2) AND i.is_disabled = 0 AND i.is_hypothetical = 0
+                  AND (i.has_filter = 0 OR i.filter_definition = @DropFilter)
+                  AND (k.sig = @Sig OR LEFT(k.sig, LEN(@Sig) + 1) = @Sig + ',')
+                  AND (@DropUnique = 0 OR (i.is_unique = 1 AND k.sig = @Sig))
+                  AND (i.type = 1   -- the clustered index covers every column
+                       OR NOT EXISTS (SELECT 1 FROM sys.index_columns AS inc
+                                      WHERE inc.object_id = @ObjectId AND inc.index_id = @IndexId AND inc.is_included_column = 1
+                                        AND NOT EXISTS (SELECT 1 FROM sys.index_columns AS ic
+                                                        WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.column_id = inc.column_id)))
+                ORDER BY i.index_id;
+
+            IF @Redundant IS NOT NULL
+                SET @Basis = CONCAT(N'Redundant: ', QUOTENAME(@Redundant), N' has the same leading keys and covers it.');
+            ELSE
+            BEGIN
+                DECLARE @Since datetime2(0), @SinceSource nvarchar(400), @ErrorLogsSearched int, @HasInstanceLogs bit;
+                BEGIN TRY
+                    EXEC AIIndexTuner.usp_UsageSince @Since = @Since OUTPUT, @SinceSource = @SinceSource OUTPUT,
+                                                     @ErrorLogsSearched = @ErrorLogsSearched OUTPUT, @HasInstanceLogs = @HasInstanceLogs OUTPUT;
+                END TRY
+                BEGIN CATCH
+                    SET @Since = NULL;
+                END CATCH;
+
+                IF @Since IS NULL
+                    SET @Reason = CONCAT(N'No other index covers ', QUOTENAME(@IndexName), N', and the period the usage statistics cover is unknown, so it is not dropped for low use.');
+                -- Without the error log, a reset after the times above (an ONLINE after OFFLINE, a
+                -- snapshot revert, an AUTO_CLOSE reopen) would not show, so the period may be shorter.
+                ELSE IF @HasInstanceLogs = 1 AND @ErrorLogsSearched = 0
+                    SET @Reason = CONCAT(N'No other index covers ', QUOTENAME(@IndexName), N', and the error log could not be read (that needs securityadmin or sysadmin, ',
+                                         N'and does not work inside INSERT ... EXEC), so the period the usage statistics cover cannot be confirmed for a low-use drop.');
+                ELSE IF @Since > DATEADD(DAY, -@MinUsageDays, SYSDATETIME())
+                    SET @Reason = CONCAT(N'No other index covers ', QUOTENAME(@IndexName), N', and the usage statistics cover only ',
+                                         AIIndexTuner.fn_FormatUptime(DATEDIFF(MINUTE, @Since, SYSDATETIME())), N' (since ', CONVERT(varchar(19), @Since, 120),
+                                         N', from ', @SinceSource, N'). An index is dropped for low use only after at least ', @MinUsageDays, N' days of them.');
+                ELSE
+                    SET @Basis = CONCAT(N'Low use over ', AIIndexTuner.fn_FormatUptime(DATEDIFF(MINUTE, @Since, SYSDATETIME())), N' of usage statistics (since ',
+                                        CONVERT(varchar(19), @Since, 120), N').');
+            END;
+        END;
+
         IF @Reason IS NOT NULL
         BEGIN
             UPDATE AIIndexTuner.Recommendation SET Status = 'Skipped', StatusReason = @Reason WHERE RecommendationId = @RecommendationId;
@@ -197,7 +257,7 @@ BEGIN
         END CATCH;
 
         UPDATE AIIndexTuner.Recommendation
-        SET Status = 'Applied', StatusReason = NULL, AppliedDDL = @Ddl, UndoDDL = @Undo,
+        SET Status = 'Applied', StatusReason = @Basis, AppliedDDL = @Ddl, UndoDDL = @Undo,
             AppliedAt = SYSDATETIME(), AppliedBy = ORIGINAL_LOGIN()
         WHERE RecommendationId = @RecommendationId;
         RETURN;
