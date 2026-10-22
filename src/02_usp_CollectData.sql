@@ -1016,7 +1016,7 @@ BEGIN
                         WHEN stmt.s LIKE 'DELETE %' THEN 'DELETE'
                         WHEN stmt.s LIKE 'MERGE %' THEN 'MERGE'
                    END AS StatementType,
-                   DATEPART(HOUR, rsi.start_time) AS BusiestUtcHour,
+                   DATEPART(HOUR, rsi.start_time) AS HourOfDayUtc,
                    CAST(rs.count_executions AS bigint) AS count_executions
             FROM sys.query_store_query_text AS qt
             INNER JOIN sys.query_store_query AS q ON qt.query_text_id = q.query_text_id
@@ -1038,14 +1038,16 @@ BEGIN
               AND (@QsScoped = 0 OR EXISTS (SELECT 1 FROM #qs_scope AS sc WHERE sc.query_id = q.query_id))
         )
         SELECT @j = (
-            SELECT TOP (12) StatementType, BusiestUtcHour, SUM(count_executions) AS Executions
+            SELECT TOP (12) StatementType, HourOfDayUtc, SUM(count_executions) AS Executions
             FROM typed
             WHERE StatementType IS NOT NULL
-            GROUP BY StatementType, BusiestUtcHour
+            GROUP BY StatementType, HourOfDayUtc
             ORDER BY SUM(count_executions) DESC, StatementType
             FOR JSON PATH)
         OPTION (RECOMPILE);
-        SET @Data += ISNULL(@j, N'No recent write workload mix found in Query Store.') + @nl;
+        SET @Data += CASE WHEN @j IS NULL THEN N'No recent write workload mix found in Query Store.'
+                          ELSE N'Executions over the last 7 days per statement type and UTC hour of day (0-23), the 12 largest buckets; a statement type can appear in several rows.' + @nl + @j
+                     END + @nl;
     END TRY
     BEGIN CATCH
         SET @Data += CONCAT(N'Query Store write workload mix unavailable: ', ERROR_MESSAGE(), @nl);
