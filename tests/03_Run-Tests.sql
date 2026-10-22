@@ -140,6 +140,8 @@ DECLARE @Missing nvarchar(max) = CONCAT(
     CASE WHEN @Data NOT LIKE N'%OPTIMIZED_SP_EXECUTESQL: %ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY: %' THEN N' sp_executesql-settings' END,
     CASE WHEN @Data NOT LIKE N'%=== QUERY STORE WORKLOAD INSIGHTS ===%"QueryId"%"TotalWaitSecs"%' THEN N' qs-workload' END,
     CASE WHEN @Data NOT LIKE N'%=== QUERY STORE WRITE WORKLOAD MIX ===%"StatementType":"INSERT"%' THEN N' qs-write-mix' END,
+    -- The workload's UPDATE is auto-parameterized: "(@1 tinyint,@2 tinyint)UPDATE ...".
+    CASE WHEN SUBSTRING(@Data, CHARINDEX(N'=== QUERY STORE WRITE WORKLOAD MIX ===', @Data), 2000) NOT LIKE N'%"StatementType":"UPDATE"%' THEN N' qs-write-mix-parameterized-update' END,
     CASE WHEN @Data NOT LIKE N'%=== QUERY STORE FORCED PLAN FAILURES ===%"LastFailureReason":"NO_INDEX"%' THEN N' qs-forced-plan-failures' END,
     CASE WHEN @Data NOT LIKE N'%=== AUTOMATIC TUNING OPTIONS ===%FORCE_LAST_GOOD_PLAN%' THEN N' automatic-tuning' END,
     CASE WHEN @Data NOT LIKE N'%=== CARDINALITY ESTIMATION FEEDBACK ===%CE feedback: %CE feedback for expressions: %' THEN N' ce-feedback' END,

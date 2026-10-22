@@ -41,6 +41,12 @@ FROM dbo.Orders AS o INNER JOIN dbo.Customers AS c ON c.CustomerId = o.CustomerI
 WHERE o.Status = 3 GROUP BY c.Region;
 GO
 
+-- An ad hoc write that simple parameterization rewrites with a parameter-declaration prefix,
+-- (@1 tinyint,@2 tinyint)UPDATE [dbo].[Orders] set [Status] = @1 WHERE [OrderId]=@2, so the
+-- write mix must read past the prefix to count it as an UPDATE.
+UPDATE dbo.Orders SET Status = 4 WHERE OrderId = 5;
+GO 3
+
 -- Workload: selective lookups with no supporting index, repeated so the impact score passes 100,000.
 -- The joins matter: a single-table aggregate gets a TRIVIAL plan, and trivial plans record no
 -- missing-index suggestions.

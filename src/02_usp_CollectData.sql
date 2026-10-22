@@ -1000,18 +1000,21 @@ BEGIN
 
     /* ===== QUERY STORE WRITE WORKLOAD MIX =====
        INSERT/UPDATE/DELETE/MERGE executions by type and UTC hour. The type comes from the leading
-       characters of the query text, so an auto-parameterized statement with a parameter-declaration
-       prefix counts as OTHER. */
+       keyword of the statement. Auto-parameterized and sp_executesql statements start with their
+       parameter declarations, as in "(@1 tinyint,@2 int)UPDATE [dbo].[Orders] ...", so the
+       statement is read from after that prefix and counted under its real type. Statements that
+       are not one of the four write types are left out; there is no OTHER bucket. (The desktop
+       collector reads only the leading characters, so it leaves parameterized writes out.) */
     SET @Data += CONCAT(@nl, N'=== QUERY STORE WRITE WORKLOAD MIX ===', @nl);
     IF @QsUsable = 0
         SET @Data += N'Query Store write workload mix is not available on this database.' + @nl;
     ELSE BEGIN
     BEGIN TRY
         WITH typed AS (
-            SELECT CASE WHEN UPPER(LTRIM(LEFT(qt.query_sql_text, 200))) LIKE 'INSERT %' THEN 'INSERT'
-                        WHEN UPPER(LTRIM(LEFT(qt.query_sql_text, 200))) LIKE 'UPDATE %' THEN 'UPDATE'
-                        WHEN UPPER(LTRIM(LEFT(qt.query_sql_text, 200))) LIKE 'DELETE %' THEN 'DELETE'
-                        WHEN UPPER(LTRIM(LEFT(qt.query_sql_text, 200))) LIKE 'MERGE %' THEN 'MERGE'
+            SELECT CASE WHEN stmt.s LIKE 'INSERT %' THEN 'INSERT'
+                        WHEN stmt.s LIKE 'UPDATE %' THEN 'UPDATE'
+                        WHEN stmt.s LIKE 'DELETE %' THEN 'DELETE'
+                        WHEN stmt.s LIKE 'MERGE %' THEN 'MERGE'
                    END AS StatementType,
                    DATEPART(HOUR, rsi.start_time) AS BusiestUtcHour,
                    CAST(rs.count_executions AS bigint) AS count_executions
@@ -1020,6 +1023,17 @@ BEGIN
             INNER JOIN sys.query_store_plan AS qp ON q.query_id = qp.query_id
             INNER JOIN sys.query_store_runtime_stats AS rs ON qp.plan_id = rs.plan_id
             INNER JOIN sys.query_store_runtime_stats_interval AS rsi ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
+            -- Upper-cased head of the text, with line breaks and tabs as spaces.
+            CROSS APPLY (SELECT UPPER(LTRIM(REPLACE(REPLACE(REPLACE(LEFT(qt.query_sql_text, 4000), NCHAR(13), N' '), NCHAR(10), N' '), NCHAR(9), N' '))) AS t) AS head
+            -- Where the statement starts after a "(@...)" parameter-declaration prefix: the first ')'
+            -- followed by a write keyword. Searching for the keyword, not the first ')', copes with
+            -- types such as decimal(18,2) inside the declarations.
+            CROSS APPLY (SELECT CASE WHEN head.t LIKE N'(@%'
+                                     THEN (SELECT MIN(v.pos) FROM (VALUES (CHARINDEX(N')INSERT ', head.t)), (CHARINDEX(N')UPDATE ', head.t)),
+                                                                          (CHARINDEX(N')DELETE ', head.t)), (CHARINDEX(N')MERGE ', head.t))) AS v(pos)
+                                           WHERE v.pos > 0)
+                                END AS p) AS prefix
+            CROSS APPLY (SELECT LEFT(CASE WHEN prefix.p IS NOT NULL THEN SUBSTRING(head.t, prefix.p + 1, 4000) ELSE head.t END, 200) AS s) AS stmt
             WHERE rs.runtime_stats_interval_id >= @QsMinInterval
               AND (@QsScoped = 0 OR EXISTS (SELECT 1 FROM #qs_scope AS sc WHERE sc.query_id = q.query_id))
         )
