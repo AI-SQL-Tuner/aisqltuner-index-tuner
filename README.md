@@ -42,14 +42,22 @@ about Microsoft's 2006 `AutoIndex.sql` prototype: a modern version, with AI doin
 ## What it does
 
 1. **Collects** the Index Tuning diagnostics, ported from AI SQL Tuner's IndexTuning goal:
-   - server and edition info, and the period the usage statistics cover
+   - server and edition info, and the period the usage statistics cover (server start, create
+     date, restore history and the error log's "Starting up database" message)
    - missing indexes, plus their overlap with existing indexes
-   - index usage, and duplicate and left-prefix overlapping indexes
+   - index usage, duplicate and left-prefix overlapping indexes, operational hotspots and page
+     density
    - the top 25 plan cache statements by CPU for this database
-   - heaps, constraints, untrusted constraints, column cardinality, large tables and statistics
-     settings
+   - Query Store: the top 50 queries by total duration over 7 days (with parameter sensitivity),
+     the write workload mix, and forced plan failures
+   - automatic tuning (`FORCE_LAST_GOOD_PLAN`) and cardinality estimation feedback
+   - heaps, constraints, untrusted constraints, column cardinality, large tables, statistics
+     settings and `OPTIMIZED_SP_EXECUTESQL`
 
-   The `@SchemaName` and `@TableName` filters apply to every object-level section.
+   The `@SchemaName` and `@TableName` filters apply to every object-level section. For the Query
+   Store sections they are resolved once into the set of queries whose plans reference the object,
+   confirmed from the plan XML. If that fails, they fall back to a plan-text match, then to module
+   dependencies. The section says which one it used.
 2. **Asks the model** with AI SQL Tuner's Index Tuning prompt. The prompt asks for a JSON object
    instead of an HTML report, and the response schema enforces that shape.
 3. **Stores** a row in `AIIndexTuner.Run` and one row per recommendation in
@@ -126,20 +134,18 @@ exactly what would be sent, run `EXEC dbo.sp_AIIndexTuner @CollectOnly = 1;`.
 
 ## Known limitations (prototype)
 
-- **Not collected yet**, though the full product's Index Tuning goal covers them:
-  - Query Store workload, write mix and forced plan failures
-  - index page density and operational hotspots
-  - automatic tuning options, CE feedback and `OPTIMIZED_SP_EXECUTESQL`
-- **Usage window:** "Database Usage Statistics Since" uses the server start time, the database
-  create date and msdb restore history. It does not search the error log, so a snapshot revert,
-  `ONLINE` after `OFFLINE`, or an `AUTO_CLOSE` reopen is missed. The prompt says so.
 - **Claude:** Claude deployments are not supported yet.
 - **No timeouts:** T-SQL has no per-statement timeout, so a collector section cannot be cut off
-  the way the desktop app's are. Each section does run in its own `TRY...CATCH`, so a failed
+  the way the desktop app's are. Work is bounded by row caps instead, including the 20,000-plan
+  cap on Query Store scope resolution. Each section runs in its own `TRY...CATCH`, so a failed
   section is reported and skipped.
-- **`INSERT ... EXEC`:** wrapping `sp_AIIndexTuner` in `INSERT ... EXEC` skips the column
-  cardinality section, because SQL Server cannot nest the proc's own `INSERT ... EXEC` of
-  `DBCC SHOW_STATISTICS`.
+- **Error log:** reading it needs `securityadmin` or `sysadmin`. Without that, the usage window
+  says which resets it could not see.
+- **`INSERT ... EXEC`:** wrapping `sp_AIIndexTuner` in `INSERT ... EXEC` breaks two parts,
+  because SQL Server cannot nest the proc's own `INSERT ... EXEC` calls:
+  - the column cardinality section (`DBCC SHOW_STATISTICS`) is skipped
+  - the error-log search (`sp_readerrorlog`) fails, so the usage window reports the error log as
+    unreadable
 - **No verification or rollback:** the tool does not measure impact after creating an index or
   roll back regressions. [AI SQL Tuner](https://www.aisqltuner.com) also covers deadlocks, code
   review, server health, query tuning, and locking and blocking.
@@ -153,14 +159,16 @@ exactly what would be sent, run `EXEC dbo.sp_AIIndexTuner @CollectOnly = 1;`.
 The test runner:
 
 1. rebuilds the install script
-2. recreates the `AIIndexTunerTest` database: 300,000 orders with no supporting index, a duplicate
-   index, an untrusted foreign key and a heap
-3. installs the tool and runs a workload
+2. recreates the `AIIndexTunerTest` database, with Query Store capturing every query:
+   - 300,000 orders with no supporting index
+   - a duplicate index, an untrusted foreign key and a heap
+3. installs the tool and runs a workload, including a forced plan whose index is then dropped
+   (a `NO_INDEX` forced-plan failure)
 4. runs [tests/03_Run-Tests.sql](tests/03_Run-Tests.sql)
 
 The tests use `@TestResponse` canned model answers, so they need no AI endpoint. They cover:
 
-- collection and scoping
+- collection of every section, scoping, and Query Store scope resolution from plan XML
 - RECOMMEND storing results without changing the schema
 - CREATE applying only the indexes that pass validation, including attempted SQL injection in index
   and table names
