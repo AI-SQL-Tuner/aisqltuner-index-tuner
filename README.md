@@ -16,8 +16,10 @@ Ozar's post [I'm Probably Not Supposed to Show You Microsoft's Auto-Indexing Too
 about Microsoft's 2006 `AutoIndex.sql` prototype: a modern version, with AI doing the analysis.
 
 > **Status: prototype.** The collectors, prompt, storage and apply logic are tested against SQL
-> Server 2025 with canned model answers (see [Testing](#testing)). The call to a live Azure OpenAI
-> endpoint has not been run end to end yet.
+> Server 2025 with canned model answers. The live path has also been run end to end against Azure
+> OpenAI `gpt-5.6-luna` on SQL Server 2025: collection, the background-mode call, storage, the
+> change controls and CREATE mode. See [Testing](#testing). Not yet run: the full live benchmark,
+> Azure SQL Database, and `ONLINE = ON` index builds.
 
 ## Requirements
 
@@ -38,7 +40,11 @@ about Microsoft's 2006 `AutoIndex.sql` prototype: a modern version, with AI doin
    because the endpoint credential is a database scoped credential.
 2. Fill in and run [setup/Configure-Endpoint.sql](setup/Configure-Endpoint.sql). It enables the
    REST endpoint feature (SQL Server 2025 only), creates the database master key and credential,
-   and writes the configuration row.
+   and writes the configuration row. To keep a filled-in copy with your key, save it as
+   `setup/Configure-Endpoint-DEV.sql`, which `.gitignore` excludes.
+3. Smoke test: `EXEC dbo.sp_AIIndexTuner;`, then check that the latest `AIIndexTuner.Run` row has
+   `Status = 'Succeeded'`. If it failed, `ErrorMessage` names the part to look at: the HTTP status,
+   the credential, or polling.
 
 ## What it does
 
@@ -194,8 +200,19 @@ exactly what would be sent, run `EXEC dbo.sp_AIIndexTuner @CollectOnly = 1;`.
   - the column cardinality section (`DBCC SHOW_STATISTICS`) is skipped
   - the error-log search (`sp_readerrorlog`) fails, so the usage window reports the error log as
     unreadable
+
+  For the same reason, `sp_AIIndexTuner_Apply` inside `INSERT ... EXEC` refuses low-use drops,
+  because it cannot confirm the usage period.
+- **Model scripts are not checked:** the `Script` column is the model's own T-SQL, kept for review
+  and never executed. Live runs show it can be invalid: one suggested
+  `ALTER DATABASE SCOPED CONFIGURATION SET AUTOMATIC_TUNING`, which should be
+  `ALTER DATABASE ... SET AUTOMATIC_TUNING`. Test a script before running it yourself.
+- **Answers vary between runs:** the same input can come back with different categories. For
+  example, a deferred drop came back under `Other` in one run and `DropIndex` in another, before the
+  prompt reserved `DropIndex` for drops to make now. The change controls and apply-mode checks are
+  what make CREATE safe, not the prompt alone.
 - **No verification or rollback:** the tool does not measure impact after creating an index or
-  roll back regressions. [AI SQL Tuner](https://www.aisqltuner.com) also covers deadlocks, code
+  roll back regressions. Each applied change does store `UndoDDL` to reverse it by hand. [AI SQL Tuner](https://www.aisqltuner.com) also covers deadlocks, code
   review, server health, query tuning, and locking and blocking.
 
 ## Testing
@@ -235,6 +252,30 @@ The tests use `@TestResponse` canned model answers, so they need no AI endpoint.
 - reading an answer longer than 4,000 characters
 - supplied diagnostics (`@CollectedData`)
 - leaving the tool's own statements out of the collected data
+
+### Live tests
+
+These need a configured endpoint (see [Install](#install)). Run them in a database that has the
+endpoint set up, not in one `Run-All.ps1` recreates:
+
+```sql
+EXEC dbo.sp_AIIndexTuner;                                                       -- default run
+EXEC dbo.sp_AIIndexTuner @AllowColumnstore = 0, @AllowDropIndex = 0, @MaxNewIndexes = 1;   -- does the model follow the rules?
+EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @AllowDropIndex = 0, @MaxNewIndexes = 2;      -- end to end, with changes
+SELECT TOP (5) RunId, Status, InputTokens, OutputTokens, ModelMs, PollCount, AllowColumnstore, AllowDropIndex, MaxNewIndexes, ErrorMessage
+FROM AIIndexTuner.Run ORDER BY RunId DESC;
+```
+
+Results on SQL Server 2025 Standard Developer with `gpt-5.6-luna`, medium effort, in
+`AIIndexTunerTest` (a 72,000-character payload) and the benchmark database (scoped to one table):
+
+| Check | Result |
+|---|---|
+| Call and storage | Every run succeeded in background mode: 17–28 s, 2–5 polls, 10,000–27,000 input and 1,300–3,700 output tokens |
+| `index_type` | Filled correctly on every new-index recommendation |
+| Change controls | With columnstore and drops disallowed and `@MaxNewIndexes = 1`, the model recommended no columnstore index, no drop and one new index |
+| CREATE mode | Created the one index that passed validation, with the model's fill factor and compression, and stored its `UndoDDL`. Other categories stayed for review. |
+| Usage window | On a few hours of usage data, the model deferred unused indexes rather than dropping them, and files them under `Other` |
 
 ## Benchmark
 
