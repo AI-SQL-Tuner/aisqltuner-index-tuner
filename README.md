@@ -8,6 +8,7 @@ recommendations in a table, and can create the new indexes it is able to verify.
 EXEC dbo.sp_AIIndexTuner;                                        -- recommend only (the default)
 EXEC dbo.sp_AIIndexTuner @SchemaName = N'Sales', @TableName = N'Orders';
 EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE';                       -- also create verified new indexes
+EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @AllowColumnstore = 0, @AllowDropIndex = 1, @MaxNewIndexes = 3;
 ```
 
 Free and open source from [AI SQL Tuner](https://www.aisqltuner.com). The idea comes from Brent
@@ -64,16 +65,45 @@ about Microsoft's 2006 `AutoIndex.sql` prototype: a modern version, with AI doin
    `AIIndexTuner.Recommendation`:
    - category (`CreateIndex`, `DropIndex`, `ConsolidateIndex`, `RebuildIndex`, `Constraint`,
      `Statistics`, `Setting`, `QueryChange` or `Other`)
+   - for a new index, its type (`NONCLUSTERED`, `NONCLUSTERED COLUMNSTORE` or
+     `CLUSTERED COLUMNSTORE`)
    - table, keys, includes, compression and fill factor
    - estimated size, confidence and rationale
    - the model's script
-4. **Applies** (with `@Mode = 'CREATE'`, or later with `sp_AIIndexTuner_Apply`). Only `CreateIndex`
-   recommendations are applied; everything else stays for you to review.
+4. **Applies** (with `@Mode = 'CREATE'`, or later with `sp_AIIndexTuner_Apply`):
+   - new nonclustered rowstore indexes
+   - new columnstore indexes, when `@AllowColumnstore = 1`
+   - index drops, when `@AllowDropIndex = 1`
+
+   Everything else stays for you to review.
+
+### Change controls
+
+These parameters limit what the model may recommend and what the proc may change. Each one adds a
+rule to the prompt **and** is enforced again when applying, so a model that ignores the rule still
+cannot make the change.
+
+| Parameter | `NULL` (default) | `1` | `0` |
+|---|---|---|---|
+| `@AllowColumnstore` | Columnstore indexes may be recommended, but are not created | Also created | Not recommended or created |
+| `@AllowDropIndex` | Index drops may be recommended, but are not run | Also run | Not recommended or run |
+
+`@MaxNewIndexes` (default `NULL`, no limit) asks for at most that many new indexes, and creates at
+most that many, in priority order. `0` asks for none.
+
+A run's settings are stored in `AIIndexTuner.Run`. A recommend-only (`NULL`) change can be applied
+after review by passing the setting to `sp_AIIndexTuner_Apply`. A `0` cannot be overridden later:
+
+```sql
+EXEC dbo.sp_AIIndexTuner_Apply @RecommendationId = 43, @AllowDropIndex = 1;
+EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @AllowColumnstore = 1, @AllowDropIndex = 1, @MaxNewIndexes = 2;
+```
 
 ### Apply-mode safety
 
 - **The model's script is never executed.** Plan cache text goes into the prompt, so a crafted
-  query could try to steer what the model writes. The proc builds the `CREATE INDEX` itself:
+  query could try to steer what the model writes. The proc builds the `CREATE INDEX` or
+  `DROP INDEX` itself:
   - It uses only the structured fields.
   - It checks every table and column against the catalog.
   - It quotes every name with `QUOTENAME`.
@@ -84,10 +114,22 @@ about Microsoft's 2006 `AutoIndex.sql` prototype: a modern version, with AI doin
   - an unknown table or column
   - an index name that is already in use
   - a filtered index (the predicate is free text)
+  - a change the run's change controls do not allow, or a new index past `@MaxNewIndexes`
+  - a second columnstore index on a table, or a clustered columnstore index on a table that has a
+    clustered rowstore index (converting it would replace that index and any primary key on it)
+- **Drops it refuses, each with a reason:**
+  - clustered indexes, and indexes that enforce a primary key or unique constraint
+  - indexes a foreign key references
+  - indexes named by an index hint in a module, a plan guide or a Query Store hint
+  - indexes a forced Query Store plan uses, since the plan would fail with `NO_INDEX`
 - **What it adds:** `ONLINE = ON` where the edition supports it (Enterprise, Azure SQL Database,
   Managed Instance).
 - **Tagging:** each index it creates gets the extended property `AIIndexTuner`, naming the run and
   the recommendation.
+- **Undo:** each applied recommendation stores `UndoDDL`:
+  - for a created index, the `DROP INDEX`
+  - for a dropped index, the `CREATE INDEX` that restores it from the catalog: keys, includes,
+    filter, options, compression and filegroup or partition scheme
 
 ```sql
 -- Review, then apply one recommendation or a whole run
@@ -172,6 +214,9 @@ The tests use `@TestResponse` canned model answers, so they need no AI endpoint.
 - RECOMMEND storing results without changing the schema
 - CREATE applying only the indexes that pass validation, including attempted SQL injection in index
   and table names
+- change controls: their prompt rules, their enforcement when the model ignores them, columnstore
+  creation, the drop safety checks, `UndoDDL` restoring each change, and applying recommend-only
+  changes after review
 - idempotent reruns
 - fenced and broken JSON
 - parameter validation

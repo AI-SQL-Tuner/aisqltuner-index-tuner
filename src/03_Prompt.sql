@@ -45,11 +45,41 @@ BEGIN
         N'Return only a JSON object, with no Markdown, code fences or commentary, of the form {"summary": string, "recommendations": [...]}. ',
         N'summary: a short executive summary of the top priorities and the net storage change across all index recommendations. ',
         N'recommendations: one entry per recommendation, ordered by priority, where priority 1 is the most important. ',
-        N'category: CreateIndex for a new nonclustered rowstore index; DropIndex; ConsolidateIndex for merging, widening or replacing existing indexes; RebuildIndex; Constraint; Statistics; Setting; QueryChange; Other for anything else, including columnstore indexes. ',
-        N'For CreateIndex, fill schema_name, table_name, index_name, key_columns (in key order, each with descending), include_columns, filter_predicate (null unless the index is filtered), is_unique, fill_factor (null to use the default), data_compression (NONE, ROW, PAGE, or null to leave it unset) and estimated_size_mb, using object and column names exactly as they appear in the input, without brackets. ',
-        N'For the other categories, fill schema_name, table_name and index_name when the recommendation is about one object, and use empty arrays and null for the fields that do not apply. ',
+        N'category: CreateIndex for a new index, rowstore or columnstore; DropIndex for dropping one existing index; ConsolidateIndex for merging, widening or replacing existing indexes; RebuildIndex; Constraint; Statistics; Setting; QueryChange; Other for anything else. ',
+        N'For CreateIndex, fill schema_name, table_name, index_name, index_type (NONCLUSTERED for a rowstore index, NONCLUSTERED COLUMNSTORE or CLUSTERED COLUMNSTORE), key_columns (in key order, each with descending), include_columns, filter_predicate (null unless the index is filtered), is_unique, fill_factor (null to use the default), data_compression (NONE, ROW, PAGE, or null to leave it unset) and estimated_size_mb, using object and column names exactly as they appear in the input, without brackets. ',
+        N'For a nonclustered columnstore index, list its columns in key_columns with descending false and leave include_columns empty. For a clustered columnstore index, leave key_columns and include_columns empty. A columnstore index takes no is_unique, fill_factor or data_compression: use false and null. ',
+        N'For DropIndex, fill schema_name, table_name and index_name with the index to drop. ',
+        N'For the other categories, fill schema_name, table_name and index_name when the recommendation is about one object, use null for index_type, and use empty arrays and null for the other fields that do not apply. ',
         N'confidence is High, Medium or Low. rationale gives the evidence from the input. benefiting_queries lists the plan cache statements that benefit, by query hash or a short excerpt, or is empty. ',
         N'script is the complete T-SQL that implements the recommendation, or an empty string when there is nothing to run. Do not put rollback, validation, diagnostic or monitoring scripts in it.');
+END;
+GO
+
+/*
+    The change controls of a run (sp_AIIndexTuner @AllowColumnstore, @AllowDropIndex,
+    @MaxNewIndexes), as instructions appended to the system prompt. Empty when nothing is restricted,
+    so a default run sends the same prompt as before.
+
+    The prompt is only half of each control: usp_ApplyRecommendation enforces the same settings, in
+    case the model does not follow them.
+*/
+CREATE OR ALTER FUNCTION AIIndexTuner.fn_ChangeRules(@AllowColumnstore bit, @AllowDropIndex bit, @MaxNewIndexes int)
+RETURNS nvarchar(max)
+AS
+BEGIN
+    IF ISNULL(@AllowColumnstore, 1) = 1 AND ISNULL(@AllowDropIndex, 1) = 1 AND @MaxNewIndexes IS NULL
+        RETURN N'';
+
+    RETURN CONCAT(CAST(N' ' AS nvarchar(max)),
+        N'Change controls for this run. They override any guidance above, and changes that break them will not be applied: ',
+        CASE WHEN @AllowColumnstore = 0 THEN
+            N'Do not recommend columnstore indexes, clustered or nonclustered, even for large tables; recommend rowstore indexes instead where they help. ' END,
+        CASE WHEN @AllowDropIndex = 0 THEN
+            N'Do not recommend dropping or disabling any existing index, either on its own (DropIndex) or as part of a consolidation; widening an index with CREATE INDEX ... WITH (DROP_EXISTING = ON) is still allowed. You may name unused or redundant indexes in the summary, as candidates to review later. ' END,
+        CASE WHEN @MaxNewIndexes = 0 THEN
+            N'Do not recommend any new indexes (CreateIndex). You may name the most valuable ones in the summary. '
+             WHEN @MaxNewIndexes > 0 THEN
+            CONCAT(N'Recommend at most ', @MaxNewIndexes, N' new indexes (CreateIndex), choosing those with the greatest benefit, and give them the highest priorities. You may name others in the summary. ') END);
 END;
 GO
 
@@ -70,7 +100,7 @@ BEGIN
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["priority", "category", "title", "schema_name", "table_name", "index_name", "key_columns", "include_columns",
+        "required": ["priority", "category", "title", "schema_name", "table_name", "index_name", "index_type", "key_columns", "include_columns",
                      "filter_predicate", "is_unique", "fill_factor", "data_compression", "estimated_size_mb", "confidence",
                      "rationale", "benefiting_queries", "script"],
         "properties": {
@@ -80,6 +110,7 @@ BEGIN
           "schema_name": { "type": ["string", "null"] },
           "table_name": { "type": ["string", "null"] },
           "index_name": { "type": ["string", "null"] },
+          "index_type": { "type": ["string", "null"], "enum": ["NONCLUSTERED", "NONCLUSTERED COLUMNSTORE", "CLUSTERED COLUMNSTORE", null] },
           "key_columns": {
             "type": "array",
             "items": {

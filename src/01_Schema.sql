@@ -93,6 +93,16 @@ IF COL_LENGTH(N'AIIndexTuner.Run', N'PayloadSupplied') IS NULL
         PollCount       int      NULL;   -- background-mode polls of the AI response
 GO
 
+/* Change controls (sp_AIIndexTuner @AllowColumnstore, @AllowDropIndex, @MaxNewIndexes). For the two
+   bits: NULL = may be recommended, never applied unless sp_AIIndexTuner_Apply is told to;
+   1 = may be recommended and applied; 0 = not recommended and never applied. */
+IF COL_LENGTH(N'AIIndexTuner.Run', N'AllowColumnstore') IS NULL
+    ALTER TABLE AIIndexTuner.Run ADD
+        AllowColumnstore bit NULL,
+        AllowDropIndex   bit NULL,
+        MaxNewIndexes    int NULL;   -- at most this many new indexes are recommended and created
+GO
+
 IF OBJECT_ID(N'AIIndexTuner.Recommendation', N'U') IS NULL
 BEGIN
     CREATE TABLE AIIndexTuner.Recommendation
@@ -126,6 +136,12 @@ BEGIN
 
     CREATE INDEX IX_AIIndexTuner_Recommendation_Run ON AIIndexTuner.Recommendation (RunId, Priority);
 END;
+GO
+
+IF COL_LENGTH(N'AIIndexTuner.Recommendation', N'IndexType') IS NULL
+    ALTER TABLE AIIndexTuner.Recommendation ADD
+        IndexType varchar(30)   NULL,   -- CreateIndex: NONCLUSTERED, NONCLUSTERED COLUMNSTORE or CLUSTERED COLUMNSTORE
+        UndoDDL   nvarchar(max) NULL;   -- reverses AppliedDDL: the DROP for a created index, the CREATE for a dropped one
 GO
 
 /* ===== Helpers ===== */

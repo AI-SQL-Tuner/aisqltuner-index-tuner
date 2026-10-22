@@ -254,12 +254,14 @@ GO
 /* ===== T6: sp_AIIndexTuner_Apply leaves non-index categories for review ===== */
 DECLARE @RecId int = (SELECT MIN(RecommendationId) FROM AIIndexTuner.Recommendation WHERE Category = 'DropIndex' AND Status = 'Recommended');
 CREATE TABLE #Applied (RecommendationId int, RunId int, Priority int, Category varchar(30), Title nvarchar(400), SchemaName sysname NULL,
-                       TableName sysname NULL, IndexName sysname NULL, Status varchar(20), StatusReason nvarchar(4000), AppliedDDL nvarchar(max), AppliedAt datetime2(0));
+                       TableName sysname NULL, IndexName sysname NULL, Status varchar(20), StatusReason nvarchar(4000), AppliedDDL nvarchar(max), AppliedAt datetime2(0),
+                       UndoDDL nvarchar(max));
 INSERT #Applied EXEC dbo.sp_AIIndexTuner_Apply @RecommendationId = @RecId;
 IF (SELECT Status FROM AIIndexTuner.Recommendation WHERE RecommendationId = @RecId) <> 'Skipped'
+   OR (SELECT StatusReason FROM AIIndexTuner.Recommendation WHERE RecommendationId = @RecId) NOT LIKE N'Index drops are recommend-only%@AllowDropIndex = 1.'
    OR NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Customers_Region_Dup')
-    THROW 50999, N'FAIL T6: a DropIndex recommendation was applied.', 1;
-PRINT 'PASS T6: DropIndex is recommend-only';
+    THROW 50999, N'FAIL T6: a DropIndex recommendation was applied, or skipped without saying how to allow it.', 1;
+PRINT 'PASS T6: DropIndex is recommend-only by default';
 GO
 
 /* ===== T7: parameter validation ===== */
@@ -384,6 +386,219 @@ IF @PlanCache LIKE N'%AIIndexTuner%' OR @QueryStore LIKE N'%AIIndexTuner%'
 IF @QueryStore NOT LIKE N'%"QueryId"%'
     THROW 50999, N'FAIL T13: the Query Store section is empty, so the check above proves nothing.', 1;
 PRINT 'PASS T13: the plan cache, Query Store workload and write mix leave out this tool''s own statements';
+GO
+
+/* ===== T14: change controls go into the prompt and onto the run ===== */
+IF AIIndexTuner.fn_ChangeRules(NULL, NULL, NULL) <> N'' OR AIIndexTuner.fn_ChangeRules(1, 1, NULL) <> N''
+    THROW 50999, N'FAIL T14: settings that restrict nothing changed the prompt.', 1;
+DECLARE @Rules nvarchar(max) = AIIndexTuner.fn_ChangeRules(0, 0, 2);
+IF @Rules NOT LIKE N'%Do not recommend columnstore indexes%' OR @Rules NOT LIKE N'%Do not recommend dropping or disabling any existing index%'
+   OR @Rules NOT LIKE N'%at most 2 new indexes%' OR AIIndexTuner.fn_ChangeRules(NULL, NULL, 0) NOT LIKE N'%Do not recommend any new indexes%'
+    THROW 50999, N'FAIL T14: the change rules are missing an instruction.', 1;
+
+DECLARE @Answer nvarchar(max) = N'{"summary": "controls", "recommendations": []}';
+EXEC dbo.sp_AIIndexTuner @CollectedData = N'pinned', @TestResponse = @Answer, @AllowColumnstore = 0, @AllowDropIndex = 0, @MaxNewIndexes = 2;
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Run
+               WHERE RunId = (SELECT MAX(RunId) FROM AIIndexTuner.Run)
+                 AND AllowColumnstore = 0 AND AllowDropIndex = 0 AND MaxNewIndexes = 2
+                 AND SystemPromptHash = CONVERT(char(64), HASHBYTES('SHA2_256', AIIndexTuner.fn_SystemPrompt() + @Rules), 2))
+    THROW 50999, N'FAIL T14: the run did not record its settings, or the prompt did not carry the rules.', 1;
+BEGIN TRY
+    EXEC dbo.sp_AIIndexTuner @CollectOnly = 1, @MaxNewIndexes = -1;
+    THROW 50999, N'FAIL T14: a negative @MaxNewIndexes was accepted.', 1;
+END TRY
+BEGIN CATCH
+    IF ERROR_NUMBER() <> 50209 THROW;
+END CATCH;
+PRINT 'PASS T14: change controls add their rules to the prompt and are recorded on the run';
+GO
+
+/* ===== T15: settings are enforced when the model ignores them ===== */
+DECLARE @Answer nvarchar(max) = N'{"summary": "ignores the controls", "recommendations": [
+  {"priority": 1, "category": "CreateIndex", "title": "Columnstore", "schema_name": "dbo", "table_name": "Orders", "index_name": "NCCI_Orders_T15",
+   "index_type": "NONCLUSTERED COLUMNSTORE", "key_columns": [{"column": "OrderDate", "descending": false}, {"column": "TotalDue", "descending": false}],
+   "include_columns": [], "filter_predicate": null, "is_unique": false, "confidence": "Low", "rationale": "t", "script": ""},
+  {"priority": 2, "category": "CreateIndex", "title": "Within the limit", "schema_name": "dbo", "table_name": "Orders", "index_name": "IX_Orders_Status_OrderDate_T15",
+   "index_type": "NONCLUSTERED", "key_columns": [{"column": "Status", "descending": false}, {"column": "OrderDate", "descending": false}],
+   "include_columns": ["TotalDue"], "filter_predicate": null, "is_unique": false, "confidence": "High", "rationale": "t", "script": ""},
+  {"priority": 3, "category": "CreateIndex", "title": "Over the limit", "schema_name": "dbo", "table_name": "Customers", "index_name": "IX_Customers_Email_T15",
+   "index_type": "NONCLUSTERED", "key_columns": [{"column": "Email", "descending": false}],
+   "include_columns": [], "filter_predicate": null, "is_unique": false, "confidence": "Medium", "rationale": "t", "script": ""},
+  {"priority": 4, "category": "DropIndex", "title": "Drop", "schema_name": "dbo", "table_name": "Customers", "index_name": "IX_Customers_Region_Dup",
+   "index_type": null, "key_columns": [], "include_columns": [], "filter_predicate": null, "is_unique": false, "confidence": "Medium", "rationale": "t",
+   "script": "DROP INDEX IX_Customers_Region_Dup ON dbo.Customers;"}]}';
+EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @TestResponse = @Answer, @AllowColumnstore = 0, @AllowDropIndex = 0, @MaxNewIndexes = 1;
+
+DECLARE @RunId int = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
+DECLARE @Expected TABLE (Priority int PRIMARY KEY, Status varchar(20), ReasonLike nvarchar(200));
+INSERT @Expected VALUES
+    (1, 'Skipped', N'Columnstore indexes are not allowed (@AllowColumnstore = 0).'),
+    (2, 'Applied', NULL),
+    (3, 'Skipped', N'The limit of 1 new index(es)%'),
+    (4, 'Skipped', N'Index drops are not allowed (@AllowDropIndex = 0).');
+IF EXISTS (SELECT 1 FROM @Expected AS e
+           LEFT JOIN AIIndexTuner.Recommendation AS r ON r.RunId = @RunId AND r.Priority = e.Priority
+           WHERE r.Status IS NULL OR r.Status <> e.Status
+              OR (e.ReasonLike IS NOT NULL AND ISNULL(r.StatusReason, N'') NOT LIKE e.ReasonLike))
+BEGIN
+    SELECT e.Priority, e.Status AS Expected, r.Status AS Actual, r.StatusReason, r.AppliedDDL
+    FROM @Expected AS e LEFT JOIN AIIndexTuner.Recommendation AS r ON r.RunId = @RunId AND r.Priority = e.Priority;
+    THROW 50999, N'FAIL T15: statuses differ from expected (see the result set above).', 1;
+END;
+IF (SELECT UndoDDL FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 2) <> N'DROP INDEX [IX_Orders_Status_OrderDate_T15] ON [dbo].[Orders];'
+    THROW 50999, N'FAIL T15: a created index has no DROP to undo it.', 1;
+
+-- A run that did not allow drops cannot be overridden when applying.
+DECLARE @DropId int = (SELECT RecommendationId FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 4);
+INSERT #Applied EXEC dbo.sp_AIIndexTuner_Apply @RecommendationId = @DropId, @AllowDropIndex = 1;
+IF (SELECT Status FROM AIIndexTuner.Recommendation WHERE RecommendationId = @DropId) <> 'Skipped'
+   OR NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Customers_Region_Dup')
+   OR EXISTS (SELECT 1 FROM sys.indexes WHERE name IN (N'NCCI_Orders_T15', N'IX_Customers_Email_T15'))
+    THROW 50999, N'FAIL T15: a change the run did not allow was made.', 1;
+PRINT 'PASS T15: columnstore, drops and the new-index limit are enforced even when the model ignores them, and @AllowDropIndex = 0 cannot be overridden';
+GO
+
+-- sqlcmd starts with QUOTED_IDENTIFIER OFF, and filtered indexes need it ON.
+SET QUOTED_IDENTIFIER ON;
+GO
+
+/* ===== T16: allowed columnstore indexes and drops, with their safety checks ===== */
+-- Things a drop must not break: an index hint in a module, a unique constraint, and a forced plan.
+-- The plan 02_Run-Workload.sql forced uses IX_Orders_Status_Probe, so put that index back; it also
+-- reads dbo.Customers through IX_Customers_Region_Dup. IX_Customers_Name_T16 is free to drop, with
+-- options for the UndoDDL to restore.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Customers_Email_Hinted')
+    CREATE INDEX IX_Customers_Email_Hinted ON dbo.Customers (Email);
+IF OBJECT_ID(N'dbo.UQ_Customers_Email', N'UQ') IS NULL
+    ALTER TABLE dbo.Customers ADD CONSTRAINT UQ_Customers_Email UNIQUE (Email);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Customers_Name_T16')
+    CREATE INDEX IX_Customers_Name_T16 ON dbo.Customers (CustomerName) INCLUDE (Email) WHERE Region = 'AB' WITH (FILLFACTOR = 90, DATA_COMPRESSION = PAGE);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Orders_Status_Probe')
+    CREATE INDEX IX_Orders_Status_Probe ON dbo.Orders (Status) INCLUDE (CustomerId, TotalDue);
+GO
+CREATE OR ALTER PROCEDURE dbo.usp_T16_Hinted AS
+    SELECT CustomerId FROM dbo.Customers WITH (INDEX (IX_Customers_Email_Hinted)) WHERE Email = N'c1@example.com';
+GO
+DECLARE @Answer nvarchar(max) = N'{"summary": "allowed", "recommendations": [
+  {"priority": 1, "category": "CreateIndex", "title": "NCCI", "schema_name": "dbo", "table_name": "Orders", "index_name": "NCCI_Orders_T16",
+   "index_type": "NONCLUSTERED COLUMNSTORE", "key_columns": [{"column": "OrderDate", "descending": false}, {"column": "Status", "descending": false}],
+   "include_columns": ["TotalDue"], "filter_predicate": null, "is_unique": false, "fill_factor": 80, "data_compression": "PAGE", "confidence": "High", "rationale": "t", "script": ""},
+  {"priority": 2, "category": "CreateIndex", "title": "Second columnstore", "schema_name": "dbo", "table_name": "Orders", "index_name": null,
+   "index_type": "CLUSTERED COLUMNSTORE", "key_columns": [], "include_columns": [], "filter_predicate": null, "is_unique": false, "confidence": "Low", "rationale": "t", "script": ""},
+  {"priority": 3, "category": "CreateIndex", "title": "CCI over a clustered PK", "schema_name": "dbo", "table_name": "Customers", "index_name": null,
+   "index_type": "CLUSTERED COLUMNSTORE", "key_columns": [], "include_columns": [], "filter_predicate": null, "is_unique": false, "confidence": "Low", "rationale": "t", "script": ""},
+  {"priority": 4, "category": "CreateIndex", "title": "CCI on the heap", "schema_name": "dbo", "table_name": "AuditLog", "index_name": null,
+   "index_type": "CLUSTERED COLUMNSTORE", "key_columns": [{"column": "LoggedAt", "descending": false}], "include_columns": [], "filter_predicate": null, "is_unique": false, "confidence": "Medium", "rationale": "t", "script": ""},
+  {"priority": 5, "category": "DropIndex", "title": "Unused", "schema_name": "dbo", "table_name": "Customers", "index_name": "IX_Customers_Name_T16",
+   "index_type": null, "key_columns": [], "include_columns": [], "filter_predicate": null, "is_unique": false, "confidence": "High", "rationale": "t", "script": ""},
+  {"priority": 6, "category": "DropIndex", "title": "Clustered PK", "schema_name": "dbo", "table_name": "Customers", "index_name": "PK_Customers",
+   "index_type": null, "key_columns": [], "include_columns": [], "filter_predicate": null, "is_unique": false, "confidence": "Low", "rationale": "t", "script": ""},
+  {"priority": 7, "category": "DropIndex", "title": "Unique constraint", "schema_name": "dbo", "table_name": "Customers", "index_name": "UQ_Customers_Email",
+   "index_type": null, "key_columns": [], "include_columns": [], "filter_predicate": null, "is_unique": false, "confidence": "Low", "rationale": "t", "script": ""},
+  {"priority": 8, "category": "DropIndex", "title": "Hinted", "schema_name": "dbo", "table_name": "Customers", "index_name": "IX_Customers_Email_Hinted",
+   "index_type": null, "key_columns": [], "include_columns": [], "filter_predicate": null, "is_unique": false, "confidence": "Low", "rationale": "t", "script": ""},
+  {"priority": 9, "category": "DropIndex", "title": "Forced plan", "schema_name": "dbo", "table_name": "Orders", "index_name": "IX_Orders_Status_Probe",
+   "index_type": null, "key_columns": [], "include_columns": [], "filter_predicate": null, "is_unique": false, "confidence": "Low", "rationale": "t", "script": ""},
+  {"priority": 10, "category": "DropIndex", "title": "Injection", "schema_name": "dbo", "table_name": "Customers", "index_name": "IX_Customers_Region]; DROP TABLE dbo.Customers; --",
+   "index_type": null, "key_columns": [], "include_columns": [], "filter_predicate": null, "is_unique": false, "confidence": "Low", "rationale": "t", "script": "DROP TABLE dbo.Customers;"},
+  {"priority": 11, "category": "DropIndex", "title": "Duplicate", "schema_name": "dbo", "table_name": "Customers", "index_name": "IX_Customers_Region_Dup",
+   "index_type": null, "key_columns": [], "include_columns": [], "filter_predicate": null, "is_unique": false, "confidence": "High", "rationale": "t", "script": ""}]}';
+EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @TestResponse = @Answer, @AllowColumnstore = 1, @AllowDropIndex = 1;
+
+DECLARE @RunId int = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
+DECLARE @Expected TABLE (Priority int PRIMARY KEY, Status varchar(20), ReasonLike nvarchar(200));
+INSERT @Expected VALUES
+    (1, 'Applied', NULL),
+    (2, 'Skipped', N'The table already has columnstore index \[NCCI_Orders_T16\]%'),
+    (3, 'Skipped', N'The table has a clustered rowstore index%'),
+    (4, 'Applied', NULL),
+    (5, 'Applied', NULL),
+    (6, 'Skipped', N'Only nonclustered indexes are dropped here; \[PK_Customers\] is CLUSTERED.'),
+    (7, 'Skipped', N'\[UQ_Customers_Email\] enforces a primary key or unique constraint.'),
+    (8, 'Skipped', N'\[IX_Customers_Email_Hinted\] is named by module \[dbo\].\[usp_T16_Hinted\]%'),
+    (9, 'Skipped', N'\[IX_Orders_Status_Probe\] is named by the forced Query Store plan_id%'),
+    (10, 'Skipped', N'Index %does not exist on \[dbo\].\[Customers\].'),
+    (11, 'Skipped', N'\[IX_Customers_Region_Dup\] is named by the forced Query Store plan_id%');
+IF EXISTS (SELECT 1 FROM @Expected AS e
+           LEFT JOIN AIIndexTuner.Recommendation AS r ON r.RunId = @RunId AND r.Priority = e.Priority
+           WHERE r.Status IS NULL OR r.Status <> e.Status
+              OR (e.ReasonLike IS NOT NULL AND ISNULL(r.StatusReason, N'') NOT LIKE e.ReasonLike ESCAPE N'\'))
+BEGIN
+    SELECT e.Priority, e.Status AS Expected, r.Status AS Actual, r.StatusReason, r.AppliedDDL
+    FROM @Expected AS e LEFT JOIN AIIndexTuner.Recommendation AS r ON r.RunId = @RunId AND r.Priority = e.Priority;
+    THROW 50999, N'FAIL T16: statuses differ from expected (see the result set above).', 1;
+END;
+
+-- The DDL is built from the validated fields: the include goes into the column list, and
+-- rowstore-only options are dropped.
+IF (SELECT AppliedDDL FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 1)
+   NOT LIKE N'CREATE NONCLUSTERED COLUMNSTORE INDEX \[NCCI_Orders_T16\] ON \[dbo\].\[Orders\] (\[OrderDate\], \[Status\], \[TotalDue\])%;' ESCAPE N'\'
+   OR (SELECT AppliedDDL FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 1) LIKE N'%FILLFACTOR%'
+   OR (SELECT AppliedDDL FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 4)
+      NOT LIKE N'CREATE CLUSTERED COLUMNSTORE INDEX \[CCI\_AIT\_AuditLog\_%\] ON \[dbo\].\[AuditLog\]%;' ESCAPE N'\'
+    THROW 50999, N'FAIL T16: unexpected columnstore DDL.', 1;
+IF OBJECT_ID(N'dbo.Customers', N'U') IS NULL OR EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Customers_Name_T16')
+   OR NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Customers_Region_Dup')
+    THROW 50999, N'FAIL T16: dbo.Customers is gone, the allowed drop did not run, or a blocked one did.', 1;
+
+-- Each UndoDDL reverses its change: the dropped index comes back as it was, the heap comes back.
+DECLARE @Undo nvarchar(max) = (SELECT UndoDDL FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 5);
+IF @Undo NOT LIKE N'CREATE NONCLUSTERED INDEX \[IX_Customers_Name_T16\] ON \[dbo\].\[Customers\] (\[CustomerName\] ASC) INCLUDE (\[Email\]) WHERE (\[Region\]=''AB'') WITH (FILLFACTOR = 90, DATA_COMPRESSION = PAGE) ON \[PRIMARY\];' ESCAPE N'\'
+BEGIN
+    SELECT @Undo AS UndoDDL;
+    THROW 50999, N'FAIL T16: unexpected UndoDDL for the dropped index (see the result set above).', 1;
+END;
+EXEC sys.sp_executesql @Undo;
+SET @Undo = (SELECT UndoDDL FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 4);
+EXEC sys.sp_executesql @Undo;
+SET @Undo = (SELECT UndoDDL FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 1);
+EXEC sys.sp_executesql @Undo;
+IF NOT EXISTS (SELECT 1 FROM sys.indexes AS i
+               INNER JOIN sys.partitions AS p ON p.object_id = i.object_id AND p.index_id = i.index_id
+               WHERE i.object_id = OBJECT_ID(N'dbo.Customers') AND i.name = N'IX_Customers_Name_T16' AND i.type = 2
+                 AND i.fill_factor = 90 AND i.filter_definition = N'([Region]=''AB'')' AND p.data_compression_desc = N'PAGE')
+   OR NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'dbo.AuditLog') AND type = 0)
+   OR EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'dbo.Orders') AND type IN (5, 6))
+    THROW 50999, N'FAIL T16: an UndoDDL did not reverse its change.', 1;
+
+DROP PROCEDURE dbo.usp_T16_Hinted;
+DROP INDEX IX_Customers_Email_Hinted ON dbo.Customers;
+ALTER TABLE dbo.Customers DROP CONSTRAINT UQ_Customers_Email;
+DROP INDEX IX_Orders_Status_Probe ON dbo.Orders;
+PRINT 'PASS T16: allowed columnstore indexes and drops are applied with UndoDDL that restores them; drops that would break a constraint, index hint or forced plan are skipped';
+GO
+
+/* ===== T17: recommend-only changes can be applied after review ===== */
+DECLARE @Answer nvarchar(max) = N'{"summary": "review first", "recommendations": [
+  {"priority": 1, "category": "CreateIndex", "title": "NCCI", "schema_name": "dbo", "table_name": "Customers", "index_name": "NCCI_Customers_T17",
+   "index_type": "NONCLUSTERED COLUMNSTORE", "key_columns": [{"column": "Region", "descending": false}],
+   "include_columns": [], "filter_predicate": null, "is_unique": false, "confidence": "Medium", "rationale": "t", "script": ""},
+  {"priority": 2, "category": "DropIndex", "title": "Unused", "schema_name": "dbo", "table_name": "Customers", "index_name": "IX_Customers_Name_T16",
+   "index_type": null, "key_columns": [], "include_columns": [], "filter_predicate": null, "is_unique": false, "confidence": "High", "rationale": "t", "script": ""}]}';
+EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @TestResponse = @Answer;   -- both settings NULL: recommend-only
+
+DECLARE @RunId int = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
+IF (SELECT COUNT(*) FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Status = 'Recommended') <> 2
+   OR (SELECT IndexType FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 1) <> 'NONCLUSTERED COLUMNSTORE'
+    THROW 50999, N'FAIL T17: CREATE mode touched a recommend-only change.', 1;
+
+-- Without the setting, applying it explains how; with it, it runs.
+DECLARE @CsId int = (SELECT RecommendationId FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 1);
+INSERT #Applied EXEC dbo.sp_AIIndexTuner_Apply @RecommendationId = @CsId;
+IF (SELECT StatusReason FROM AIIndexTuner.Recommendation WHERE RecommendationId = @CsId) NOT LIKE N'Columnstore indexes are recommend-only%@AllowColumnstore = 1.'
+    THROW 50999, N'FAIL T17: a recommend-only columnstore index was not skipped with a way to allow it.', 1;
+INSERT #Applied EXEC dbo.sp_AIIndexTuner_Apply @RunId = @RunId, @AllowColumnstore = 1, @AllowDropIndex = 1;
+IF (SELECT COUNT(*) FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Status = 'Applied') <> 2
+   OR NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'NCCI_Customers_T17' AND type = 6)
+   OR EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Customers_Name_T16')
+    THROW 50999, N'FAIL T17: sp_AIIndexTuner_Apply with the settings did not apply both changes.', 1;
+
+DECLARE @Undo nvarchar(max) = (SELECT STRING_AGG(UndoDDL, N' ') FROM AIIndexTuner.Recommendation WHERE RunId = @RunId);
+EXEC sys.sp_executesql @Undo;
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Customers_Name_T16') OR EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'NCCI_Customers_T17')
+    THROW 50999, N'FAIL T17: the UndoDDL did not restore the table.', 1;
+DROP INDEX IX_Customers_Name_T16 ON dbo.Customers;
+PRINT 'PASS T17: recommend-only columnstore indexes and drops stay for review, then apply with sp_AIIndexTuner_Apply and the setting';
 GO
 
 PRINT 'ALL TESTS PASSED';
