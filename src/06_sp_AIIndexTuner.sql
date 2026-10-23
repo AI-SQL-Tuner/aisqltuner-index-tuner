@@ -220,7 +220,7 @@ BEGIN
 
     SELECT r.RunId, r.Status AS RunStatus, r.ModelUsed, r.InputTokens, r.OutputTokens, r.Summary,
            r.CollectedChars, r.StartedAt, r.CompletedAt,
-           N'Free and open source from AI SQL Tuner. For deadlocks, code review, server health, query tuning and more, see https://www.aisqltuner.com' AS MoreFrom
+           N'Free and open source from AI SQL Tuner. For deadlocks, code review, server health, query tuning and more, see https://aisqltuner.com' AS MoreFrom
     FROM AIIndexTuner.Run AS r WHERE r.RunId = @RunId;
 
     SELECT RecommendationId, Priority, Category, Title, SchemaName, TableName, IndexName, IndexType, Confidence, EstimatedSizeMB,

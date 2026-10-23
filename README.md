@@ -11,7 +11,7 @@ EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE';                       -- also create 
 EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @AllowColumnstore = 0, @AllowDropIndex = 1, @MaxNewIndexes = 3;
 ```
 
-Free and open source from [AI SQL Tuner](https://www.aisqltuner.com). The idea comes from Brent
+Free and open source from [AI SQL Tuner](https://aisqltuner.com). The idea comes from Brent
 Ozar's post [I'm Probably Not Supposed to Show You Microsoft's Auto-Indexing Tool](https://www.brentozar.com/archive/2026/10/im-probably-not-supposed-to-show-you-microsofts-auto-indexing-tool),
 about Microsoft's 2006 `AutoIndex.sql` prototype: a modern version, with AI doing the analysis.
 
@@ -212,7 +212,7 @@ exactly what would be sent, run `EXEC dbo.sp_AIIndexTuner @CollectOnly = 1;`.
   prompt reserved `DropIndex` for drops to make now. The change controls and apply-mode checks are
   what make CREATE safe, not the prompt alone.
 - **No verification or rollback:** the tool does not measure impact after creating an index or
-  roll back regressions. Each applied change does store `UndoDDL` to reverse it by hand. [AI SQL Tuner](https://www.aisqltuner.com) also covers deadlocks, code
+  roll back regressions. Each applied change does store `UndoDDL` to reverse it by hand. [AI SQL Tuner](https://aisqltuner.com) also covers deadlocks, code
   review, server health, query tuning, and locking and blocking.
 
 ## Testing
@@ -314,4 +314,7 @@ It runs `sp_AIIndexTuner` against them and scores every run with 37 rubric check
 
 ## License
 
-To be decided before the first public release.
+[MIT](LICENSE). Copyright (c) 2026 AI SQL Tuner LLC.
+
+The software is provided as is, without warranty. It can create and drop indexes, so review
+recommendations and test in a non-production database first.
