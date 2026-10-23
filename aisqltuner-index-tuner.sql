@@ -1,6 +1,6 @@
 ﻿/*
     aisqltuner-index-tuner: AI-assisted index tuning from inside SQL Server.
-    Free and open source from AI SQL Tuner (https://www.aisqltuner.com).
+    Free and open source from AI SQL Tuner (https://aisqltuner.com).
 
     Install: run this script in the user database you want to tune, then run
     setup/Configure-Endpoint.sql. Requires SQL Server 2025, Azure SQL Database or
@@ -2408,7 +2408,7 @@ BEGIN
 
     SELECT r.RunId, r.Status AS RunStatus, r.ModelUsed, r.InputTokens, r.OutputTokens, r.Summary,
            r.CollectedChars, r.StartedAt, r.CompletedAt,
-           N'Free and open source from AI SQL Tuner. For deadlocks, code review, server health, query tuning and more, see https://www.aisqltuner.com' AS MoreFrom
+           N'Free and open source from AI SQL Tuner. For deadlocks, code review, server health, query tuning and more, see https://aisqltuner.com' AS MoreFrom
     FROM AIIndexTuner.Run AS r WHERE r.RunId = @RunId;
 
     SELECT RecommendationId, Priority, Category, Title, SchemaName, TableName, IndexName, IndexType, Confidence, EstimatedSizeMB,

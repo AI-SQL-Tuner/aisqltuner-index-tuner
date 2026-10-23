@@ -6,7 +6,7 @@ $out = Join-Path $root 'aisqltuner-index-tuner.sql'
 $header = @"
 /*
     aisqltuner-index-tuner: AI-assisted index tuning from inside SQL Server.
-    Free and open source from AI SQL Tuner (https://www.aisqltuner.com).
+    Free and open source from AI SQL Tuner (https://aisqltuner.com).
 
     Install: run this script in the user database you want to tune, then run
     setup/Configure-Endpoint.sql. Requires SQL Server 2025, Azure SQL Database or
