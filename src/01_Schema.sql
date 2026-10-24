@@ -184,3 +184,28 @@ BEGIN
     RETURN REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@Value, N'\', N'\\'), N'%', N'\%'), N'_', N'\_'), N'[', N'\['), N']', N'\]');
 END;
 GO
+
+/* A column's declared type as it would be written in DDL: nvarchar(max), nvarchar(200),
+   decimal(12, 2), datetime2(3), int. Lengths of nchar and nvarchar are in characters. */
+CREATE OR ALTER FUNCTION AIIndexTuner.fn_ColumnType(@ObjectId int, @ColumnId int)
+RETURNS nvarchar(200)
+AS
+BEGIN
+    RETURN (
+        SELECT CONCAT(t.name,
+            CASE
+                WHEN t.name IN (N'varchar', N'char', N'varbinary', N'binary')
+                    THEN CONCAT(N'(', CASE WHEN c.max_length = -1 THEN N'max' ELSE CAST(c.max_length AS nvarchar(10)) END, N')')
+                WHEN t.name IN (N'nvarchar', N'nchar')
+                    THEN CONCAT(N'(', CASE WHEN c.max_length = -1 THEN N'max' ELSE CAST(c.max_length / 2 AS nvarchar(10)) END, N')')
+                WHEN t.name IN (N'decimal', N'numeric')
+                    THEN CONCAT(N'(', c.precision, N', ', c.scale, N')')
+                WHEN t.name IN (N'datetime2', N'time', N'datetimeoffset')
+                    THEN CONCAT(N'(', c.scale, N')')
+                ELSE N''
+            END)
+        FROM sys.columns AS c
+        INNER JOIN sys.types AS t ON t.user_type_id = c.user_type_id
+        WHERE c.object_id = @ObjectId AND c.column_id = @ColumnId);
+END;
+GO

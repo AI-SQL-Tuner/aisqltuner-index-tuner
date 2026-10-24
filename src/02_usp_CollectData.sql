@@ -218,6 +218,66 @@ BEGIN
         SET @ServerFillFactor = 100;
     END CATCH;
 
+    /* Included columns of the top 50 missing-index candidates, with their types, for the next two
+       sections. A missing-index suggestion names its INCLUDE columns but not their types, so a
+       copied suggestion can put an nvarchar(max) column into an index. For (max), xml, text and
+       other columns of 256 bytes or more, an average width is also sampled from up to 1,000 rows. */
+    CREATE TABLE #IncludeCols (index_handle int, object_id int, column_id int, column_name sysname, type_name nvarchar(200), is_wide bit, avg_bytes bigint NULL);
+    CREATE TABLE #IncludeTypes (index_handle int PRIMARY KEY, Types nvarchar(max));
+    BEGIN TRY
+        INSERT #IncludeCols (index_handle, object_id, column_id, column_name, type_name, is_wide)
+        SELECT mi.index_handle, mi.object_id, c.column_id, c.name, AIIndexTuner.fn_ColumnType(c.object_id, c.column_id),
+               CASE WHEN c.max_length = -1 OR c.max_length >= 256 OR c.system_type_id IN (34, 35, 99, 241) THEN 1 ELSE 0 END
+        FROM (SELECT TOP (50) d.index_handle, d.object_id
+              FROM sys.dm_db_missing_index_details AS d
+              INNER JOIN sys.dm_db_missing_index_groups AS g ON d.index_handle = g.index_handle
+              INNER JOIN sys.dm_db_missing_index_group_stats AS st ON g.index_group_handle = st.group_handle
+              INNER JOIN sys.objects AS o ON d.object_id = o.object_id
+              INNER JOIN sys.schemas AS s ON o.schema_id = s.schema_id
+              WHERE d.database_id = DB_ID()
+                AND s.name NOT LIKE N'AIIndexTuner%' AND (@SchemaName IS NULL OR s.name = @SchemaName)
+                AND (@TableName IS NULL OR o.name = @TableName)
+              ORDER BY st.avg_total_user_cost * st.avg_user_impact * (st.user_seeks + st.user_scans) DESC) AS mi
+        CROSS APPLY sys.dm_db_missing_index_columns(mi.index_handle) AS mc
+        INNER JOIN sys.columns AS c ON c.object_id = mi.object_id AND c.column_id = mc.column_id
+        WHERE mc.column_usage = 'INCLUDE';
+
+        DECLARE @WideObject int, @WideColumn int, @WideSql nvarchar(max), @WideAvg bigint;
+        DECLARE wide_cur CURSOR LOCAL FAST_FORWARD FOR
+            SELECT DISTINCT object_id, column_id FROM #IncludeCols WHERE is_wide = 1;
+        OPEN wide_cur;
+        FETCH NEXT FROM wide_cur INTO @WideObject, @WideColumn;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            BEGIN TRY
+                -- NOLOCK: an estimate, which should not wait on or block the workload.
+                SET @WideSql = N'SELECT @Avg = AVG(CAST(DATALENGTH(v) AS bigint)) FROM (SELECT TOP (1000) ' + QUOTENAME(COL_NAME(@WideObject, @WideColumn))
+                             + N' AS v FROM ' + QUOTENAME(OBJECT_SCHEMA_NAME(@WideObject)) + N'.' + QUOTENAME(OBJECT_NAME(@WideObject)) + N' WITH (NOLOCK)'
+                             + N' WHERE ' + QUOTENAME(COL_NAME(@WideObject, @WideColumn)) + N' IS NOT NULL) AS x;';
+                SET @WideAvg = NULL;
+                EXEC sys.sp_executesql @WideSql, N'@Avg bigint OUTPUT', @Avg = @WideAvg OUTPUT;
+                UPDATE #IncludeCols SET avg_bytes = @WideAvg WHERE object_id = @WideObject AND column_id = @WideColumn;
+            END TRY
+            BEGIN CATCH
+                -- Leave the width unknown; the type is still reported.
+            END CATCH;
+            FETCH NEXT FROM wide_cur INTO @WideObject, @WideColumn;
+        END;
+        CLOSE wide_cur;
+        DEALLOCATE wide_cur;
+
+        INSERT #IncludeTypes (index_handle, Types)
+        SELECT index_handle,
+               STRING_AGG(CAST(CONCAT(column_name, N' ', type_name, CASE WHEN avg_bytes IS NOT NULL THEN CONCAT(N' (avg ', avg_bytes, N' bytes)') END) AS nvarchar(max)), N', ')
+                   WITHIN GROUP (ORDER BY column_id)
+        FROM #IncludeCols
+        GROUP BY index_handle;
+    END TRY
+    BEGIN CATCH
+        IF CURSOR_STATUS('local', 'wide_cur') >= -1 BEGIN CLOSE wide_cur; DEALLOCATE wide_cur; END;
+        -- The two sections below still run, without IncludedColumnTypes.
+    END CATCH;
+
     /* ===== MISSING INDEX RECOMMENDATIONS ===== */
     BEGIN TRY
         SET @j = (
@@ -226,6 +286,7 @@ BEGIN
                 CASE WHEN LEN(d.equality_columns) > 200 THEN LEFT(d.equality_columns, 200) + N'...' ELSE d.equality_columns END AS EqualityColumns,
                 CASE WHEN LEN(d.inequality_columns) > 200 THEN LEFT(d.inequality_columns, 200) + N'...' ELSE d.inequality_columns END AS InequalityColumns,
                 CASE WHEN LEN(d.included_columns) > 200 THEN LEFT(d.included_columns, 200) + N'...' ELSE d.included_columns END AS IncludedColumns,
+                it.Types AS IncludedColumnTypes,
                 CAST(st.avg_total_user_cost AS decimal(18, 2)) AS AvgTotalUserCost,
                 CAST(st.avg_user_impact AS decimal(5, 2)) AS AvgUserImpactPct,
                 st.user_seeks + st.user_scans AS TotalSeeksScans,
@@ -235,6 +296,7 @@ BEGIN
             INNER JOIN sys.dm_db_missing_index_group_stats AS st ON g.index_group_handle = st.group_handle
             INNER JOIN sys.objects AS o ON d.object_id = o.object_id
             INNER JOIN sys.schemas AS s ON o.schema_id = s.schema_id
+            LEFT JOIN #IncludeTypes AS it ON it.index_handle = d.index_handle
             WHERE d.database_id = DB_ID()
               AND st.avg_total_user_cost * st.avg_user_impact * (st.user_seeks + st.user_scans) > 100000
               AND s.name NOT LIKE N'AIIndexTuner%' AND (@SchemaName IS NULL OR s.name = @SchemaName)
@@ -323,6 +385,7 @@ BEGIN
         WITH missing_indexes AS (
             SELECT TOP (15)
                 d.object_id,
+                d.index_handle,
                 s.name + N'.' + o.name AS table_name,
                 COALESCE(d.equality_columns, N'') AS equality_columns,
                 COALESCE(d.inequality_columns, N'') AS inequality_columns,
@@ -373,6 +436,7 @@ BEGIN
                 mn.equality_columns AS EqualityColumns,
                 mn.inequality_columns AS InequalityColumns,
                 mn.included_columns AS IncludedColumns,
+                it.Types AS IncludedColumnTypes,
                 mn.requested_key_columns AS RequestedKeyColumns,
                 best.existing_index_name AS BestMatchingExistingIndex,
                 best.existing_key_columns AS ExistingKeyColumns,
@@ -388,6 +452,7 @@ BEGIN
                     + (CASE WHEN NULLIF(mn.requested_include_columns, N'') IS NULL THEN 0 ELSE LEN(mn.requested_include_columns) - LEN(REPLACE(mn.requested_include_columns, N',', N'')) + 1 END)) AS bigint) AS EstimatedWritePenalty
             FROM missing_normalized AS mn
             LEFT JOIN table_sizes AS ts ON mn.object_id = ts.object_id
+            LEFT JOIN #IncludeTypes AS it ON it.index_handle = mn.index_handle
             OUTER APPLY (
                 SELECT TOP (1) en.existing_index_name, en.existing_key_columns, en.existing_include_columns, en.user_updates,
                        CASE
@@ -616,14 +681,16 @@ BEGIN
     /* ===== COLUMN CARDINALITY =====
        Density vectors for the tables behind the top 20 high-impact missing indexes and the 20 largest
        tables over 10,000 rows (plus the scoped table), via DBCC SHOW_STATISTICS ... WITH DENSITY_VECTOR. */
+    -- The candidate statistics, kept for SKEWED LOW-CARDINALITY COLUMNS.
+    CREATE TABLE #CardStats (object_id int, stats_id int, StatsTable nvarchar(300), StatsName sysname);
     BEGIN TRY
         CREATE TABLE #RawDensity (AllDensity float, AvgLength float, Columns nvarchar(4000));
         CREATE TABLE #Density (TableName nvarchar(300), AllDensity float, AvgLength float, Columns nvarchar(4000));
 
         DECLARE @StatsTable nvarchar(300), @StatsName sysname, @sql nvarchar(max), @CardinalityErrors int = 0;
 
-        DECLARE stats_cur CURSOR LOCAL FAST_FORWARD FOR
-            SELECT DISTINCT QUOTENAME(OBJECT_SCHEMA_NAME(s.object_id)) + N'.' + QUOTENAME(OBJECT_NAME(s.object_id)), s.name
+        INSERT #CardStats (object_id, stats_id, StatsTable, StatsName)
+            SELECT DISTINCT s.object_id, s.stats_id, QUOTENAME(OBJECT_SCHEMA_NAME(s.object_id)) + N'.' + QUOTENAME(OBJECT_NAME(s.object_id)), s.name
             FROM sys.stats AS s
             INNER JOIN sys.objects AS o ON s.object_id = o.object_id
             WHERE o.type = 'U'
@@ -644,6 +711,8 @@ BEGIN
                                       ORDER BY SUM(ps.row_count) DESC)
                    OR (@SchemaName IS NOT NULL AND @TableName IS NOT NULL));
 
+        DECLARE stats_cur CURSOR LOCAL FAST_FORWARD FOR
+            SELECT StatsTable, StatsName FROM #CardStats;
         OPEN stats_cur;
         FETCH NEXT FROM stats_cur INTO @StatsTable, @StatsName;
         WHILE @@FETCH_STATUS = 0
@@ -679,6 +748,54 @@ BEGIN
     BEGIN CATCH
         IF CURSOR_STATUS('local', 'stats_cur') >= -1 BEGIN CLOSE stats_cur; DEALLOCATE stats_cur; END;
         SET @Data += CONCAT(@nl, N'=== COLUMN CARDINALITY ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
+    END CATCH;
+
+    /* ===== SKEWED LOW-CARDINALITY COLUMNS =====
+       For the tables in COLUMN CARDINALITY: columns that lead a statistics object whose histogram has
+       2 to 10 values, one value per step, where one value holds 80% or more of the rows or one holds
+       5% or less. Density alone says State has 2 values; this says Open is 0.5% of the rows. A query
+       for a rare value is served by a filtered index, and SQL Server often suggests no missing index
+       for it. Shares are from the histogram, so they are as current as StatsUpdated. */
+    BEGIN TRY
+        WITH lead_stats AS (
+            SELECT cs.object_id, cs.StatsTable, sc.column_id, MIN(cs.stats_id) AS stats_id
+            FROM #CardStats AS cs
+            INNER JOIN sys.stats_columns AS sc ON sc.object_id = cs.object_id AND sc.stats_id = cs.stats_id AND sc.stats_column_id = 1
+            GROUP BY cs.object_id, cs.StatsTable, sc.column_id
+        ),
+        hist AS (
+            SELECT ls.object_id, ls.StatsTable, ls.column_id, ls.stats_id, h.range_high_key, h.equal_rows,
+                   SUM(h.equal_rows + h.range_rows) OVER (PARTITION BY ls.object_id, ls.column_id) AS total_rows,
+                   SUM(h.range_rows) OVER (PARTITION BY ls.object_id, ls.column_id) AS between_rows,
+                   COUNT(*) OVER (PARTITION BY ls.object_id, ls.column_id) AS steps
+            FROM lead_stats AS ls
+            CROSS APPLY sys.dm_db_stats_histogram(ls.object_id, ls.stats_id) AS h
+        ),
+        skewed AS (
+            SELECT object_id, StatsTable, column_id, stats_id, total_rows
+            FROM hist
+            WHERE steps BETWEEN 2 AND 10 AND between_rows = 0 AND total_rows >= 1000
+            GROUP BY object_id, StatsTable, column_id, stats_id, total_rows
+            HAVING MAX(equal_rows) >= 0.8 * total_rows OR MIN(equal_rows) <= 0.05 * total_rows
+        )
+        SELECT @j = (
+            SELECT TOP (20)
+                sk.StatsTable AS TableName,
+                COL_NAME(sk.object_id, sk.column_id) AS ColumnName,
+                AIIndexTuner.fn_ColumnType(sk.object_id, sk.column_id) AS ColumnType,
+                CAST(sk.total_rows AS bigint) AS HistogramRows,
+                CONVERT(varchar(19), STATS_DATE(sk.object_id, sk.stats_id), 120) AS StatsUpdated,
+                (SELECT STRING_AGG(CAST(CONCAT(ISNULL(LEFT(CONVERT(nvarchar(4000), h.range_high_key), 60), N'NULL'), N': ',
+                                               CAST(100.0 * h.equal_rows / h.total_rows AS decimal(5, 2)), N'%') AS nvarchar(max)), N', ')
+                            WITHIN GROUP (ORDER BY h.equal_rows DESC)
+                 FROM hist AS h WHERE h.object_id = sk.object_id AND h.column_id = sk.column_id) AS ValueShares
+            FROM skewed AS sk
+            ORDER BY sk.total_rows DESC
+            FOR JSON PATH);
+        SET @Data += CONCAT(@nl, N'=== SKEWED LOW-CARDINALITY COLUMNS ===', @nl, ISNULL(@j, N'(none)'), @nl);
+    END TRY
+    BEGIN CATCH
+        SET @Data += CONCAT(@nl, N'=== SKEWED LOW-CARDINALITY COLUMNS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
     /* ===== LARGE TABLES ===== over 1,000,000 rows */

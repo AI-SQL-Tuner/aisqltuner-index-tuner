@@ -99,6 +99,10 @@ GO
 DECLARE @Data nvarchar(max);
 EXEC AIIndexTuner.usp_CollectData @Data = @Data OUTPUT;
 IF @Data NOT LIKE N'%=== MISSING INDEX RECOMMENDATIONS ===%dbo.Orders%'
+   -- The Orders suggestions include TotalDue decimal(12, 2) and CustomerId int, with their types.
+   OR @Data NOT LIKE N'%=== MISSING INDEX RECOMMENDATIONS ===%"IncludedColumnTypes":"TotalDue decimal(12, 2)"%=== INDEX USAGE STATISTICS ===%'
+   OR @Data NOT LIKE N'%=== MISSING INDEX OVERLAP SIGNALS ===%"IncludedColumnTypes":"%=== DUPLICATE AND OVERLAPPING INDEXES ===%'
+   OR @Data NOT LIKE N'%=== SKEWED LOW-CARDINALITY COLUMNS ===%'
    OR @Data NOT LIKE N'%=== DUPLICATE AND OVERLAPPING INDEXES ===%IX_Customers_Region_Dup%'
    OR @Data NOT LIKE N'%=== UNTRUSTED OR DISABLED CONSTRAINTS ===%FK_Orders_Customers%'
    OR @Data NOT LIKE N'%=== COLUMN CARDINALITY ===%EstimatedDistinctValues%'
@@ -613,6 +617,33 @@ IF (SELECT StatusReason FROM AIIndexTuner.Recommendation WHERE RecommendationId 
 DROP INDEX IX_Customers_Name_T16 ON dbo.Customers;
 DROP INDEX IX_Customers_Name_Wide ON dbo.Customers;
 PRINT 'PASS T17: recommend-only columnstore indexes and drops stay for review, then apply with sp_AIIndexTuner_Apply and the setting';
+GO
+
+/* ===== T18: column types and skewed low-cardinality columns ===== */
+IF AIIndexTuner.fn_ColumnType(OBJECT_ID(N'dbo.Orders'), COLUMNPROPERTY(OBJECT_ID(N'dbo.Orders'), N'Notes', 'ColumnId')) <> N'nvarchar(200)'
+   OR AIIndexTuner.fn_ColumnType(OBJECT_ID(N'dbo.Orders'), COLUMNPROPERTY(OBJECT_ID(N'dbo.Orders'), N'TotalDue', 'ColumnId')) <> N'decimal(12, 2)'
+   OR AIIndexTuner.fn_ColumnType(OBJECT_ID(N'dbo.Orders'), COLUMNPROPERTY(OBJECT_ID(N'dbo.Orders'), N'OrderDate', 'ColumnId')) <> N'date'
+   OR AIIndexTuner.fn_ColumnType(OBJECT_ID(N'dbo.Customers'), COLUMNPROPERTY(OBJECT_ID(N'dbo.Customers'), N'Region', 'ColumnId')) <> N'char(2)'
+    THROW 50999, N'FAIL T18: fn_ColumnType does not format a type as DDL would.', 1;
+
+-- Orders.Notes is NULL in 90% of rows and 'Gift wrap' in 10%: skewed. Orders.Status has five
+-- equally common values: not skewed.
+IF NOT EXISTS (SELECT 1 FROM sys.stats WHERE object_id = OBJECT_ID(N'dbo.Orders') AND name = N'ST_T18_Notes')
+    CREATE STATISTICS ST_T18_Notes ON dbo.Orders (Notes) WITH FULLSCAN;
+IF NOT EXISTS (SELECT 1 FROM sys.stats WHERE object_id = OBJECT_ID(N'dbo.Orders') AND name = N'ST_T18_Status')
+    CREATE STATISTICS ST_T18_Status ON dbo.Orders (Status) WITH FULLSCAN;
+DECLARE @Data nvarchar(max);
+EXEC AIIndexTuner.usp_CollectData @Data = @Data OUTPUT;
+DECLARE @Skew nvarchar(max) = SUBSTRING(@Data, CHARINDEX(N'=== SKEWED LOW-CARDINALITY COLUMNS ===', @Data),
+                                        CHARINDEX(N'=== LARGE TABLES ===', @Data) - CHARINDEX(N'=== SKEWED LOW-CARDINALITY COLUMNS ===', @Data));
+IF @Skew NOT LIKE N'%"TableName":"\[dbo\].\[Orders\]","ColumnName":"Notes","ColumnType":"nvarchar(200)","HistogramRows":300000,%"ValueShares":"NULL: 90.00\%, Gift wrap: 10.00\%"%' ESCAPE N'\'
+   OR @Skew LIKE N'%"ColumnName":"Status"%'
+BEGIN
+    SELECT @Skew AS SkewSection;
+    THROW 50999, N'FAIL T18: the skewed-column section is missing Notes, or lists the evenly spread Status (see the result set above).', 1;
+END;
+DROP STATISTICS dbo.Orders.ST_T18_Notes, dbo.Orders.ST_T18_Status;
+PRINT 'PASS T18: column types are formatted as in DDL, and a skewed column is reported with each value''s share while an even one is not';
 GO
 
 PRINT 'ALL TESTS PASSED';

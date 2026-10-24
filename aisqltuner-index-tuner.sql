@@ -196,6 +196,31 @@ BEGIN
 END;
 GO
 
+/* A column's declared type as it would be written in DDL: nvarchar(max), nvarchar(200),
+   decimal(12, 2), datetime2(3), int. Lengths of nchar and nvarchar are in characters. */
+CREATE OR ALTER FUNCTION AIIndexTuner.fn_ColumnType(@ObjectId int, @ColumnId int)
+RETURNS nvarchar(200)
+AS
+BEGIN
+    RETURN (
+        SELECT CONCAT(t.name,
+            CASE
+                WHEN t.name IN (N'varchar', N'char', N'varbinary', N'binary')
+                    THEN CONCAT(N'(', CASE WHEN c.max_length = -1 THEN N'max' ELSE CAST(c.max_length AS nvarchar(10)) END, N')')
+                WHEN t.name IN (N'nvarchar', N'nchar')
+                    THEN CONCAT(N'(', CASE WHEN c.max_length = -1 THEN N'max' ELSE CAST(c.max_length / 2 AS nvarchar(10)) END, N')')
+                WHEN t.name IN (N'decimal', N'numeric')
+                    THEN CONCAT(N'(', c.precision, N', ', c.scale, N')')
+                WHEN t.name IN (N'datetime2', N'time', N'datetimeoffset')
+                    THEN CONCAT(N'(', c.scale, N')')
+                ELSE N''
+            END)
+        FROM sys.columns AS c
+        INNER JOIN sys.types AS t ON t.user_type_id = c.user_type_id
+        WHERE c.object_id = @ObjectId AND c.column_id = @ColumnId);
+END;
+GO
+
 /* ===== 02_usp_CollectData.sql ===== */
 SET ANSI_NULLS ON;
 SET QUOTED_IDENTIFIER ON;
@@ -417,6 +442,66 @@ BEGIN
         SET @ServerFillFactor = 100;
     END CATCH;
 
+    /* Included columns of the top 50 missing-index candidates, with their types, for the next two
+       sections. A missing-index suggestion names its INCLUDE columns but not their types, so a
+       copied suggestion can put an nvarchar(max) column into an index. For (max), xml, text and
+       other columns of 256 bytes or more, an average width is also sampled from up to 1,000 rows. */
+    CREATE TABLE #IncludeCols (index_handle int, object_id int, column_id int, column_name sysname, type_name nvarchar(200), is_wide bit, avg_bytes bigint NULL);
+    CREATE TABLE #IncludeTypes (index_handle int PRIMARY KEY, Types nvarchar(max));
+    BEGIN TRY
+        INSERT #IncludeCols (index_handle, object_id, column_id, column_name, type_name, is_wide)
+        SELECT mi.index_handle, mi.object_id, c.column_id, c.name, AIIndexTuner.fn_ColumnType(c.object_id, c.column_id),
+               CASE WHEN c.max_length = -1 OR c.max_length >= 256 OR c.system_type_id IN (34, 35, 99, 241) THEN 1 ELSE 0 END
+        FROM (SELECT TOP (50) d.index_handle, d.object_id
+              FROM sys.dm_db_missing_index_details AS d
+              INNER JOIN sys.dm_db_missing_index_groups AS g ON d.index_handle = g.index_handle
+              INNER JOIN sys.dm_db_missing_index_group_stats AS st ON g.index_group_handle = st.group_handle
+              INNER JOIN sys.objects AS o ON d.object_id = o.object_id
+              INNER JOIN sys.schemas AS s ON o.schema_id = s.schema_id
+              WHERE d.database_id = DB_ID()
+                AND s.name NOT LIKE N'AIIndexTuner%' AND (@SchemaName IS NULL OR s.name = @SchemaName)
+                AND (@TableName IS NULL OR o.name = @TableName)
+              ORDER BY st.avg_total_user_cost * st.avg_user_impact * (st.user_seeks + st.user_scans) DESC) AS mi
+        CROSS APPLY sys.dm_db_missing_index_columns(mi.index_handle) AS mc
+        INNER JOIN sys.columns AS c ON c.object_id = mi.object_id AND c.column_id = mc.column_id
+        WHERE mc.column_usage = 'INCLUDE';
+
+        DECLARE @WideObject int, @WideColumn int, @WideSql nvarchar(max), @WideAvg bigint;
+        DECLARE wide_cur CURSOR LOCAL FAST_FORWARD FOR
+            SELECT DISTINCT object_id, column_id FROM #IncludeCols WHERE is_wide = 1;
+        OPEN wide_cur;
+        FETCH NEXT FROM wide_cur INTO @WideObject, @WideColumn;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            BEGIN TRY
+                -- NOLOCK: an estimate, which should not wait on or block the workload.
+                SET @WideSql = N'SELECT @Avg = AVG(CAST(DATALENGTH(v) AS bigint)) FROM (SELECT TOP (1000) ' + QUOTENAME(COL_NAME(@WideObject, @WideColumn))
+                             + N' AS v FROM ' + QUOTENAME(OBJECT_SCHEMA_NAME(@WideObject)) + N'.' + QUOTENAME(OBJECT_NAME(@WideObject)) + N' WITH (NOLOCK)'
+                             + N' WHERE ' + QUOTENAME(COL_NAME(@WideObject, @WideColumn)) + N' IS NOT NULL) AS x;';
+                SET @WideAvg = NULL;
+                EXEC sys.sp_executesql @WideSql, N'@Avg bigint OUTPUT', @Avg = @WideAvg OUTPUT;
+                UPDATE #IncludeCols SET avg_bytes = @WideAvg WHERE object_id = @WideObject AND column_id = @WideColumn;
+            END TRY
+            BEGIN CATCH
+                -- Leave the width unknown; the type is still reported.
+            END CATCH;
+            FETCH NEXT FROM wide_cur INTO @WideObject, @WideColumn;
+        END;
+        CLOSE wide_cur;
+        DEALLOCATE wide_cur;
+
+        INSERT #IncludeTypes (index_handle, Types)
+        SELECT index_handle,
+               STRING_AGG(CAST(CONCAT(column_name, N' ', type_name, CASE WHEN avg_bytes IS NOT NULL THEN CONCAT(N' (avg ', avg_bytes, N' bytes)') END) AS nvarchar(max)), N', ')
+                   WITHIN GROUP (ORDER BY column_id)
+        FROM #IncludeCols
+        GROUP BY index_handle;
+    END TRY
+    BEGIN CATCH
+        IF CURSOR_STATUS('local', 'wide_cur') >= -1 BEGIN CLOSE wide_cur; DEALLOCATE wide_cur; END;
+        -- The two sections below still run, without IncludedColumnTypes.
+    END CATCH;
+
     /* ===== MISSING INDEX RECOMMENDATIONS ===== */
     BEGIN TRY
         SET @j = (
@@ -425,6 +510,7 @@ BEGIN
                 CASE WHEN LEN(d.equality_columns) > 200 THEN LEFT(d.equality_columns, 200) + N'...' ELSE d.equality_columns END AS EqualityColumns,
                 CASE WHEN LEN(d.inequality_columns) > 200 THEN LEFT(d.inequality_columns, 200) + N'...' ELSE d.inequality_columns END AS InequalityColumns,
                 CASE WHEN LEN(d.included_columns) > 200 THEN LEFT(d.included_columns, 200) + N'...' ELSE d.included_columns END AS IncludedColumns,
+                it.Types AS IncludedColumnTypes,
                 CAST(st.avg_total_user_cost AS decimal(18, 2)) AS AvgTotalUserCost,
                 CAST(st.avg_user_impact AS decimal(5, 2)) AS AvgUserImpactPct,
                 st.user_seeks + st.user_scans AS TotalSeeksScans,
@@ -434,6 +520,7 @@ BEGIN
             INNER JOIN sys.dm_db_missing_index_group_stats AS st ON g.index_group_handle = st.group_handle
             INNER JOIN sys.objects AS o ON d.object_id = o.object_id
             INNER JOIN sys.schemas AS s ON o.schema_id = s.schema_id
+            LEFT JOIN #IncludeTypes AS it ON it.index_handle = d.index_handle
             WHERE d.database_id = DB_ID()
               AND st.avg_total_user_cost * st.avg_user_impact * (st.user_seeks + st.user_scans) > 100000
               AND s.name NOT LIKE N'AIIndexTuner%' AND (@SchemaName IS NULL OR s.name = @SchemaName)
@@ -522,6 +609,7 @@ BEGIN
         WITH missing_indexes AS (
             SELECT TOP (15)
                 d.object_id,
+                d.index_handle,
                 s.name + N'.' + o.name AS table_name,
                 COALESCE(d.equality_columns, N'') AS equality_columns,
                 COALESCE(d.inequality_columns, N'') AS inequality_columns,
@@ -572,6 +660,7 @@ BEGIN
                 mn.equality_columns AS EqualityColumns,
                 mn.inequality_columns AS InequalityColumns,
                 mn.included_columns AS IncludedColumns,
+                it.Types AS IncludedColumnTypes,
                 mn.requested_key_columns AS RequestedKeyColumns,
                 best.existing_index_name AS BestMatchingExistingIndex,
                 best.existing_key_columns AS ExistingKeyColumns,
@@ -587,6 +676,7 @@ BEGIN
                     + (CASE WHEN NULLIF(mn.requested_include_columns, N'') IS NULL THEN 0 ELSE LEN(mn.requested_include_columns) - LEN(REPLACE(mn.requested_include_columns, N',', N'')) + 1 END)) AS bigint) AS EstimatedWritePenalty
             FROM missing_normalized AS mn
             LEFT JOIN table_sizes AS ts ON mn.object_id = ts.object_id
+            LEFT JOIN #IncludeTypes AS it ON it.index_handle = mn.index_handle
             OUTER APPLY (
                 SELECT TOP (1) en.existing_index_name, en.existing_key_columns, en.existing_include_columns, en.user_updates,
                        CASE
@@ -815,14 +905,16 @@ BEGIN
     /* ===== COLUMN CARDINALITY =====
        Density vectors for the tables behind the top 20 high-impact missing indexes and the 20 largest
        tables over 10,000 rows (plus the scoped table), via DBCC SHOW_STATISTICS ... WITH DENSITY_VECTOR. */
+    -- The candidate statistics, kept for SKEWED LOW-CARDINALITY COLUMNS.
+    CREATE TABLE #CardStats (object_id int, stats_id int, StatsTable nvarchar(300), StatsName sysname);
     BEGIN TRY
         CREATE TABLE #RawDensity (AllDensity float, AvgLength float, Columns nvarchar(4000));
         CREATE TABLE #Density (TableName nvarchar(300), AllDensity float, AvgLength float, Columns nvarchar(4000));
 
         DECLARE @StatsTable nvarchar(300), @StatsName sysname, @sql nvarchar(max), @CardinalityErrors int = 0;
 
-        DECLARE stats_cur CURSOR LOCAL FAST_FORWARD FOR
-            SELECT DISTINCT QUOTENAME(OBJECT_SCHEMA_NAME(s.object_id)) + N'.' + QUOTENAME(OBJECT_NAME(s.object_id)), s.name
+        INSERT #CardStats (object_id, stats_id, StatsTable, StatsName)
+            SELECT DISTINCT s.object_id, s.stats_id, QUOTENAME(OBJECT_SCHEMA_NAME(s.object_id)) + N'.' + QUOTENAME(OBJECT_NAME(s.object_id)), s.name
             FROM sys.stats AS s
             INNER JOIN sys.objects AS o ON s.object_id = o.object_id
             WHERE o.type = 'U'
@@ -843,6 +935,8 @@ BEGIN
                                       ORDER BY SUM(ps.row_count) DESC)
                    OR (@SchemaName IS NOT NULL AND @TableName IS NOT NULL));
 
+        DECLARE stats_cur CURSOR LOCAL FAST_FORWARD FOR
+            SELECT StatsTable, StatsName FROM #CardStats;
         OPEN stats_cur;
         FETCH NEXT FROM stats_cur INTO @StatsTable, @StatsName;
         WHILE @@FETCH_STATUS = 0
@@ -878,6 +972,54 @@ BEGIN
     BEGIN CATCH
         IF CURSOR_STATUS('local', 'stats_cur') >= -1 BEGIN CLOSE stats_cur; DEALLOCATE stats_cur; END;
         SET @Data += CONCAT(@nl, N'=== COLUMN CARDINALITY ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
+    END CATCH;
+
+    /* ===== SKEWED LOW-CARDINALITY COLUMNS =====
+       For the tables in COLUMN CARDINALITY: columns that lead a statistics object whose histogram has
+       2 to 10 values, one value per step, where one value holds 80% or more of the rows or one holds
+       5% or less. Density alone says State has 2 values; this says Open is 0.5% of the rows. A query
+       for a rare value is served by a filtered index, and SQL Server often suggests no missing index
+       for it. Shares are from the histogram, so they are as current as StatsUpdated. */
+    BEGIN TRY
+        WITH lead_stats AS (
+            SELECT cs.object_id, cs.StatsTable, sc.column_id, MIN(cs.stats_id) AS stats_id
+            FROM #CardStats AS cs
+            INNER JOIN sys.stats_columns AS sc ON sc.object_id = cs.object_id AND sc.stats_id = cs.stats_id AND sc.stats_column_id = 1
+            GROUP BY cs.object_id, cs.StatsTable, sc.column_id
+        ),
+        hist AS (
+            SELECT ls.object_id, ls.StatsTable, ls.column_id, ls.stats_id, h.range_high_key, h.equal_rows,
+                   SUM(h.equal_rows + h.range_rows) OVER (PARTITION BY ls.object_id, ls.column_id) AS total_rows,
+                   SUM(h.range_rows) OVER (PARTITION BY ls.object_id, ls.column_id) AS between_rows,
+                   COUNT(*) OVER (PARTITION BY ls.object_id, ls.column_id) AS steps
+            FROM lead_stats AS ls
+            CROSS APPLY sys.dm_db_stats_histogram(ls.object_id, ls.stats_id) AS h
+        ),
+        skewed AS (
+            SELECT object_id, StatsTable, column_id, stats_id, total_rows
+            FROM hist
+            WHERE steps BETWEEN 2 AND 10 AND between_rows = 0 AND total_rows >= 1000
+            GROUP BY object_id, StatsTable, column_id, stats_id, total_rows
+            HAVING MAX(equal_rows) >= 0.8 * total_rows OR MIN(equal_rows) <= 0.05 * total_rows
+        )
+        SELECT @j = (
+            SELECT TOP (20)
+                sk.StatsTable AS TableName,
+                COL_NAME(sk.object_id, sk.column_id) AS ColumnName,
+                AIIndexTuner.fn_ColumnType(sk.object_id, sk.column_id) AS ColumnType,
+                CAST(sk.total_rows AS bigint) AS HistogramRows,
+                CONVERT(varchar(19), STATS_DATE(sk.object_id, sk.stats_id), 120) AS StatsUpdated,
+                (SELECT STRING_AGG(CAST(CONCAT(ISNULL(LEFT(CONVERT(nvarchar(4000), h.range_high_key), 60), N'NULL'), N': ',
+                                               CAST(100.0 * h.equal_rows / h.total_rows AS decimal(5, 2)), N'%') AS nvarchar(max)), N', ')
+                            WITHIN GROUP (ORDER BY h.equal_rows DESC)
+                 FROM hist AS h WHERE h.object_id = sk.object_id AND h.column_id = sk.column_id) AS ValueShares
+            FROM skewed AS sk
+            ORDER BY sk.total_rows DESC
+            FOR JSON PATH);
+        SET @Data += CONCAT(@nl, N'=== SKEWED LOW-CARDINALITY COLUMNS ===', @nl, ISNULL(@j, N'(none)'), @nl);
+    END TRY
+    BEGIN CATCH
+        SET @Data += CONCAT(@nl, N'=== SKEWED LOW-CARDINALITY COLUMNS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
     /* ===== LARGE TABLES ===== over 1,000,000 rows */
@@ -1437,8 +1579,12 @@ AS
 BEGIN
     RETURN CONCAT(CAST(N'' AS nvarchar(max)),
         N'You are a SQL Server expert specializing in index and code optimization. ',
-        N'Analyze the provided missing index recommendations, missing index overlap signals, column cardinality, index usage statistics (including key/included columns, index sizes and compression), duplicate and overlapping indexes, index page density, index operational hotspots, heap tables, large tables, query patterns from the plan cache, Query Store workload insights, Query Store write workload mix, Query Store forced plan failures, automatic tuning options, cardinality estimation feedback, constraints, untrusted or disabled constraints, and database statistics settings. ',
+        N'Analyze the provided missing index recommendations (with the types of their included columns), missing index overlap signals, column cardinality, skewed low-cardinality columns, index usage statistics (including key/included columns, index sizes and compression), duplicate and overlapping indexes, index page density, index operational hotspots, heap tables, large tables, query patterns from the plan cache, Query Store workload insights, Query Store write workload mix, Query Store forced plan failures, automatic tuning options, cardinality estimation feedback, constraints, untrusted or disabled constraints, and database statistics settings. ',
         N'Carefully consider the additional overhead of adding indexes. Analyze the number of user_updates compared to user_seeks and user_scans for each table when recommending indexes, especially when the index is not included in the missing indexes report. Consider clustered and nonclustered columnstore indexes for tables with more than 1000000 rows. Consider filtered indexes. ',
+        N'If HEAP TABLE ANALYSIS reports forwarded records, explain that each forwarded record costs an extra page read for every scan or lookup that reaches it, and that their number grows as rows widen. Recommend a clustered index on a narrow, unique, stable key that the workload filters or joins on, or the table''s primary key, as an Other recommendation (ConsolidateIndex when it replaces existing indexes) whose script creates it. If the table has to stay a heap, recommend ALTER TABLE ... REBUILD (RebuildIndex) instead, noting that it removes the forwarding pointers but that they return as rows widen again. A nonclustered index on a heap does not remove forwarded records. ',
+        N'Missing-index suggestions name their included columns without types. IncludedColumnTypes gives each type, and for wide columns an average width sampled from the table. Do not copy an nvarchar(max), varchar(max), varbinary(max), xml, text or other wide column into INCLUDE because a suggestion lists it: for the few rows a selective query returns, a key lookup costs less than storing the value again in every row of the index, and a (max) column can make the index nearly as large as the table. Include a wide column only when the query returns it for many rows, and then give its storage cost in the rationale and in estimated_size_mb. ',
+        N'SKEWED LOW-CARDINALITY COLUMNS lists columns where a value is rare, with the share of rows for each value. When a frequent query filters such a column on a rare literal value (for example State = ''Open'' at 0.5% of the rows), recommend a filtered index with that predicate in filter_predicate, keyed on the query''s other predicates and its ORDER BY columns, even when no missing-index suggestion covers the query. Do not recommend an unfiltered index led by the low-cardinality column: it stores every row of the common value, which no query reads. A filtered index is used only for a literal or recompiled value, so if the query passes the value as a parameter, say so in the rationale. ',
+        N'Before recommending a columnstore index on a table with updates, deletes or single-row inserts (shown by its user_updates, the Query Store write workload mix and the index operational hotspots), weigh that write activity in the rationale: an update to a compressed row marks it deleted and inserts the new version into the delta store, deleted rows stay in the rowgroups until a rebuild, and trickle inserts wait in the delta store until a rowgroup fills, so frequent writes add overhead and slow scans. When the table takes single-row updates by key while new rows arrive in date order, the hot rows are usually the recent ones: prefer a nonclustered columnstore index filtered to the older, stable rows (a filter_predicate on the date column, for example EventDate < a boundary date a few weeks back) so that the hot rows stay out of it, and say so in the rationale. If you decide against columnstore for such a table, still give the table a recommendation, a rowstore CreateIndex or an Other recommendation, whose rationale states its write activity and why that rules columnstore out. Never leave a large table that has both analytic queries and frequent writes out of the answer. ',
         N'If recommendation includes dropping and recreating a primary key, also include dropping and recreating any foreign keys that reference it. ',
         N'Recommend indexes only when beneficial: avoid on tables under ~1000 rows; consider selectively for 1000–10000 rows; generally add for tables with more than 10000 rows when predicates are selective. ',
         N'Prioritize high‑cardinality columns, frequent queries, and operations involving WHERE, JOIN, ORDER BY, or GROUP BY. Avoid indexing low‑cardinality columns or write‑heavy tables unless strongly justified by usage patterns and performance impact. ',
@@ -1474,6 +1620,7 @@ BEGIN
         N'For CreateIndex, fill schema_name, table_name, index_name, index_type (NONCLUSTERED for a rowstore index, NONCLUSTERED COLUMNSTORE or CLUSTERED COLUMNSTORE), key_columns (in key order, each with descending), include_columns, filter_predicate (null unless the index is filtered), is_unique, fill_factor (null to use the default), data_compression (NONE, ROW, PAGE, or null to leave it unset) and estimated_size_mb, using object and column names exactly as they appear in the input, without brackets. ',
         N'For a nonclustered columnstore index, list its columns in key_columns with descending false and leave include_columns empty. For a clustered columnstore index, leave key_columns and include_columns empty. A columnstore index takes no is_unique, fill_factor or data_compression: use false and null. ',
         N'For DropIndex, fill schema_name, table_name and index_name with the index to drop, and estimated_size_mb. Use DropIndex only for a nonclustered index to drop now that does not enforce a primary key or unique constraint; put a change to a clustered index or constraint under ConsolidateIndex, and an index to confirm after a longer observation period under Other. ',
+        N'schema_name is always a schema that appears in the input, never the database name; it is null for a database or server setting. ',
         N'For the other categories, fill schema_name, table_name and index_name when the recommendation is about one object, fill estimated_size_mb when it changes index storage, use null for index_type and false for is_unique, and use empty arrays and null for the other fields that do not apply. ',
         N'confidence is High, Medium or Low. rationale gives the evidence from the input. benefiting_queries lists the plan cache and Query Store statements that benefit, each by the QueryHash or Query Store QueryId the input reports for it (for example 0x1A2B3C4D5E6F7A8B or query_id 42), or by a short excerpt when it has neither, or is empty. ',
         N'script is the complete T-SQL that implements the recommendation, or an empty string when there is nothing to run. For CreateIndex and DropIndex it creates or drops exactly the index the other fields describe, with the same names, columns and options. Do not put rollback, validation, diagnostic or monitoring scripts in it.');
