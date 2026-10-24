@@ -51,7 +51,9 @@ about Microsoft's 2006 `AutoIndex.sql` prototype: a modern version, with AI doin
 1. **Collects** the Index Tuning diagnostics, ported from AI SQL Tuner's IndexTuning goal:
    - server and edition info, and the period the usage statistics cover (server start, create
      date, restore history and the error log's "Starting up database" message)
-   - missing indexes, plus their overlap with existing indexes
+   - missing indexes, plus their overlap with existing indexes. Each suggestion's included columns
+     are listed with their types, and wide or `(max)` columns with an average width sampled from up
+     to 1,000 rows, so a suggestion that would copy a large column into an index can be spotted
    - index usage, duplicate and left-prefix overlapping indexes, operational hotspots and page
      density
    - the top 25 plan cache statements by CPU for this database
@@ -60,6 +62,9 @@ about Microsoft's 2006 `AutoIndex.sql` prototype: a modern version, with AI doin
    - automatic tuning (`FORCE_LAST_GOOD_PLAN`) and cardinality estimation feedback
    - heaps, constraints, untrusted constraints, column cardinality, large tables, statistics
      settings and `OPTIMIZED_SP_EXECUTESQL`
+   - skewed low-cardinality columns, with each value's share of the rows from the statistics
+     histogram (for example `Closed: 99.50%, Open: 0.50%`), so the model can suggest a filtered
+     index even when SQL Server suggests none
 
    The `@SchemaName` and `@TableName` filters apply to every object-level section. For the Query
    Store sections they are resolved once into the set of queries whose plans reference the object,
