@@ -74,7 +74,8 @@ about Microsoft's 2006 `AutoIndex.sql` prototype: a modern version, with AI doin
    - for a new index, its type (`NONCLUSTERED`, `NONCLUSTERED COLUMNSTORE` or
      `CLUSTERED COLUMNSTORE`)
    - table, keys, includes, compression and fill factor
-   - estimated size, confidence and rationale
+   - estimated storage change in MB (negative for storage a drop reclaims), confidence and
+     rationale
    - the model's script
 4. **Applies** (with `@Mode = 'CREATE'`, or later with `sp_AIIndexTuner_Apply`):
    - new nonclustered rowstore indexes
