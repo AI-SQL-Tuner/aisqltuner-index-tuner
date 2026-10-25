@@ -16,22 +16,49 @@ Free and open source from [AI SQL Tuner](https://aisqltuner.com). The idea comes
 Ozar's post [I'm Probably Not Supposed to Show You Microsoft's Auto-Indexing Tool](https://www.brentozar.com/archive/2026/10/im-probably-not-supposed-to-show-you-microsofts-auto-indexing-tool),
 about Microsoft's 2006 `AutoIndex.sql` prototype: a modern version, with AI doing the analysis.
 
+> **aisqltuner-index-tuner is the open-source index tuning engine.** Looking for query tuning,
+> deadlock analysis, server health checks, code review, a GUI with HTML reports, or support for
+> SQL Server 2022 or earlier? See [AI SQL Tuner Studio](https://aisqltuner.com), also available
+> from the [Microsoft Store](https://apps.microsoft.com/detail/9P68072ZM3N5).
+> [How they compare](#compared-with-ai-sql-tuner-studio).
+
 > **Status: prototype.** The collectors, prompt, storage and apply logic are tested against SQL
 > Server 2025 with canned model answers. The live path has also been run end to end against Azure
 > OpenAI `gpt-5.6-luna` on SQL Server 2025: collection, the background-mode call, storage, the
 > change controls and CREATE mode. See [Testing](#testing). Not yet run: the full live benchmark,
-> Azure SQL Database, and `ONLINE = ON` index builds.
+> Azure SQL Database, Fabric SQL Database, and `ONLINE = ON` index builds.
 
 ## Requirements
 
-- SQL Server 2025, Azure SQL Database, or Azure SQL Managed Instance with the SQL Server 2025 or
-  Always-up-to-date update policy. These are the platforms with `sp_invoke_external_rest_endpoint`.
+- SQL Server 2025, Azure SQL Database, Azure SQL Managed Instance with the SQL Server 2025 or
+  Always-up-to-date update policy, or Fabric SQL Database. These are the platforms with
+  `sp_invoke_external_rest_endpoint`.
 - An Azure OpenAI (or Microsoft Foundry) resource with a deployed OpenAI model, and its API key or
   a managed identity with the *Cognitive Services OpenAI User* role. Only OpenAI models are
   supported for now.
 - To collect: `VIEW SERVER STATE` (or `VIEW SERVER PERFORMANCE STATE`), `VIEW DATABASE STATE` and
   `VIEW DEFINITION`. To call the model: `EXECUTE ANY EXTERNAL ENDPOINT`. To create indexes:
   `ALTER` on the tables.
+
+## Compared with AI SQL Tuner Studio
+
+[AI SQL Tuner Studio](https://aisqltuner.com) is AI SQL Tuner's commercial Windows desktop app,
+available from the [Microsoft Store](https://apps.microsoft.com/detail/9P68072ZM3N5) or as a direct
+download. This project ports Studio's Index Tuning goal to T-SQL, so it runs inside SQL Server and
+can apply what it finds.
+
+| | aisqltuner-index-tuner (open source) | AI SQL Tuner Studio |
+|---|---|---|
+| Index tuning | Yes | Yes |
+| Query tuning, deadlock analysis, blocking and locking, server health, code review | No | Yes |
+| Interface | T-SQL stored procedures; results in tables | Windows desktop app with HTML reports |
+| Runs on | The database server, as stored procedures | Windows 10 or 11 (Microsoft Store or direct download), Windows Server (direct download) |
+| SQL Server | SQL Server 2025 only | SQL Server, including 2022 and earlier |
+| Azure and Fabric | Azure SQL Database; Azure SQL Managed Instance with the SQL Server 2025 or Always-up-to-date update policy; Fabric SQL Database | Azure SQL Database; Azure SQL Managed Instance with any update policy; Fabric SQL Database |
+| AI endpoint | Required: your own Azure OpenAI or Microsoft Foundry deployment | Optional: hosted models are included, and paid editions can bring their own Azure OpenAI endpoint |
+| Applies recommendations | Yes: creates verified new indexes and, when allowed, drops indexes, within the [change controls](#change-controls) and [apply thresholds](#apply-thresholds) | No: the report gives ready-to-run scripts for you to review and run |
+| Can run on a schedule | Yes: from a SQL Server Agent job or any other scheduler | No |
+| Price | Free, [MIT license](LICENSE) | Free Edition and paid editions; see [aisqltuner.com](https://aisqltuner.com) |
 
 ## Install
 
@@ -265,8 +292,7 @@ exactly what would be sent, run `EXEC dbo.sp_AIIndexTuner @CollectOnly = 1;`.
   prompt reserved `DropIndex` for drops to make now. The change controls and apply-mode checks are
   what make CREATE safe, not the prompt alone.
 - **No verification or rollback:** the tool does not measure impact after creating an index or
-  roll back regressions. Each applied change does store `UndoDDL` to reverse it by hand. [AI SQL Tuner](https://aisqltuner.com) also covers deadlocks, code
-  review, server health, query tuning, and locking and blocking.
+  roll back regressions. Each applied change does store `UndoDDL` to reverse it by hand.
 
 ## Testing
 

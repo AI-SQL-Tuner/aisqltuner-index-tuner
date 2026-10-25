@@ -37,6 +37,11 @@ recommendations are kept, and it replaces the procedures and functions.
   captures these result sets with `INSERT ... EXEC` needs the new columns.
 - The system prompt and response schema changed (#14), so `AIIndexTuner.Run.SystemPromptHash`
   differs from earlier runs.
+- **AI SQL Tuner Studio links** ([#16](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/16)):
+  the README compares this project with [AI SQL Tuner Studio](https://aisqltuner.com), the
+  commercial desktop app. The `MoreFrom` column of `sp_AIIndexTuner`'s run result, and the install
+  script's header, link to Studio's website and its
+  [Microsoft Store](https://apps.microsoft.com/detail/9P68072ZM3N5) listing.
 
 ## 2026-10-24
 

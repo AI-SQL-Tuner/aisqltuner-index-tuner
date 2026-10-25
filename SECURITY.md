@@ -1,5 +1,8 @@
 # Security policy
 
+This policy covers the open-source aisqltuner-index-tuner only. For
+[AI SQL Tuner Studio](https://aisqltuner.com), the commercial desktop app, see its website.
+
 ## Supported versions
 
 This project is a prototype. Only the latest version on `main` receives security fixes.
