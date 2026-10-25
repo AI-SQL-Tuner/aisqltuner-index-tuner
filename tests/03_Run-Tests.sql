@@ -257,7 +257,7 @@ GO
 
 /* ===== T6: sp_AIIndexTuner_Apply leaves non-index categories for review ===== */
 DECLARE @RecId int = (SELECT MIN(RecommendationId) FROM AIIndexTuner.Recommendation WHERE Category = 'DropIndex' AND Status = 'Recommended');
-CREATE TABLE #Applied (RecommendationId int, RunId int, Priority int, Category varchar(30), Title nvarchar(400), SchemaName sysname NULL,
+CREATE TABLE #Applied (RecommendationId int, RunId int, Priority int, PriorityLevel varchar(10), Confidence varchar(10), Category varchar(30), Title nvarchar(400), SchemaName sysname NULL,
                        TableName sysname NULL, IndexName sysname NULL, Status varchar(20), StatusReason nvarchar(4000), AppliedDDL nvarchar(max), AppliedAt datetime2(0),
                        UndoDDL nvarchar(max));
 INSERT #Applied EXEC dbo.sp_AIIndexTuner_Apply @RecommendationId = @RecId;
@@ -644,6 +644,89 @@ BEGIN
 END;
 DROP STATISTICS dbo.Orders.ST_T18_Notes, dbo.Orders.ST_T18_Status;
 PRINT 'PASS T18: column types are formatted as in DDL, and a skewed column is reported with each value''s share while an even one is not';
+GO
+
+/* ===== T19: @MinPriority and @MinConfidence apply only recommendations at those levels or above ===== */
+IF AIIndexTuner.fn_SystemPrompt() NOT LIKE N'%priority_level is High, Medium or Low%'
+   OR AIIndexTuner.fn_ResponseSchema() NOT LIKE N'%"required": \["priority", "priority_level",%' ESCAPE N'\'
+   OR ISJSON(AIIndexTuner.fn_ResponseSchema()) = 0
+    THROW 50999, N'FAIL T19: the prompt or the response schema does not ask for priority_level.', 1;
+
+DECLARE @Answer nvarchar(max) = N'{"summary": "thresholds", "recommendations": [
+  {"priority": 1, "priority_level": "High", "category": "CreateIndex", "title": "High, High", "schema_name": "dbo", "table_name": "Orders", "index_name": "IX_Orders_TotalDue_T19",
+   "index_type": "NONCLUSTERED", "key_columns": [{"column": "TotalDue", "descending": false}], "include_columns": [], "filter_predicate": null, "is_unique": false, "confidence": "High", "rationale": "t", "script": ""},
+  {"priority": 2, "priority_level": "Medium", "category": "CreateIndex", "title": "Medium, High", "schema_name": "dbo", "table_name": "Orders", "index_name": "IX_Orders_Notes_T19",
+   "index_type": "NONCLUSTERED", "key_columns": [{"column": "Notes", "descending": false}], "include_columns": [], "filter_predicate": null, "is_unique": false, "confidence": "High", "rationale": "t", "script": ""},
+  {"priority": 3, "priority_level": "Medium", "category": "CreateIndex", "title": "Medium, Medium", "schema_name": "dbo", "table_name": "Customers", "index_name": "IX_Customers_Name_T19",
+   "index_type": "NONCLUSTERED", "key_columns": [{"column": "CustomerName", "descending": false}], "include_columns": [], "filter_predicate": null, "is_unique": false, "confidence": "Medium", "rationale": "t", "script": ""},
+  {"priority": 4, "priority_level": "Low", "category": "CreateIndex", "title": "Low, High", "schema_name": "dbo", "table_name": "Customers", "index_name": "IX_Customers_Email_Region_T19",
+   "index_type": "NONCLUSTERED", "key_columns": [{"column": "Email", "descending": false}, {"column": "Region", "descending": false}], "include_columns": [], "filter_predicate": null, "is_unique": false, "confidence": "High", "rationale": "t", "script": ""},
+  {"priority": 5, "category": "CreateIndex", "title": "No levels", "schema_name": "dbo", "table_name": "Orders", "index_name": "IX_Orders_Notes_OrderDate_T19",
+   "index_type": "NONCLUSTERED", "key_columns": [{"column": "Notes", "descending": false}, {"column": "OrderDate", "descending": false}], "include_columns": [], "filter_predicate": null, "is_unique": false, "rationale": "t", "script": ""}]}';
+-- Lower case is accepted and stored as High, Medium or Low.
+EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @TestResponse = @Answer, @MinPriority = 'medium', @MinConfidence = 'HIGH';
+
+DECLARE @RunId int = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Run WHERE RunId = @RunId AND MinPriority = 'Medium' AND MinConfidence = 'High')
+   OR (SELECT PriorityLevel FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 1) <> 'High'
+   OR (SELECT PriorityLevel FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 5) IS NOT NULL
+    THROW 50999, N'FAIL T19: the run did not record its minimums, or the priority levels were not stored.', 1;
+
+DECLARE @Expected TABLE (Priority int PRIMARY KEY, Status varchar(20), ReasonLike nvarchar(400));
+INSERT @Expected VALUES
+    (1, 'Applied', NULL),
+    (2, 'Applied', NULL),
+    (3, 'Skipped', N'Confidence Medium is below the minimum of High (@MinConfidence)%@MinConfidence = ''Low''.'),
+    (4, 'Skipped', N'Priority level Low is below the minimum of Medium (@MinPriority)%@MinPriority = ''Low''.'),
+    (5, 'Skipped', N'Priority level (none) is below the minimum of Medium%');
+IF EXISTS (SELECT 1 FROM @Expected AS e
+           LEFT JOIN AIIndexTuner.Recommendation AS r ON r.RunId = @RunId AND r.Priority = e.Priority
+           WHERE r.Status IS NULL OR r.Status <> e.Status
+              OR (e.ReasonLike IS NOT NULL AND ISNULL(r.StatusReason, N'') NOT LIKE e.ReasonLike))
+BEGIN
+    SELECT e.Priority, e.Status AS Expected, r.Status AS Actual, r.StatusReason
+    FROM @Expected AS e LEFT JOIN AIIndexTuner.Recommendation AS r ON r.RunId = @RunId AND r.Priority = e.Priority;
+    THROW 50999, N'FAIL T19: CREATE with @MinPriority = Medium and @MinConfidence = High gave unexpected statuses (see the result set above).', 1;
+END;
+
+-- Applying the run again keeps its minimums.
+INSERT #Applied EXEC dbo.sp_AIIndexTuner_Apply @RunId = @RunId;
+IF (SELECT COUNT(*) FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Status = 'Applied') <> 2
+    THROW 50999, N'FAIL T19: sp_AIIndexTuner_Apply without minimums did not keep the run''s.', 1;
+
+-- After review, a lower minimum from the caller replaces the run's: here only the confidence one,
+-- so the run's @MinPriority = Medium still holds.
+DECLARE @MediumId int = (SELECT RecommendationId FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 3);
+INSERT #Applied EXEC dbo.sp_AIIndexTuner_Apply @RecommendationId = @MediumId, @MinConfidence = 'Low';
+IF (SELECT Status FROM AIIndexTuner.Recommendation WHERE RecommendationId = @MediumId) <> 'Applied'
+   OR NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Customers_Name_T19')
+    THROW 50999, N'FAIL T19: a reviewed recommendation was not applied with @MinConfidence = ''Low''.', 1;
+
+-- Low, Low applies everything else allows, including a recommendation with no levels.
+INSERT #Applied EXEC dbo.sp_AIIndexTuner_Apply @RunId = @RunId, @MinPriority = 'Low', @MinConfidence = 'Low';
+IF (SELECT COUNT(*) FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Status = 'Applied') <> 5
+    THROW 50999, N'FAIL T19: @MinPriority = Low and @MinConfidence = Low did not apply every recommendation.', 1;
+IF NOT EXISTS (SELECT 1 FROM #Applied WHERE RunId = @RunId AND Priority = 1 AND PriorityLevel = 'High' AND Confidence = 'High')
+    THROW 50999, N'FAIL T19: sp_AIIndexTuner_Apply does not return the priority level and confidence.', 1;
+
+BEGIN TRY
+    EXEC dbo.sp_AIIndexTuner @CollectOnly = 1, @MinPriority = 'Critical';
+    THROW 50999, N'FAIL T19: an unknown @MinPriority was accepted.', 1;
+END TRY
+BEGIN CATCH
+    IF ERROR_NUMBER() <> 50210 THROW;
+END CATCH;
+BEGIN TRY
+    EXEC dbo.sp_AIIndexTuner_Apply @RunId = @RunId, @MinConfidence = 'Sure';
+    THROW 50999, N'FAIL T19: an unknown @MinConfidence was accepted by sp_AIIndexTuner_Apply.', 1;
+END TRY
+BEGIN CATCH
+    IF ERROR_NUMBER() <> 50303 THROW;
+END CATCH;
+
+DECLARE @Undo nvarchar(max) = (SELECT STRING_AGG(UndoDDL, N' ') FROM AIIndexTuner.Recommendation WHERE RunId = @RunId);
+EXEC sys.sp_executesql @Undo;
+PRINT 'PASS T19: @MinPriority and @MinConfidence apply only recommendations at those levels or above, the rest wait for review, and a lower minimum applies them later';
 GO
 
 PRINT 'ALL TESTS PASSED';

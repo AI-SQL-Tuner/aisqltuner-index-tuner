@@ -14,6 +14,11 @@ GO
     caller can pass the same settings: 0 from either side blocks a change, and 1 from either side
     allows one that the other left NULL (recommend-only). @MaxNewIndexes uses the lower limit.
 
+    Apply thresholds: @MinPriority and @MinConfidence (High, Medium or Low) skip a recommendation
+    whose priority level or confidence is below them; one the model gave no level counts as Low.
+    The caller's value replaces the run's (sp_AIIndexTuner @MinPriority, @MinConfidence), so a
+    recommendation held back for review can be applied after it, with a lower minimum.
+
     Applied: new rowstore indexes; new columnstore indexes when allowed; drops of nonclustered
     indexes when allowed, nothing depends on them, and either another index makes them redundant
     or the usage statistics cover at least 7 days. Every other category, and any filtered index,
@@ -25,20 +30,24 @@ CREATE OR ALTER PROCEDURE AIIndexTuner.usp_ApplyRecommendation
     @RecommendationId int,
     @AllowColumnstore bit = NULL,
     @AllowDropIndex   bit = NULL,
-    @MaxNewIndexes    int = NULL
+    @MaxNewIndexes    int = NULL,
+    @MinPriority      varchar(10) = NULL,
+    @MinConfidence    varchar(10) = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
 
     DECLARE @Category varchar(30), @Status varchar(20), @SchemaName sysname, @TableName sysname, @IndexName sysname,
             @IndexType varchar(30), @KeyColumns nvarchar(max), @IncludeColumns nvarchar(max), @Filter nvarchar(4000), @IsUnique bit,
-            @FillFactor tinyint, @Compression varchar(10), @RunId int,
-            @RunColumnstore bit, @RunDropIndex bit, @RunMaxNew int;
+            @FillFactor tinyint, @Compression varchar(10), @RunId int, @PriorityLevel varchar(10), @Confidence varchar(10),
+            @RunColumnstore bit, @RunDropIndex bit, @RunMaxNew int, @RunMinPriority varchar(10), @RunMinConfidence varchar(10);
 
     SELECT @Category = r.Category, @Status = r.Status, @SchemaName = r.SchemaName, @TableName = r.TableName, @IndexName = r.IndexName,
            @IndexType = r.IndexType, @KeyColumns = r.KeyColumns, @IncludeColumns = r.IncludeColumns, @Filter = r.FilterPredicate,
            @IsUnique = r.IsUnique, @FillFactor = r.[FillFactor], @Compression = r.DataCompression, @RunId = r.RunId,
-           @RunColumnstore = run.AllowColumnstore, @RunDropIndex = run.AllowDropIndex, @RunMaxNew = run.MaxNewIndexes
+           @PriorityLevel = r.PriorityLevel, @Confidence = r.Confidence,
+           @RunColumnstore = run.AllowColumnstore, @RunDropIndex = run.AllowDropIndex, @RunMaxNew = run.MaxNewIndexes,
+           @RunMinPriority = run.MinPriority, @RunMinConfidence = run.MinConfidence
     FROM AIIndexTuner.Recommendation AS r
     INNER JOIN AIIndexTuner.Run AS run ON run.RunId = r.RunId
     WHERE r.RecommendationId = @RecommendationId;
@@ -56,7 +65,9 @@ BEGIN
                                   WHEN @RunDropIndex = 1 OR @AllowDropIndex = 1 THEN 1 END,
            @MaxNewIndexes = CASE WHEN @RunMaxNew IS NULL THEN @MaxNewIndexes
                                  WHEN @MaxNewIndexes IS NULL OR @RunMaxNew < @MaxNewIndexes THEN @RunMaxNew
-                                 ELSE @MaxNewIndexes END;
+                                 ELSE @MaxNewIndexes END,
+           @MinPriority = ISNULL(@MinPriority, @RunMinPriority),
+           @MinConfidence = ISNULL(@MinConfidence, @RunMinConfidence);
 
     SET @IndexType = CASE WHEN @Category = 'CreateIndex' THEN ISNULL(@IndexType, 'NONCLUSTERED') END;
 
@@ -77,6 +88,12 @@ BEGIN
     ELSE IF @IsColumnstore = 1 AND @AllowColumnstore IS NULL
         SET @Reason = CONCAT(N'Columnstore indexes are recommend-only for this run. Review it, then apply it with sp_AIIndexTuner_Apply @RecommendationId = ',
                              @RecommendationId, N', @AllowColumnstore = 1.');
+    ELSE IF ISNULL(AIIndexTuner.fn_LevelRank(@PriorityLevel), 1) < AIIndexTuner.fn_LevelRank(@MinPriority)
+        SET @Reason = CONCAT(N'Priority level ', ISNULL(@PriorityLevel, N'(none)'), N' is below the minimum of ', @MinPriority,
+                             N' (@MinPriority). Review it, then apply it with sp_AIIndexTuner_Apply @RecommendationId = ', @RecommendationId, N', @MinPriority = ''Low''.');
+    ELSE IF ISNULL(AIIndexTuner.fn_LevelRank(@Confidence), 1) < AIIndexTuner.fn_LevelRank(@MinConfidence)
+        SET @Reason = CONCAT(N'Confidence ', ISNULL(@Confidence, N'(none)'), N' is below the minimum of ', @MinConfidence,
+                             N' (@MinConfidence). Review it, then apply it with sp_AIIndexTuner_Apply @RecommendationId = ', @RecommendationId, N', @MinConfidence = ''Low''.');
     ELSE IF @Category = 'CreateIndex' AND @MaxNewIndexes IS NOT NULL
          AND (SELECT COUNT(*) FROM AIIndexTuner.Recommendation
               WHERE RunId = @RunId AND Category = 'CreateIndex' AND Status = 'Applied') >= @MaxNewIndexes
