@@ -16,7 +16,7 @@ Free and open source from [AI SQL Tuner](https://aisqltuner.com). The idea comes
 Ozar's post [I'm Probably Not Supposed to Show You Microsoft's Auto-Indexing Tool](https://www.brentozar.com/archive/2026/10/im-probably-not-supposed-to-show-you-microsofts-auto-indexing-tool),
 about Microsoft's 2006 `AutoIndex.sql` prototype: a modern version, with AI doing the analysis.
 
-> **AI-SQL-Tuner Index Tuner is the open-source index tuning engine.** Looking for query tuning,
+> **aisqltuner-index-tuner is the open-source index tuning engine.** Looking for query tuning,
 > deadlock analysis, server health checks, code review, a GUI with HTML reports, or support for
 > SQL Server 2022 or earlier? See [AI SQL Tuner Studio](https://aisqltuner.com), also available
 > from the [Microsoft Store](https://apps.microsoft.com/detail/9P68072ZM3N5).
