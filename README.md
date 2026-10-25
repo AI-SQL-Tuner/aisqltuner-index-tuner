@@ -138,8 +138,9 @@ They differ from the change controls in two ways:
 
 - **The prompt does not change.** The model still makes every recommendation, and the thresholds
   only decide which of them are applied.
-- **A threshold can be lowered after review.** The run stores its minimums, and
-  `sp_AIIndexTuner_Apply` uses them unless you pass your own, which replace them:
+- **A threshold can be lowered after review.** The run stores its minimums (`MinPriority` and
+  `MinConfidence` in `AIIndexTuner.Run`), and `sp_AIIndexTuner_Apply` uses them unless you pass
+  your own, which replace them:
 
 ```sql
 EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7;                                        -- the run's minimums
@@ -350,6 +351,11 @@ It runs `sp_AIIndexTuner` against them and scores every run with 37 rubric check
 
 `sp_AIIndexTuner @CollectedData = N'…'` runs the model on supplied diagnostics instead of collecting them, for example a run's `AIIndexTuner.Run.CollectedData`. The benchmark uses it so that every iteration answers the same input. `AIIndexTuner.Run` records the payload's SHA-256, collection and model time, apply time, and the number of background polls.
 
+## Release notes
+
+See [RELEASE_NOTES.md](RELEASE_NOTES.md) for what changed in each release and how to upgrade an
+existing install.
+
 ## Repository layout
 
 | Path | |
@@ -359,6 +365,7 @@ It runs `sp_AIIndexTuner` against them and scores every run with 37 rubric check
 | `setup/Configure-Endpoint.sql` | Credential and configuration template |
 | `tests/` | Test database, workload, tests and runner |
 | `bench/` | Benchmark: challenge database, workload, rubric, runner, cases, prerequisites and results |
+| `RELEASE_NOTES.md` | Changes by release, and how to upgrade |
 
 ## License
 
