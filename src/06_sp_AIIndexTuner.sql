@@ -46,8 +46,8 @@ GO
                             for example a run's AIIndexTuner.Run.CollectedData. Benchmarks use it to
                             give every run the same input. Nothing is collected.
 
-    Requires SQL Server 2025, Azure SQL Database or Azure SQL Managed Instance
-    (sp_invoke_external_rest_endpoint). Only OpenAI models are supported for now.
+    Requires SQL Server 2025, Azure SQL Database, Azure SQL Managed Instance or Fabric SQL
+    Database (sp_invoke_external_rest_endpoint). Only OpenAI models are supported for now.
 */
 CREATE OR ALTER PROCEDURE dbo.sp_AIIndexTuner
     @SchemaName   sysname = NULL,
@@ -240,7 +240,7 @@ BEGIN
 
     SELECT r.RunId, r.Status AS RunStatus, r.ModelUsed, r.InputTokens, r.OutputTokens, r.Summary,
            r.CollectedChars, r.StartedAt, r.CompletedAt,
-           N'Free and open source from AI SQL Tuner. For deadlocks, code review, server health, query tuning and more, see https://aisqltuner.com' AS MoreFrom
+           N'Free and open source from AI SQL Tuner. For query tuning, deadlock analysis, server health checks, code review, HTML reports or SQL Server 2022 and earlier, see AI SQL Tuner Studio: https://aisqltuner.com or https://apps.microsoft.com/detail/9P68072ZM3N5' AS MoreFrom
     FROM AIIndexTuner.Run AS r WHERE r.RunId = @RunId;
 
     SELECT RecommendationId, Priority, PriorityLevel, Category, Title, SchemaName, TableName, IndexName, IndexType, Confidence, EstimatedSizeMB,
