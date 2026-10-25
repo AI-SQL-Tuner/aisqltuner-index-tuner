@@ -68,16 +68,18 @@ Each case is a known index-tuning problem with a defensible expected answer, bui
 
 **Setup.** `FactEvents` (5M rows) gets:
 - analytic aggregates over the last 90 days and over all rows
-- `Reps × 10` single-row updates on the same 50,000 "hot" recent rows, plus inserts
+- `Reps × 10` single-row updates by key on the same 50,000 "hot" rows (EventId 1 to 50,000), plus inserts. The hot rows' dates are spread across all 730 days, as `EventDate` cycles with `EventId`.
 
 **What the collector shows.** Large table; update and insert activity in Query Store, the write mix and the operational hotspots.
 
-**Expected answer.** Weigh the write load explicitly. A good answer is a nonclustered columnstore **filtered to cold rows** (`WHERE EventDate < …`), so the hot rows stay out of the delta store. Declining columnstore with that reason is also acceptable.
+**Expected answer.** Weigh the write load explicitly. A good answer is a **nonclustered** columnstore with the write cost stated: the rowstore primary key still serves the single-row updates, and each update goes to the delete bitmap and delta store. A filtered nonclustered columnstore is also fine. Declining columnstore with that reason is also acceptable.
+
+**Why C4-P1 isn't "filtered to cold rows".** It used to require a columnstore filtered to cold rows (`WHERE EventDate < …`). No run passed it under any prompt (issue #12). The hot rows aren't recent, so no `EventDate` filter keeps them out of the index, and nothing in the payload says where the updates land. The check now asks for the answer the data supports.
 
 | Check | Kind | |
 |---|---|---|
 | C4-R1 | required | a FactEvents recommendation whose title or rationale weighs the writes (write, update, insert, DML, maintenance, delta store) |
-| C4-P1 | preferred | a filtered nonclustered columnstore on FactEvents |
+| C4-P1 | preferred | a nonclustered columnstore on FactEvents (filtered or not) whose title or rationale weighs the writes |
 
 ## C5: Write-heavy table
 

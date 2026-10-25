@@ -79,7 +79,7 @@ END;
 SET @i = 0;
 WHILE @i < @Reps * 10
 BEGIN
-    SET @b1 = 1 + (@i * 97) % 50000;   -- the same hot rows, as recent rows are in practice
+    SET @b1 = 1 + (@i * 97) % 50000;   -- the same hot rows each time; their dates span all 730 days
     EXEC sys.sp_executesql @c4u, N'@id bigint', @id = @b1;
     IF @i % 2 = 0
     BEGIN

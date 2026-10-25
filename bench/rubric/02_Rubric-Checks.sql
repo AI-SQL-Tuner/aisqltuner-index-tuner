@@ -45,8 +45,10 @@ INSERT AIIndexTunerBench.RubricCheck (CheckId, CaseId, Kind, Variant, Descriptio
  @R + N'r.TargetU LIKE N''%[^A-Z0-9_]FACTEVENTS[^A-Z0-9_]%''
    AND (r.ReasonU LIKE N''%WRITE%'' OR r.ReasonU LIKE N''%UPDATE%'' OR r.ReasonU LIKE N''%INSERT%''
         OR r.ReasonU LIKE N''%DML%'' OR r.ReasonU LIKE N''%MAINTENANCE%'' OR r.ReasonU LIKE N''%DELTA STORE%'')'),
-('C4-P1', 'C4', 'preferred', 'base', N'A filtered (cold rows) nonclustered columnstore on FactEvents',
- @R + N'r.TargetU LIKE N''%[^A-Z0-9_]FACTEVENTS[^A-Z0-9_]%'' AND r.ScriptC LIKE N''%COLUMNSTORE%)WHERE%'''),
+('C4-P1', 'C4', 'preferred', 'base', N'A nonclustered columnstore on FactEvents whose rationale weighs the writes',
+ @R + N'r.TargetU LIKE N''%[^A-Z0-9_]FACTEVENTS[^A-Z0-9_]%'' AND r.ScriptC LIKE N''%NONCLUSTEREDCOLUMNSTORE%''
+   AND (r.ReasonU LIKE N''%WRITE%'' OR r.ReasonU LIKE N''%UPDATE%'' OR r.ReasonU LIKE N''%INSERT%''
+        OR r.ReasonU LIKE N''%DML%'' OR r.ReasonU LIKE N''%MAINTENANCE%'' OR r.ReasonU LIKE N''%DELTA STORE%'')'),
 
 /* ----- C5: write-heavy table ----- */
 ('C5-F1', 'C5', 'forbidden', 'base', N'At most one new index on the write-heavy AuditQueue',
