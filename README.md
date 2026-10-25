@@ -124,6 +124,14 @@ must also pass the change controls and safety checks. The rest are skipped with 
 stay for you to review. A recommendation the model gave no level counts as `Low`. Both levels
 are the model's own estimates, so a threshold lowers the risk but does not replace review.
 
+The levels vary between runs, as the answers do (see [Known limitations](#known-limitations-prototype)),
+so two CREATE runs on the same database can apply different sets. In five live runs of
+`gpt-5.6-luna` on the benchmark database, with the same input:
+- the model never gave `Low` confidence, so `@MinConfidence = 'Medium'` held nothing back and only
+  `'High'` did
+- with `Medium` / `High`, new indexes on some tables were applied in every run, others in none, and
+  a few in some runs but not others
+
 | Environment | `@MinPriority` | `@MinConfidence` | Applied |
 |---|---|---|---|
 | Dedicated test environment | `Low` | `Low` | Everything the change controls and safety checks allow |
