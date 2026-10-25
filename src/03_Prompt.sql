@@ -56,6 +56,7 @@ BEGIN
         N'summary: a short executive summary of the top priorities and the net storage change across all index recommendations. ',
         N'All text values are plain text, with no HTML or Markdown; the script is T-SQL only. ',
         N'recommendations: one entry per recommendation, ordered by priority, where priority 1 is the most important. ',
+        N'priority_level is High, Medium or Low: how much the change matters to the workload, weighing its expected benefit against its cost. High is a large benefit, Medium a moderate one, and Low a small one or housekeeping. It is separate from confidence. Every High entry comes before every Medium entry, and every Medium entry before every Low entry. ',
         N'category: CreateIndex for a new index, rowstore or columnstore; DropIndex for dropping one existing index; ConsolidateIndex for merging, widening or replacing existing indexes; RebuildIndex; Constraint; Statistics; Setting; QueryChange; Other for anything else. Each CreateIndex or DropIndex entry covers exactly one index. A new clustered rowstore index or primary key, for example on a heap, is not CreateIndex: use ConsolidateIndex when it replaces existing indexes, and Other otherwise. ',
         N'title: a one-line heading that names the change and the object. ',
         N'For CreateIndex, fill schema_name, table_name, index_name, index_type (NONCLUSTERED for a rowstore index, NONCLUSTERED COLUMNSTORE or CLUSTERED COLUMNSTORE), key_columns (in key order, each with descending), include_columns, filter_predicate (null unless the index is filtered), is_unique, fill_factor (null to use the default), data_compression (NONE, ROW, PAGE, or null to leave it unset) and estimated_size_mb, using object and column names exactly as they appear in the input, without brackets. ',
@@ -63,7 +64,7 @@ BEGIN
         N'For DropIndex, fill schema_name, table_name and index_name with the index to drop, and estimated_size_mb. Use DropIndex only for a nonclustered index to drop now that does not enforce a primary key or unique constraint; put a change to a clustered index or constraint under ConsolidateIndex, and an index to confirm after a longer observation period under Other. ',
         N'schema_name is always a schema that appears in the input, never the database name; it is null for a database or server setting. ',
         N'For the other categories, fill schema_name, table_name and index_name when the recommendation is about one object, fill estimated_size_mb when it changes index storage, use null for index_type and false for is_unique, and use empty arrays and null for the other fields that do not apply. ',
-        N'confidence is High, Medium or Low. rationale gives the evidence from the input. benefiting_queries lists the plan cache and Query Store statements that benefit, each by the QueryHash or Query Store QueryId the input reports for it (for example 0x1A2B3C4D5E6F7A8B or query_id 42), or by a short excerpt when it has neither, or is empty. ',
+        N'confidence is High, Medium or Low: how sure you are, from the evidence in the input, that the change is correct and helps as described. rationale gives the evidence from the input. benefiting_queries lists the plan cache and Query Store statements that benefit, each by the QueryHash or Query Store QueryId the input reports for it (for example 0x1A2B3C4D5E6F7A8B or query_id 42), or by a short excerpt when it has neither, or is empty. ',
         N'script is the complete T-SQL that implements the recommendation, or an empty string when there is nothing to run. For CreateIndex and DropIndex it creates or drops exactly the index the other fields describe, with the same names, columns and options. Do not put rollback, validation, diagnostic or monitoring scripts in it.');
 END;
 GO
@@ -113,11 +114,12 @@ BEGIN
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["priority", "category", "title", "schema_name", "table_name", "index_name", "index_type", "key_columns", "include_columns",
+        "required": ["priority", "priority_level", "category", "title", "schema_name", "table_name", "index_name", "index_type", "key_columns", "include_columns",
                      "filter_predicate", "is_unique", "fill_factor", "data_compression", "estimated_size_mb", "confidence",
                      "rationale", "benefiting_queries", "script"],
         "properties": {
           "priority": { "type": "integer" },
+          "priority_level": { "type": "string", "enum": ["High", "Medium", "Low"] },
           "category": { "type": "string", "enum": ["CreateIndex", "DropIndex", "ConsolidateIndex", "RebuildIndex", "Constraint", "Statistics", "Setting", "QueryChange", "Other"] },
           "title": { "type": "string" },
           "schema_name": { "type": ["string", "null"] },

@@ -9,6 +9,7 @@ EXEC dbo.sp_AIIndexTuner;                                        -- recommend on
 EXEC dbo.sp_AIIndexTuner @SchemaName = N'Sales', @TableName = N'Orders';
 EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE';                       -- also create verified new indexes
 EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @AllowColumnstore = 0, @AllowDropIndex = 1, @MaxNewIndexes = 3;
+EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @MinPriority = 'Medium', @MinConfidence = 'High';   -- apply only the surest
 ```
 
 Free and open source from [AI SQL Tuner](https://aisqltuner.com). The idea comes from Brent
@@ -79,15 +80,18 @@ about Microsoft's 2006 `AutoIndex.sql` prototype: a modern version, with AI doin
    - for a new index, its type (`NONCLUSTERED`, `NONCLUSTERED COLUMNSTORE` or
      `CLUSTERED COLUMNSTORE`)
    - table, keys, includes, compression and fill factor
-   - estimated storage change in MB (negative for storage a drop reclaims), confidence and
-     rationale
+   - priority: `Priority` ranks the recommendations (1 is the most important), and
+     `PriorityLevel` is `High`, `Medium` or `Low`
+   - estimated storage change in MB (negative for storage a drop reclaims), confidence (`High`,
+     `Medium` or `Low`) and rationale
    - the model's script
 4. **Applies** (with `@Mode = 'CREATE'`, or later with `sp_AIIndexTuner_Apply`):
    - new nonclustered rowstore indexes
    - new columnstore indexes, when `@AllowColumnstore = 1`
    - index drops, when `@AllowDropIndex = 1`
 
-   Everything else stays for you to review.
+   Everything else stays for you to review. The [apply thresholds](#apply-thresholds) can hold back
+   recommendations with a low priority level or confidence too.
 
 ### Change controls
 
@@ -111,6 +115,47 @@ EXEC dbo.sp_AIIndexTuner_Apply @RecommendationId = 43, @AllowDropIndex = 1;
 EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @AllowColumnstore = 1, @AllowDropIndex = 1, @MaxNewIndexes = 2;
 ```
 
+### Apply thresholds
+
+`@MinPriority` and `@MinConfidence` set the lowest priority level and confidence a recommendation
+can have and still be applied. Each takes `High`, `Medium` or `Low`; `NULL` (the default) means no
+minimum. A recommendation is applied only if both its levels are at the minimum or above, and it
+must also pass the change controls and safety checks. The rest are skipped with a reason and
+stay for you to review. A recommendation the model gave no level counts as `Low`. Both levels
+are the model's own estimates, so a threshold lowers the risk but does not replace review.
+
+The levels vary between runs, as the answers do (see [Known limitations](#known-limitations-prototype)),
+so two CREATE runs on the same database can apply different sets. In five live runs of
+`gpt-5.6-luna` on the benchmark database, with the same input:
+- the model never gave `Low` confidence, so `@MinConfidence = 'Medium'` held nothing back and only
+  `'High'` did
+- with `Medium` / `High`, new indexes on some tables were applied in every run, others in none, and
+  a few in some runs but not others
+
+| Environment | `@MinPriority` | `@MinConfidence` | Applied |
+|---|---|---|---|
+| Dedicated test environment | `Low` | `Low` | Everything the change controls and safety checks allow |
+| Production | `Medium` | `High` | High- and medium-priority changes the model is highly confident in. Review the rest by hand |
+
+```sql
+EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @MinPriority = 'Low', @MinConfidence = 'Low';      -- test environment
+EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @MinPriority = 'Medium', @MinConfidence = 'High';  -- production
+```
+
+They differ from the change controls in two ways:
+
+- **The prompt does not change.** The model still makes every recommendation, and the thresholds
+  only decide which of them are applied.
+- **A threshold can be lowered after review.** The run stores its minimums (`MinPriority` and
+  `MinConfidence` in `AIIndexTuner.Run`), and `sp_AIIndexTuner_Apply` uses them unless you pass
+  your own, which replace them:
+
+```sql
+EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7;                                        -- the run's minimums
+EXEC dbo.sp_AIIndexTuner_Apply @RecommendationId = 44, @MinConfidence = 'Low';    -- one you reviewed
+EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @MinPriority = 'Low', @MinConfidence = 'Low';
+```
+
 ### Apply-mode safety
 
 - **The model's script is never executed.** Plan cache text goes into the prompt, so a crafted
@@ -127,6 +172,7 @@ EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @AllowColumnstore = 1, @AllowDropInde
   - an index name that is already in use
   - a filtered index (the predicate is free text)
   - a change the run's change controls do not allow, or a new index past `@MaxNewIndexes`
+  - a priority level or confidence below `@MinPriority` or `@MinConfidence`
   - a second columnstore index on a table, or a clustered columnstore index on a table that has a
     clustered rowstore index (converting it would replace that index and any primary key on it)
 - **Drops it refuses, each with a reason:**
@@ -152,6 +198,7 @@ EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @AllowColumnstore = 1, @AllowDropInde
 ```sql
 -- Review, then apply one recommendation or a whole run
 SELECT * FROM AIIndexTuner.Recommendation WHERE RunId = 7 ORDER BY Priority;
+SELECT * FROM AIIndexTuner.Recommendation WHERE RunId = 7 AND StatusReason LIKE N'%below the minimum%';   -- held back by a threshold
 EXEC dbo.sp_AIIndexTuner_Apply @RecommendationId = 42;
 EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7;
 
@@ -251,6 +298,8 @@ The tests use `@TestResponse` canned model answers, so they need no AI endpoint.
 - change controls: their prompt rules, their enforcement when the model ignores them, columnstore
   creation, the drop safety checks, `UndoDDL` restoring each change, and applying recommend-only
   changes after review
+- apply thresholds: `@MinPriority` and `@MinConfidence` holding back lower recommendations, a
+  recommendation with no level counting as `Low`, and applying held-back ones after review
 - idempotent reruns
 - fenced and broken JSON
 - parameter validation
@@ -268,7 +317,9 @@ endpoint set up, not in one `Run-All.ps1` recreates:
 EXEC dbo.sp_AIIndexTuner;                                                       -- default run
 EXEC dbo.sp_AIIndexTuner @AllowColumnstore = 0, @AllowDropIndex = 0, @MaxNewIndexes = 1;   -- does the model follow the rules?
 EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @AllowDropIndex = 0, @MaxNewIndexes = 2;      -- end to end, with changes
-SELECT TOP (5) RunId, Status, InputTokens, OutputTokens, ModelMs, PollCount, AllowColumnstore, AllowDropIndex, MaxNewIndexes, ErrorMessage
+EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @MinPriority = 'Medium', @MinConfidence = 'High';  -- apply thresholds
+SELECT TOP (5) RunId, Status, InputTokens, OutputTokens, ModelMs, PollCount, AllowColumnstore, AllowDropIndex, MaxNewIndexes,
+       MinPriority, MinConfidence, ErrorMessage
 FROM AIIndexTuner.Run ORDER BY RunId DESC;
 ```
 
@@ -308,6 +359,11 @@ It runs `sp_AIIndexTuner` against them and scores every run with 37 rubric check
 
 `sp_AIIndexTuner @CollectedData = N'…'` runs the model on supplied diagnostics instead of collecting them, for example a run's `AIIndexTuner.Run.CollectedData`. The benchmark uses it so that every iteration answers the same input. `AIIndexTuner.Run` records the payload's SHA-256, collection and model time, apply time, and the number of background polls.
 
+## Release notes
+
+See [RELEASE_NOTES.md](RELEASE_NOTES.md) for what changed in each release and how to upgrade an
+existing install.
+
 ## Repository layout
 
 | Path | |
@@ -317,6 +373,7 @@ It runs `sp_AIIndexTuner` against them and scores every run with 37 rubric check
 | `setup/Configure-Endpoint.sql` | Credential and configuration template |
 | `tests/` | Test database, workload, tests and runner |
 | `bench/` | Benchmark: challenge database, workload, rubric, runner, cases, prerequisites and results |
+| `RELEASE_NOTES.md` | Changes by release, and how to upgrade |
 
 ## License
 

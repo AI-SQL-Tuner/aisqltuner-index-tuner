@@ -103,6 +103,15 @@ IF COL_LENGTH(N'AIIndexTuner.Run', N'AllowColumnstore') IS NULL
         MaxNewIndexes    int NULL;   -- at most this many new indexes are recommended and created
 GO
 
+/* Apply thresholds (sp_AIIndexTuner @MinPriority, @MinConfidence): High, Medium or Low. Only a
+   recommendation whose priority level and confidence are at that level or above is applied; the
+   rest stay for review. NULL = no minimum. Unlike the change controls, they do not change the prompt. */
+IF COL_LENGTH(N'AIIndexTuner.Run', N'MinPriority') IS NULL
+    ALTER TABLE AIIndexTuner.Run ADD
+        MinPriority   varchar(10) NULL,
+        MinConfidence varchar(10) NULL;
+GO
+
 IF OBJECT_ID(N'AIIndexTuner.Recommendation', N'U') IS NULL
 BEGIN
     CREATE TABLE AIIndexTuner.Recommendation
@@ -144,7 +153,21 @@ IF COL_LENGTH(N'AIIndexTuner.Recommendation', N'IndexType') IS NULL
         UndoDDL   nvarchar(max) NULL;   -- reverses AppliedDDL: the DROP for a created index, the CREATE for a dropped one
 GO
 
+IF COL_LENGTH(N'AIIndexTuner.Recommendation', N'PriorityLevel') IS NULL
+    ALTER TABLE AIIndexTuner.Recommendation ADD
+        PriorityLevel varchar(10) NULL;   -- High, Medium or Low; Priority is the rank within the run (1 = most important)
+GO
+
 /* ===== Helpers ===== */
+
+/* A High, Medium or Low level as a number to compare: 3, 2 or 1. NULL for anything else. */
+CREATE OR ALTER FUNCTION AIIndexTuner.fn_LevelRank(@Level varchar(10))
+RETURNS tinyint
+AS
+BEGIN
+    RETURN CASE UPPER(LTRIM(RTRIM(@Level))) WHEN 'HIGH' THEN 3 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 1 END;
+END;
+GO
 
 /* Uptime in the largest sensible unit: "3.2 days", "5.5 hours" or "40 minutes" (as FormatUptime in the desktop collector). */
 CREATE OR ALTER FUNCTION AIIndexTuner.fn_FormatUptime(@Minutes int)

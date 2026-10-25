@@ -28,8 +28,9 @@ within 14 days. This is a best-effort target for a free, open source project, no
   and `DROP INDEX` statements it builds from validated fields. This includes SQL injection through
   object names, index names or other catalog data, and prompt injection through plan cache or Query
   Store text that changes what the procedures execute.
-- Any way to bypass the change controls (`@AllowColumnstore`, `@AllowDropIndex`, `@MaxNewIndexes`)
-  or the drop safety checks described in the README.
+- Any way to bypass the change controls (`@AllowColumnstore`, `@AllowDropIndex`, `@MaxNewIndexes`),
+  the apply thresholds (`@MinPriority`, `@MinConfidence`) or the drop safety checks described in
+  the README.
 - Disclosure of the endpoint credential or API key, or sending data to anywhere other than the
   Azure OpenAI endpoint you configure.
 
