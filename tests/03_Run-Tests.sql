@@ -380,16 +380,46 @@ GO
 
 /* ===== T13: the collector leaves out this tool's own statements =====
    By now the tests have run sp_AIIndexTuner many times, so its statements are in the plan cache
-   and Query Store. */
-DECLARE @Data nvarchar(max);
+   and Query Store. A search for "AIIndexTuner" does not find all of them:
+     - its dynamic SQL, the width sampling of wide INCLUDE columns, has no object_id there, so the
+       check also looks for that statement's own text. The workload's Notes query set it off in
+       T1's collection (T3's indexes on dbo.Orders have since cleared the suggestion), so it must
+       be in the plan cache and Query Store for the check to mean anything;
+     - its temp-table writes do not name its schema, and the write mix gives only counts, so two
+       more collector runs must leave the write mix unchanged.
+   The search strings are split so that this batch's own text does not match them. */
+DECLARE @Data nvarchar(max), @Mix nvarchar(max), @Before bigint, @After bigint, @Sampling nvarchar(40) = N'%DATALENGTH' + N'(v)%';
+IF NOT EXISTS (SELECT 1 FROM sys.dm_exec_query_stats AS qs CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st WHERE st.text LIKE @Sampling)
+   OR NOT EXISTS (SELECT 1 FROM sys.query_store_query_text WHERE query_sql_text LIKE @Sampling)
+    THROW 50999, N'FAIL T13: the width sampling is not in the plan cache and Query Store, so the dynamic SQL check proves nothing.', 1;
 EXEC AIIndexTuner.usp_CollectData @Data = @Data OUTPUT;
 DECLARE @PlanCache nvarchar(max) = SUBSTRING(@Data, CHARINDEX(N'=== PLAN CACHE QUERY STATISTICS ===', @Data), CHARINDEX(N'=== HEAP TABLE ANALYSIS ===', @Data) - CHARINDEX(N'=== PLAN CACHE QUERY STATISTICS ===', @Data)),
         @QueryStore nvarchar(max) = SUBSTRING(@Data, CHARINDEX(N'=== QUERY STORE WORKLOAD INSIGHTS ===', @Data), CHARINDEX(N'=== AUTOMATIC TUNING OPTIONS ===', @Data) - CHARINDEX(N'=== QUERY STORE WORKLOAD INSIGHTS ===', @Data));
 IF @PlanCache LIKE N'%AIIndexTuner%' OR @QueryStore LIKE N'%AIIndexTuner%'
     THROW 50999, N'FAIL T13: the plan cache or Query Store sections include this tool''s own statements.', 1;
+IF @PlanCache LIKE @Sampling OR @QueryStore LIKE @Sampling
+    THROW 50999, N'FAIL T13: the plan cache or Query Store sections include the collector''s width sampling (its dynamic SQL).', 1;
 IF @QueryStore NOT LIKE N'%"QueryId"%'
-    THROW 50999, N'FAIL T13: the Query Store section is empty, so the check above proves nothing.', 1;
-PRINT 'PASS T13: the plan cache, Query Store workload and write mix leave out this tool''s own statements';
+    THROW 50999, N'FAIL T13: the Query Store section is empty, so the checks above prove nothing.', 1;
+
+-- Total executions in the write mix, before and after two more collector runs.
+SET @Mix = SUBSTRING(@Data, CHARINDEX(N'=== QUERY STORE WRITE WORKLOAD MIX ===', @Data), CHARINDEX(N'=== QUERY STORE FORCED PLAN FAILURES ===', @Data) - CHARINDEX(N'=== QUERY STORE WRITE WORKLOAD MIX ===', @Data));
+IF CHARINDEX(N'[{', @Mix) = 0
+    THROW 50999, N'FAIL T13: the write mix is empty, so the check below proves nothing.', 1;
+SET @Mix = SUBSTRING(@Mix, CHARINDEX(N'[{', @Mix), CHARINDEX(N'}]', @Mix) - CHARINDEX(N'[{', @Mix) + 2);
+SELECT @Before = SUM(Executions) FROM OPENJSON(@Mix) WITH (Executions bigint);
+
+EXEC AIIndexTuner.usp_CollectData @Data = @Data OUTPUT;
+EXEC AIIndexTuner.usp_CollectData @Data = @Data OUTPUT;
+SET @Mix = SUBSTRING(@Data, CHARINDEX(N'=== QUERY STORE WRITE WORKLOAD MIX ===', @Data), CHARINDEX(N'=== QUERY STORE FORCED PLAN FAILURES ===', @Data) - CHARINDEX(N'=== QUERY STORE WRITE WORKLOAD MIX ===', @Data));
+SET @Mix = SUBSTRING(@Mix, CHARINDEX(N'[{', @Mix), CHARINDEX(N'}]', @Mix) - CHARINDEX(N'[{', @Mix) + 2);
+SELECT @After = SUM(Executions) FROM OPENJSON(@Mix) WITH (Executions bigint);
+IF @After <> @Before
+BEGIN
+    DECLARE @Msg nvarchar(400) = CONCAT(N'FAIL T13: two collector runs changed the write mix from ', @Before, N' to ', @After, N' executions, so it counts the collector''s own writes.');
+    THROW 50999, @Msg, 1;
+END;
+PRINT 'PASS T13: the plan cache, Query Store workload and write mix leave out this tool''s own statements, including its dynamic SQL and temp-table writes';
 GO
 
 /* ===== T14: change controls go into the prompt and onto the run ===== */

@@ -251,7 +251,10 @@ BEGIN
         BEGIN
             BEGIN TRY
                 -- NOLOCK: an estimate, which should not wait on or block the workload.
-                SET @WideSql = N'SELECT @Avg = AVG(CAST(DATALENGTH(v) AS bigint)) FROM (SELECT TOP (1000) ' + QUOTENAME(COL_NAME(@WideObject, @WideColumn))
+                -- The marker comment keeps this statement out of the plan cache and Query Store sections:
+                -- dynamic SQL has no object_id there, and Query Store drops a comment that comes before
+                -- the statement, but keeps one inside it.
+                SET @WideSql = N'SELECT /* AIIndexTuner collector */ @Avg = AVG(CAST(DATALENGTH(v) AS bigint)) FROM (SELECT TOP (1000) ' + QUOTENAME(COL_NAME(@WideObject, @WideColumn))
                              + N' AS v FROM ' + QUOTENAME(OBJECT_SCHEMA_NAME(@WideObject)) + N'.' + QUOTENAME(OBJECT_NAME(@WideObject)) + N' WITH (NOLOCK)'
                              + N' WHERE ' + QUOTENAME(COL_NAME(@WideObject, @WideColumn)) + N' IS NOT NULL) AS x;';
                 SET @WideAvg = NULL;
@@ -549,7 +552,7 @@ BEGIN
             CROSS APPLY (SELECT CAST(pa.value AS int) AS dbid FROM sys.dm_exec_plan_attributes(qs.plan_handle) AS pa WHERE pa.attribute = N'dbid') AS pdb
             WHERE pdb.dbid = DB_ID()
               -- Leave out this tool's own statements: its AIIndexTuner* schemas, the sp_AIIndexTuner* procs in dbo,
-              -- and ad hoc batches that call or query them.
+              -- ad hoc batches that call or query them, and its dynamic SQL, which carries an AIIndexTuner marker.
               AND (st.objectid IS NULL OR OBJECT_SCHEMA_NAME(st.objectid, st.dbid) IS NULL OR OBJECT_SCHEMA_NAME(st.objectid, st.dbid) NOT LIKE N'AIIndexTuner%')
               AND st.text NOT LIKE N'%AIIndexTuner%'
             ORDER BY qs.total_worker_time DESC
@@ -1193,7 +1196,13 @@ BEGIN
             CROSS APPLY (SELECT LEFT(CASE WHEN prefix.p IS NOT NULL THEN SUBSTRING(head.t, prefix.p + 1, 4000) ELSE head.t END, 200) AS s) AS stmt
             WHERE rs.runtime_stats_interval_id >= @QsMinInterval
               AND (@QsScoped = 0 OR EXISTS (SELECT 1 FROM #qs_scope AS sc WHERE sc.query_id = q.query_id))
-              AND qt.query_sql_text NOT LIKE N'%AIIndexTuner%'   -- this tool's own writes (runs, recommendations)
+              AND q.is_internal_query = 0
+              -- Leave out this tool's own writes, as in the workload section: its temp-table writes in
+              -- usp_CollectData and usp_UsageSince, whose text does not name the schema, by module,
+              -- and its runs and recommendations by text.
+              AND (q.object_id = 0 OR OBJECT_SCHEMA_NAME(q.object_id) IS NULL OR OBJECT_SCHEMA_NAME(q.object_id) NOT LIKE N'AIIndexTuner%')
+              AND (q.object_id = 0 OR OBJECT_NAME(q.object_id) IS NULL OR OBJECT_NAME(q.object_id) NOT LIKE N'sp[_]AIIndexTuner%')
+              AND qt.query_sql_text NOT LIKE N'%AIIndexTuner%'
         )
         SELECT @j = (
             SELECT TOP (12) StatementType, HourOfDayUtc, SUM(count_executions) AS Executions
