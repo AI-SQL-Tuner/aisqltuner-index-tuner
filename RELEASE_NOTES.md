@@ -43,6 +43,24 @@ recommendations are kept, and it replaces the procedures and functions.
   script's header, link to Studio's website and its
   [Microsoft Store](https://apps.microsoft.com/detail/9P68072ZM3N5) listing.
 
+### Fixed
+
+- **The collector's own statements in the payload**
+  ([issue #18](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/issues/18)): two kinds got
+  through the filters and were shown to the model as workload.
+  - The width sampling of wide `INCLUDE` columns, added in #13, is dynamic SQL, which has no
+    `object_id` in the plan cache or Query Store. It appeared in PLAN CACHE QUERY STATISTICS and
+    QUERY STORE WORKLOAD INSIGHTS as a query that reads the wide column. It now carries an
+    `/* AIIndexTuner collector */` marker inside the statement, where Query Store keeps it.
+  - QUERY STORE WRITE WORKLOAD MIX counted the collector's own temp-table writes, such as one
+    `INSERT #RawDensity` per statistic read. It now leaves out statements of the tool's modules
+    and internal queries, as the workload section does.
+  - Payloads collected before this fix, including pinned benchmark payloads, may include these
+    statements.
+  - T13 now checks for the sampling statement itself, and that two more collector runs leave the
+    write mix unchanged. The test workload has a query that returns `dbo.Orders.Notes`, so the
+    sampling runs.
+
 ## 2026-10-24
 
 - **Benchmark gaps closed** ([#13](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/13), issue #12):

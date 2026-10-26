@@ -63,6 +63,19 @@ BEGIN
 END;
 GO
 
+-- A query that returns Notes, an nvarchar(200) column: 400 bytes is wide, so its missing-index
+-- suggestion makes the collector sample Notes' width with dynamic SQL, which T13 checks it leaves out.
+DECLARE @i int = 0, @notes nvarchar(200), @cust int;
+WHILE @i < 50
+BEGIN
+    SELECT @notes = MAX(o.Notes), @cust = MAX(c.CustomerId)
+    FROM dbo.Orders AS o INNER JOIN dbo.Customers AS c ON c.CustomerId = o.CustomerId
+    WHERE o.Status = 1 AND o.OrderDate > DATEADD(DAY, -(@i % 30) - 7, '2026-10-01') AND o.OrderDate <= DATEADD(DAY, -(@i % 30), '2026-10-01');
+
+    SET @i += 1;
+END;
+GO
+
 SELECT OBJECT_NAME(d.object_id) AS TableName, d.equality_columns, d.inequality_columns, d.included_columns,
        CAST(s.avg_total_user_cost * s.avg_user_impact * (s.user_seeks + s.user_scans) AS bigint) AS ImpactScore
 FROM sys.dm_db_missing_index_details AS d

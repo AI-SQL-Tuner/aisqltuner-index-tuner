@@ -332,7 +332,8 @@ The tests use `@TestResponse` canned model answers, so they need no AI endpoint.
 - the request body
 - reading an answer longer than 4,000 characters
 - supplied diagnostics (`@CollectedData`)
-- leaving the tool's own statements out of the collected data
+- leaving the tool's own statements out of the collected data, including its dynamic SQL and its
+  temp-table writes
 
 ### Live tests
 
