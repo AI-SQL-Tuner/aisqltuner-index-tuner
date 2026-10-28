@@ -450,6 +450,8 @@ BEGIN
                + N'  * SQL Server 2025 platform capabilities detected' + @nl
                + N'  * Advanced Intelligent Query Processing enhancements may be available' + @nl
                + N'  * CE feedback (needs compatibility level 160 or higher and Query Store in READ_WRITE) and CE feedback for expressions (CE_FEEDBACK_FOR_EXPRESSIONS)' + @nl
+               + N'  * DOP feedback (DOP_FEEDBACK, ON by default; needs compatibility level 160 or higher and Query Store in READ_WRITE)' + @nl
+               + N'  * Optional parameter plan optimization (OPTIONAL_PARAMETER_OPTIMIZATION, ON by default; needs compatibility level 170; not on Azure SQL Managed Instance)' + @nl
             ELSE N'' END);
 
     IF @SchemaName IS NOT NULL AND @TableName IS NOT NULL
@@ -1319,6 +1321,30 @@ BEGIN
         + CASE WHEN @QsCapped = 1 THEN CONCAT(N' More than ', @QsPlanCap, N' plans were eligible, so the scan was capped at that many, most recently executed first; less recently executed plans are not represented in this scope.') ELSE N'' END
         + CASE WHEN @QsScoped = 1 AND @QsScopeCount = 0 THEN N' No Query Store queries matched, so the Query Store sections below are empty; that means no captured workload touched the object, not that the sections failed.' ELSE N'' END;
 
+        /* Adaptive plans (Parameter Sensitive Plan, optional parameter plan optimization) store each query
+           variant as its own query, with object_id 0, under a parent query that has the module's object_id.
+           The plan-XML tiers find the variants, whose plans read the object, and the dependency tier finds
+           the parents. Each brings in the other, so a statement is in scope whichever query Query Store
+           recorded its work under. */
+        IF @QsScoped = 1
+        BEGIN
+        BEGIN TRY
+            INSERT #qs_scope (query_id)
+            SELECT x.query_id
+            FROM (SELECT qv.query_variant_query_id AS query_id
+                  FROM sys.query_store_query_variant AS qv
+                  INNER JOIN #qs_scope AS s ON s.query_id = qv.parent_query_id
+                  UNION
+                  SELECT qv.parent_query_id
+                  FROM sys.query_store_query_variant AS qv
+                  INNER JOIN #qs_scope AS s ON s.query_id = qv.query_variant_query_id) AS x
+            WHERE NOT EXISTS (SELECT 1 FROM #qs_scope AS s2 WHERE s2.query_id = x.query_id);
+        END TRY
+        BEGIN CATCH
+            SET @QsScopeNote += CONCAT(N' Query variants could not be matched to their parent queries (', ERROR_MESSAGE(), N').');
+        END CATCH;
+        END;
+
         DROP TABLE #qs_plan_cand;
         DROP TABLE #qs_plan_hit;
     END;
@@ -1352,19 +1378,30 @@ BEGIN
             WHERE ws.runtime_stats_interval_id >= @QsMinInterval
             GROUP BY ws.plan_id
         ),
+        -- An adaptive plan query variant (Parameter Sensitive Plan, optional parameter plan optimization)
+        -- is counted under its parent query, with the parent's text and module: the parent's dispatcher
+        -- plan has no runtime stats, so otherwise one statement's cost is split over its variants.
         qs AS (
-            SELECT q.query_id, q.query_hash, qt.query_sql_text, p.plan_id, rs.count_executions, rs.avg_duration, rs.avg_cpu_time,
+            SELECT COALESCE(pq.query_id, q.query_id) AS query_id, COALESCE(pq.query_hash, q.query_hash) AS query_hash,
+                   COALESCE(pqt.query_sql_text, qt.query_sql_text) AS query_sql_text,
+                   p.plan_id, rs.count_executions, rs.avg_duration, rs.avg_cpu_time,
                    rs.avg_logical_reads, rs.avg_logical_writes, rs.avg_rowcount, rs.first_execution_time, rs.last_execution_time,
                    ISNULL(w.total_wait_ms, 0) AS total_wait_ms
             FROM rs_agg AS rs
             INNER JOIN sys.query_store_plan AS p ON rs.plan_id = p.plan_id
             INNER JOIN sys.query_store_query AS q ON p.query_id = q.query_id
             INNER JOIN sys.query_store_query_text AS qt ON q.query_text_id = qt.query_text_id
+            LEFT JOIN sys.query_store_query_variant AS qv ON qv.query_variant_query_id = q.query_id
+            LEFT JOIN sys.query_store_query AS pq ON pq.query_id = qv.parent_query_id
+            LEFT JOIN sys.query_store_query_text AS pqt ON pqt.query_text_id = pq.query_text_id
             LEFT JOIN waits AS w ON rs.plan_id = w.plan_id
+            CROSS APPLY (SELECT COALESCE(pq.object_id, q.object_id) AS object_id) AS m
             WHERE q.is_internal_query = 0
-              -- Leave out this tool's own statements, as in the plan cache section.
-              AND (q.object_id = 0 OR OBJECT_SCHEMA_NAME(q.object_id) IS NULL OR OBJECT_SCHEMA_NAME(q.object_id) NOT LIKE N'AIIndexTuner%')
-              AND (q.object_id = 0 OR OBJECT_NAME(q.object_id) IS NULL OR OBJECT_NAME(q.object_id) NOT LIKE N'sp[_]AIIndexTuner%')
+              -- Leave out this tool's own statements, as in the plan cache section. A variant has object_id 0,
+              -- so its module is its parent's: the collector's own catch-all filters, such as
+              -- (@SchemaName IS NULL OR s.name = @SchemaName), get variants at compatibility level 170.
+              AND (m.object_id = 0 OR OBJECT_SCHEMA_NAME(m.object_id) IS NULL OR OBJECT_SCHEMA_NAME(m.object_id) NOT LIKE N'AIIndexTuner%')
+              AND (m.object_id = 0 OR OBJECT_NAME(m.object_id) IS NULL OR OBJECT_NAME(m.object_id) NOT LIKE N'sp[_]AIIndexTuner%')
               AND qt.query_sql_text NOT LIKE N'%AIIndexTuner%'
         ),
         param_sens AS (
@@ -1433,6 +1470,10 @@ BEGIN
             INNER JOIN sys.query_store_plan AS qp ON q.query_id = qp.query_id
             INNER JOIN sys.query_store_runtime_stats AS rs ON qp.plan_id = rs.plan_id
             INNER JOIN sys.query_store_runtime_stats_interval AS rsi ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
+            -- A query variant's module is its parent's (see the workload section).
+            LEFT JOIN sys.query_store_query_variant AS qv ON qv.query_variant_query_id = q.query_id
+            LEFT JOIN sys.query_store_query AS pq ON pq.query_id = qv.parent_query_id
+            CROSS APPLY (SELECT COALESCE(pq.object_id, q.object_id) AS object_id) AS m
             -- Upper-cased head of the text, with line breaks and tabs as spaces.
             CROSS APPLY (SELECT UPPER(LTRIM(REPLACE(REPLACE(REPLACE(LEFT(qt.query_sql_text, 4000), NCHAR(13), N' '), NCHAR(10), N' '), NCHAR(9), N' '))) AS t) AS head
             -- Where the statement starts after a "(@...)" parameter-declaration prefix: the first ')'
@@ -1450,8 +1491,8 @@ BEGIN
               -- Leave out this tool's own writes, as in the workload section: its temp-table writes in
               -- usp_CollectData and usp_UsageSince, whose text does not name the schema, by module,
               -- and its runs and recommendations by text.
-              AND (q.object_id = 0 OR OBJECT_SCHEMA_NAME(q.object_id) IS NULL OR OBJECT_SCHEMA_NAME(q.object_id) NOT LIKE N'AIIndexTuner%')
-              AND (q.object_id = 0 OR OBJECT_NAME(q.object_id) IS NULL OR OBJECT_NAME(q.object_id) NOT LIKE N'sp[_]AIIndexTuner%')
+              AND (m.object_id = 0 OR OBJECT_SCHEMA_NAME(m.object_id) IS NULL OR OBJECT_SCHEMA_NAME(m.object_id) NOT LIKE N'AIIndexTuner%')
+              AND (m.object_id = 0 OR OBJECT_NAME(m.object_id) IS NULL OR OBJECT_NAME(m.object_id) NOT LIKE N'sp[_]AIIndexTuner%')
               AND qt.query_sql_text NOT LIKE N'%AIIndexTuner%'
         )
         SELECT @j = (
@@ -1487,7 +1528,10 @@ BEGIN
         )
         SELECT @j = (
             SELECT TOP (25)
+                -- The forced plan's own query, which sp_query_store_unforce_plan takes, and for a query
+                -- variant of an adaptive plan the parent query it belongs to.
                 qsq.query_id AS QueryId,
+                qv.parent_query_id AS ParentQueryId,
                 qsp.plan_id AS PlanId,
                 qsp.force_failure_count AS ForceFailureCount,
                 qsp.last_force_failure_reason_desc AS LastFailureReason,
@@ -1497,6 +1541,7 @@ BEGIN
             FROM sys.query_store_plan AS qsp
             INNER JOIN sys.query_store_query AS qsq ON qsp.query_id = qsq.query_id
             INNER JOIN sys.query_store_query_text AS qt ON qsq.query_text_id = qt.query_text_id
+            LEFT JOIN sys.query_store_query_variant AS qv ON qv.query_variant_query_id = qsq.query_id
             LEFT JOIN recent_runtime AS rr ON qsp.plan_id = rr.plan_id
             WHERE qsp.is_forced_plan = 1 AND qsp.force_failure_count >= 1
               AND (@QsScoped = 0 OR EXISTS (SELECT 1 FROM #qs_scope AS sc WHERE sc.query_id = qsq.query_id))
@@ -1519,6 +1564,11 @@ BEGIN
             WHERE name = N'FORCE_LAST_GOOD_PLAN'
             FOR JSON PATH);
         SET @Data += CONCAT(@nl, N'=== AUTOMATIC TUNING OPTIONS ===', @nl, ISNULL(@j, N'FORCE_LAST_GOOD_PLAN option not found.'), @nl);
+        -- Standard (including Standard Developer) and Express report the option but cannot turn it on:
+        -- ALTER DATABASE ... SET AUTOMATIC_TUNING fails there with error 15707.
+        IF @EngineEdition IN (2, 4)
+            SET @Data += CONCAT(N'Automatic tuning is available only in the Enterprise and Enterprise Developer editions of SQL Server, so FORCE_LAST_GOOD_PLAN cannot be enabled on this edition (',
+                                CONVERT(nvarchar(128), SERVERPROPERTY('Edition')), N'): ALTER DATABASE ... SET AUTOMATIC_TUNING fails here with error 15707.', @nl);
     END TRY
     BEGIN CATCH
         SET @Data += CONCAT(@nl, N'=== AUTOMATIC TUNING OPTIONS ===', @nl, N'Automatic tuning options unavailable: ', ERROR_MESSAGE(), @nl);
@@ -1588,6 +1638,104 @@ BEGIN
     BEGIN CATCH
         SET @Data += CONCAT(N'The CE feedback settings could not be read: ', ERROR_MESSAGE(), @nl);
     END CATCH;
+
+    /* ===== DEGREE OF PARALLELISM FEEDBACK ===== (AppendDopFeedbackSummaryAsync, issue #17)
+       DOP feedback lowers the DOP of repeating parallel queries whose parallelism is inefficient. It is
+       ON by default on SQL Server 2025. Unlike CE feedback, a plan forced through Query Store does not
+       stop it; a MAXDOP query hint or Query Store hint does. On Managed Instance it needs the SQL Server
+       2025 or Always-up-to-date update policy, and ProductUpdateType is 'CU' under both the SQL Server
+       2022 policy (no DOP feedback) and the 2025 one, so only 'Continuous' confirms it. */
+    SET @Data += CONCAT(@nl, N'=== DEGREE OF PARALLELISM FEEDBACK ===', @nl);
+    DECLARE @UpdateType nvarchar(128) = CONVERT(nvarchar(128), SERVERPROPERTY('ProductUpdateType'));
+    BEGIN TRY
+        DECLARE @Dop int, @DopDefault int, @DopBlockers nvarchar(1000) = N'';
+        SELECT @Compat = compatibility_level FROM sys.databases WHERE database_id = DB_ID();
+        SELECT @Dop = MAX(CONVERT(int, value)), @DopDefault = MAX(CONVERT(int, is_value_default))
+        FROM sys.database_scoped_configurations
+        WHERE name = N'DOP_FEEDBACK';
+
+        IF @Dop = 0
+            SET @DopBlockers += CASE @DopDefault
+                WHEN 1 THEN N'; DOP_FEEDBACK is OFF, its default on this version'
+                WHEN 0 THEN N'; DOP_FEEDBACK was set OFF (not its default here, so it may have been turned off on purpose)'
+                ELSE N'; DOP_FEEDBACK is OFF' END;
+        IF @Compat < 160 SET @DopBlockers += CONCAT(N'; compatibility level is ', @Compat, N' (needs 160 or higher)');
+        IF ISNULL(@QsStateDesc, N'') <> N'READ_WRITE'
+            SET @DopBlockers += CASE WHEN @QsStateDesc IS NULL THEN N'; the Query Store state could not be read (needs READ_WRITE)'
+                                     ELSE CONCAT(N'; Query Store is ', @QsStateDesc, N' (needs READ_WRITE)') END;
+
+        SET @Data += CASE
+            WHEN @Dop IS NULL THEN N'DOP feedback: NOT_AVAILABLE (it needs SQL Server 2022 or later, Azure SQL Database, SQL database in Microsoft Fabric, or Azure SQL Managed Instance with the SQL Server 2025 or Always-up-to-date update policy).'
+            WHEN @EngineEdition = 8 AND ISNULL(@UpdateType, N'') <> N'Continuous'
+                THEN CONCAT(N'DOP feedback: not confirmed for this database: on Azure SQL Managed Instance it needs the SQL Server 2025 or Always-up-to-date update policy, and this instance reports ProductUpdateType ',
+                            ISNULL(@UpdateType, N'NULL'), N', which the SQL Server 2022 policy (no DOP feedback) and the SQL Server 2025 policy share, so check the instance''s update policy',
+                            @DopBlockers, N'.')
+            WHEN @DopBlockers = N'' THEN CONCAT(N'DOP feedback: ON and can run for this database (DOP_FEEDBACK ON, compatibility level ', @Compat, N', Query Store READ_WRITE).')
+            ELSE CONCAT(N'DOP feedback: cannot run for this database: ', STUFF(@DopBlockers, 1, 2, N''), N'.')
+        END + @nl;
+
+        IF @Dop IS NOT NULL AND @QsUsable = 1
+        BEGIN
+            SET @Data += N'DOP feedback rows by state (sys.query_store_plan_feedback, feature_id 3):' + @nl
+                + ISNULL((SELECT STRING_AGG(CAST(CONCAT(N'  ', state_desc, N': ', n) AS nvarchar(max)) COLLATE DATABASE_DEFAULT, NCHAR(10)) WITHIN GROUP (ORDER BY n DESC)
+                          FROM (SELECT state_desc, COUNT(*) AS n FROM sys.query_store_plan_feedback WHERE feature_id = 3 GROUP BY state_desc) AS x), N'  none') + @nl;
+
+            -- Microsoft documents feedback_data only for CE and memory grant feedback, so the DOP feedback
+            -- value is shown as recorded.
+            DECLARE @DopRecent nvarchar(max) = (
+                SELECT STRING_AGG(CAST(CONCAT(N'  query_id ', query_id, N', plan_id ', plan_id, N': ', state_desc,
+                                         N'; feedback_data: ', ISNULL(NULLIF(AIIndexTuner.fn_CleanText(feedback_data, 300), N''), N'none'),
+                                         N'; last updated ', CONVERT(varchar(16), last_updated_time AT TIME ZONE 'UTC', 120), N' UTC',
+                                         CASE WHEN @IncludeQueryText = 1 THEN N'; query: ' + AIIndexTuner.fn_CleanText(query_sql_text, 200) ELSE N'' END) AS nvarchar(max)) COLLATE DATABASE_DEFAULT, NCHAR(10))
+                       WITHIN GROUP (ORDER BY last_updated_time DESC)
+                FROM (SELECT TOP (20) p.query_id, pf.plan_id, pf.state_desc, pf.feedback_data, pf.last_updated_time, qt.query_sql_text
+                      FROM sys.query_store_plan_feedback AS pf
+                      INNER JOIN sys.query_store_plan AS p ON p.plan_id = pf.plan_id
+                      INNER JOIN sys.query_store_query AS q ON q.query_id = p.query_id
+                      INNER JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
+                      WHERE pf.feature_id = 3
+                      ORDER BY pf.last_updated_time DESC) AS r);
+            SET @Data += N'Most recent DOP feedback rows (top 20):' + @nl + ISNULL(@DopRecent, N'  none') + @nl;
+            IF @DopRecent IS NOT NULL
+                SET @Data += N'  DOP feedback keeps a row here only once a lower DOP is verified and stable; a regression, including a cancelled query, returns the query to its last known good DOP. The states are those of every feedback feature in sys.query_store_plan_feedback.' + @nl;
+        END;
+    END TRY
+    BEGIN CATCH
+        SET @Data += CONCAT(N'The DOP feedback settings could not be read: ', ERROR_MESSAGE(), @nl);
+    END CATCH;
+
+    /* ===== OPTIONAL PARAMETER PLAN OPTIMIZATION ===== (DescribeOptionalParameterOptimization, issue #17)
+       OPPO gives a catch-all predicate such as (@p IS NULL OR col = @p) a query variant for each NULL state
+       of the parameter, so the variant for a non-NULL value can seek an index the single scan plan could
+       not use. Microsoft lists it for SQL Server 2025, Azure SQL Database and SQL database in Fabric, not
+       for Azure SQL Managed Instance; it needs compatibility level 170 and OPTIONAL_PARAMETER_OPTIMIZATION
+       ON, the default. */
+    SET @Data += CONCAT(@nl, N'=== OPTIONAL PARAMETER PLAN OPTIMIZATION ===', @nl);
+    BEGIN TRY
+        DECLARE @Oppo int, @OppoBlockers nvarchar(1000) = N'';
+        SELECT @Oppo = MAX(CONVERT(int, value))
+        FROM sys.database_scoped_configurations
+        WHERE name = N'OPTIONAL_PARAMETER_OPTIMIZATION';
+
+        IF @Oppo = 0 SET @OppoBlockers += N'; OPTIONAL_PARAMETER_OPTIMIZATION is OFF';
+        IF @Compat < 170 SET @OppoBlockers += CONCAT(N'; compatibility level is ', @Compat, N' (needs 170)');
+
+        SET @Data += CASE
+            WHEN @EngineEdition = 8
+                THEN CONCAT(N'Optional parameter plan optimization (OPPO): NOT_AVAILABLE: Microsoft lists it for SQL Server 2025, Azure SQL Database or SQL database in Microsoft Fabric, not for Azure SQL Managed Instance',
+                            CASE WHEN @Oppo IS NOT NULL THEN CONCAT(N' (OPTIONAL_PARAMETER_OPTIMIZATION reads ', CASE @Oppo WHEN 1 THEN N'ON' ELSE N'OFF' END, N' here)') ELSE N'' END, N'.')
+            WHEN @Oppo IS NULL THEN N'Optional parameter plan optimization (OPPO): NOT_AVAILABLE (it needs SQL Server 2025, Azure SQL Database or SQL database in Microsoft Fabric).'
+            WHEN @OppoBlockers = N'' THEN CONCAT(N'Optional parameter plan optimization (OPPO): ACTIVE (OPTIONAL_PARAMETER_OPTIMIZATION ON, compatibility level ', @Compat, N').')
+            ELSE CONCAT(N'Optional parameter plan optimization (OPPO): NOT ACTIVE for this database: ', STUFF(@OppoBlockers, 1, 2, N''), N'.')
+        END + @nl;
+
+        IF @QsUsable = 1
+            SET @Data += CONCAT(N'Query Store holds ', (SELECT COUNT(*) FROM sys.query_store_query_variant),
+                                N' adaptive plan query variants (Parameter Sensitive Plan or OPPO). QUERY STORE WORKLOAD INSIGHTS counts each under its parent query, with the parent''s text, and the object scope of a scoped run covers both.', @nl);
+    END TRY
+    BEGIN CATCH
+        SET @Data += CONCAT(N'The optional parameter plan optimization settings could not be read: ', ERROR_MESSAGE(), @nl);
+    END CATCH;
 END;
 GO
 
@@ -1614,7 +1762,8 @@ AS
 BEGIN
     RETURN CONCAT(CAST(N'' AS nvarchar(max)),
         N'You are a SQL Server expert specializing in index and code optimization. ',
-        N'Analyze the provided missing index recommendations (with the types of their included columns), missing index overlap signals, column cardinality, skewed low-cardinality columns, index usage statistics (including key/included columns, index sizes and compression), duplicate and overlapping indexes, index page density, index operational hotspots, heap tables, large tables, query patterns from the plan cache, Query Store workload insights, Query Store write workload mix, Query Store forced plan failures, automatic tuning options, cardinality estimation feedback, constraints, untrusted or disabled constraints, and database statistics settings. ',
+        -- Every section of the collected input, by its header, in the order usp_CollectData writes them (test T20).
+        N'Analyze the provided input, whose sections are: server information with its platform capabilities, missing index recommendations (with the types of their included columns), index usage statistics (including key/included columns, index sizes and compression), missing index overlap signals, duplicate and overlapping indexes, plan cache query statistics, heap table analysis, constraints and relationships, untrusted or disabled constraints, index operational hotspots, column cardinality, skewed low-cardinality columns, large tables, database statistics settings, index page density, Query Store workload insights, Query Store write workload mix, Query Store forced plan failures, automatic tuning options, cardinality estimation feedback, degree of parallelism feedback, and optional parameter plan optimization. ',
         N'Carefully consider the additional overhead of adding indexes. Analyze the number of user_updates compared to user_seeks and user_scans for each table when recommending indexes, especially when the index is not included in the missing indexes report. Consider clustered and nonclustered columnstore indexes for tables with more than 1000000 rows. Consider filtered indexes. ',
         N'If HEAP TABLE ANALYSIS reports forwarded records, explain that each forwarded record costs an extra page read for every scan or lookup that reaches it, and that their number grows as rows widen. Recommend a clustered index on a narrow, unique, stable key that the workload filters or joins on, or the table''s primary key, as an Other recommendation (ConsolidateIndex when it replaces existing indexes) whose script creates it. If the table has to stay a heap, recommend ALTER TABLE ... REBUILD (RebuildIndex) instead, noting that it removes the forwarding pointers but that they return as rows widen again. A nonclustered index on a heap does not remove forwarded records. ',
         N'Missing-index suggestions name their included columns without types. IncludedColumnTypes gives each type, and for wide columns an average width sampled from the table. Do not copy an nvarchar(max), varchar(max), varbinary(max), xml, text or other wide column into INCLUDE because a suggestion lists it: for the few rows a selective query returns, a key lookup costs less than storing the value again in every row of the index, and a (max) column can make the index nearly as large as the table. Include a wide column only when the query returns it for many rows, and then give its storage cost in the rationale and in estimated_size_mb. ',
@@ -1625,7 +1774,10 @@ BEGIN
         N'Prioritize high‑cardinality columns, frequent queries, and operations involving WHERE, JOIN, ORDER BY, or GROUP BY. Avoid indexing low‑cardinality columns or write‑heavy tables unless strongly justified by usage patterns and performance impact. ',
         N'Provide specific, prioritized recommendations for index changes including creates, drops, and modifications. Name the statements from the plan cache or Query Store that will benefit from each index recommendation in its benefiting_queries, if possible. ',
         N'If Query Store forced-plan failures are reported, give each affected query_id and plan_id its own recommendation. In its rationale, state the query_id and plan_id, the failure count, the last failure reason, and the executions and average duration over the last 7 days, as reported, and explain what the failure reason means (for example, NO_INDEX when an index the forced plan uses has been dropped or changed, and NO_PLAN or GENERAL_FAILURE when the forced plan can no longer be produced). Recommend a fix that matches it, in the category of that fix: recreate the missing index or object (CreateIndex for a nonclustered index), update statistics (Statistics), rewrite or parameterize the query (QueryChange), or unforce the plan with sys.sp_query_store_unforce_plan (Other). Take the reported automatic tuning state into account: when FORCE_LAST_GOOD_PLAN is on, prefer letting it handle plan regressions and find the cause before unforcing. Plan history, runtime percentiles, compile times and schema-change history are not in the input, so do not present them. ',
-        N'Review automatic tuning options: if FORCE_LAST_GOOD_PLAN is not enabled, make a Setting recommendation to enable it, to allow SQL Server to automatically revert to the last known good plan when a regression is detected; if it is enabled but the actual state differs from the desired state, make a Setting recommendation that gives the reported reason in its rationale and the corrective action in its script. ',
+        -- Live runs 13 to 16 scripted FORCE_LAST_GOOD_PLAN as a database scoped configuration, which SQL Server
+        -- rejects, and recommended it on Standard Developer edition, which has no automatic tuning (error
+        -- 15707). The statement and the edition limit are spelled out here (test T24 runs the statement).
+        N'Review automatic tuning options: if FORCE_LAST_GOOD_PLAN is not enabled, make a Setting recommendation to enable it, to allow SQL Server to automatically revert to the last known good plan when a regression is detected; if it is enabled but the actual state differs from the desired state, make a Setting recommendation that gives the reported reason in its rationale and the corrective action in its script. FORCE_LAST_GOOD_PLAN is an automatic tuning option, not a database scoped configuration: the script that enables it is ALTER DATABASE [db] SET AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = ON); never ALTER DATABASE SCOPED CONFIGURATION, which has no such option. Where AUTOMATIC TUNING OPTIONS says the edition cannot enable it (Standard, Standard Developer and Express), do not recommend enabling it or any change that needs it; you may note in the summary that the edition lacks automatic plan correction. ',
         N'Analyze index page density to identify indexes with low page utilization (below ~75%) which may benefit from rebuild operations, fill factor adjustments, or indicate excessive page splits from random inserts. Give each index to rebuild its own RebuildIndex recommendation. ',
         N'If duplicate or left-prefix overlapping indexes are reported, recommend consolidation: for exact key duplicates recommend dropping the redundant index (DropIndex, keeping unique indexes and indexes that back constraints); for left-prefix overlaps evaluate whether the narrower index can be dropped (DropIndex) or merged into the wider index by adding included columns (ConsolidateIndex), using the reported reads, writes, and size to justify each recommendation. Never recommend dropping an index that enforces a primary key or unique constraint without replacing the constraint. ',
         N'Index usage statistics, missing index statistics, index operational statistics and the plan cache accumulate only since the time in the input''s "Database Usage Statistics Since" line, which is the later of the SQL Server start time and the database''s last restore, attach, snapshot revert, ONLINE or AUTO_CLOSE reopen. Before recommending that an index be dropped because it shows no or few reads, check that period: if it is shorter than one week, do not recommend dropping it outright; make it an Other recommendation, as a candidate to confirm after a longer observation period, with the period and its source in the rationale. With at least a week you may recommend dropping it, noting in the rationale that monthly or quarterly work may not have run in that time. If that line says the statistics may cover less than the period, say so in the rationale of any drop you recommend. If the time is unknown, say so and apply the same caution. This caution applies only to drops justified by low use. An exact key duplicate, or an index that another index makes redundant (the same leading keys, its included columns and filter covered, and any uniqueness kept), loses nothing when dropped, so recommend dropping it (DropIndex) whatever the period. ',
@@ -1633,6 +1785,10 @@ BEGIN
         N'Recommend statistics updates, creation, or drops when beneficial (Statistics). Recommend query code changes to improve performance (QueryChange). ',
         N'Use the CARDINALITY ESTIMATION FEEDBACK section. When it says CE feedback cannot run, report that as one Setting recommendation with its reasons in the rationale, not as several recommendations or a headline of the summary. Treat VERIFICATION_REGRESSED and NO_RECOMMENDATION rows as CE feedback working as designed, not as problems. When you recommend forcing a plan or fixing a forced plan failure, apply the rule below on forced plans. When CE feedback for expressions is ON, its own protection checks only cardinality estimates, not run time; Microsoft points to automatic plan correction (FORCE_LAST_GOOD_PLAN, or sys.dm_db_tuning_recommendations when automatic tuning is off) to catch run-time regressions, so mention this in the rationale of the automatic tuning recommendation. ',
         N'CE feedback (cardinality estimation feedback, SQL Server 2022 and later, Azure SQL Database and Azure SQL Managed Instance) runs only where the input says it can run: CE_FEEDBACK ON, compatibility level 160 or higher and Query Store in READ_WRITE. Microsoft also applies it to a query that has the USE HINT QUERY_OPTIMIZER_COMPATIBILITY_LEVEL_160 hint or a higher one. It does not run for a query that has a plan forced through Query Store, hard-coded query hints (an OPTION clause), or Query Store hints set by a user. So wherever CE feedback can run, any recommendation to force a plan, add a query hint, or set a Query Store hint for a query must say that it stops CE feedback from adjusting that query''s estimates. Recommend raising the compatibility level only together with the usual advice for that change: test the workload at the new level and use Query Store to find and fix regressions. Never recommend it for CE feedback alone. Where CE_FEEDBACK is NOT_AVAILABLE, do not present CE feedback as available, and do not say CE feedback for expressions is on unless CE_FEEDBACK_FOR_EXPRESSIONS is reported ON. ',
+        -- DOP feedback and optional parameter plan optimization (issue #17), from AI SQL Tuner's
+        -- IndexTuningDopFeedback / DopFeedbackRules and IndexTuningOptionalParameters / OptionalParameterRules.
+        N'Use the DEGREE OF PARALLELISM FEEDBACK section. DOP feedback is OFF by default on SQL Server 2022 and ON by default on SQL Server 2025. Say it is active only where that section says it can run: DOP_FEEDBACK ON, compatibility level 160 or higher and Query Store in READ_WRITE; where it says NOT_AVAILABLE or not confirmed, do not present it as available. When it says DOP feedback cannot run, make one Setting recommendation with the reasons in its rationale, not several; when DOP_FEEDBACK is OFF as its default, recommend turning it on only for a database whose Query Store workload has repeating parallel queries, and when it was set OFF and that is not its default, recommend reviewing that choice rather than turning it on. Changing a database scoped configuration clears that database''s plan cache, so say so in the rationale of a Setting recommendation that changes one. DOP feedback only lowers the DOP of repeating parallel queries, within MAXDOP and never below 2, so it does nothing for serial plans and does not replace a correct MAXDOP or cost threshold for parallelism. Unlike CE feedback, a plan forced through Query Store does not stop DOP feedback; do not say it does. A MAXDOP query hint or Query Store hint makes the query ineligible, so wherever DOP feedback is available, any QueryChange that adds OPTION (MAXDOP n) or a Query Store MAXDOP hint must say so in its rationale and, unless DOP_FEEDBACK is already ON, offer ALTER DATABASE SCOPED CONFIGURATION SET DOP_FEEDBACK = ON as the alternative. ',
+        N'Use the OPTIONAL PARAMETER PLAN OPTIMIZATION section. Optional parameter plan optimization (OPPO) exists only on SQL Server 2025, Azure SQL Database and SQL database in Microsoft Fabric, not on Azure SQL Managed Instance, and is active only where that section says ACTIVE: compatibility level 170 and OPTIONAL_PARAMETER_OPTIMIZATION ON, the default. It gives a catch-all predicate such as (@p IS NULL OR col = @p) a query variant for each NULL state of the parameter, so the variant for a non-NULL value can seek an index the single scan plan could not use. Where OPPO is active, do not recommend dropping an index (DropIndex) only because it showed no seeks before OPPO was active, and do not recommend OPTION (RECOMPILE), dynamic SQL or an IF/ELSE split (QueryChange) for a catch-all predicate that OPPO already handles. A QueryChange that adds OPTION (RECOMPILE), WITH RECOMPILE or the DISABLE_OPTIONAL_PARAMETER_OPTIMIZATION hint, or copies parameters into local variables, on such a database must say in its rationale that this stops OPPO for the statement. QUERY STORE WORKLOAD INSIGHTS already counts each query variant under its parent query. Where OPPO is not active only because the compatibility level is below 170, you may mention it as part of the usual compatibility level advice, never as a reason on its own. Where it is NOT_AVAILABLE, do not present it as available. ',
         N'DATABASE STATISTICS SETTINGS also reports OPTIMIZED_SP_EXECUTESQL and ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY. Do not recommend enabling OPTIMIZED_SP_EXECUTESQL from this input, which has no evidence of compilation storms, and do not mention it when it is OFF or NOT_AVAILABLE. When it is ON, Auto Update Stats is True, and Auto Update Stats Async is False or ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY is OFF, make one Setting recommendation whose script runs ALTER DATABASE [db] SET AUTO_UPDATE_STATISTICS_ASYNC ON and ALTER DATABASE SCOPED CONFIGURATION SET ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY = ON, whichever are off. ',
         N'Microsoft recommends, when AUTO_UPDATE_STATISTICS is ON, also enabling AUTO_UPDATE_STATISTICS_ASYNC and the ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY database scoped configuration, which reduces long compiles, LCK_M_X waits and WAIT_ON_SYNC_STATISTICS_REFRESH waits while other callers wait for one compile. ',
         N'Consider both query performance and maintenance overhead. Provide scripts for all recommendations. Consider compression settings and fillfactor in scripts. ',
