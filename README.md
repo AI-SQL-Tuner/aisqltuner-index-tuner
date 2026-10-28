@@ -25,7 +25,8 @@ about Microsoft's 2006 `AutoIndex.sql` prototype: a modern version, with AI doin
 > **Status: prototype.** The collectors, prompt, storage and apply logic are tested against SQL
 > Server 2025 with canned model answers. The live path has also been run end to end against Azure
 > OpenAI `gpt-5.6-luna` on SQL Server 2025: collection, the background-mode call, storage, the
-> change controls and CREATE mode. See [Testing](#testing). Not yet run: the full live benchmark,
+> change controls and CREATE mode. See [Testing](#testing) and [Benchmark](#benchmark). Not yet run: the
+> rest of the impact benchmark (one scenario of three so far),
 > Azure SQL Database, Fabric SQL Database, and `ONLINE = ON` index builds.
 
 ## Requirements
@@ -366,7 +367,7 @@ Results on SQL Server 2025 Standard Developer with `gpt-5.6-luna`, medium effort
 
 ## Benchmark
 
-[bench/](bench/) checks whether the recommendations are right ([issue #2](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/issues/2), part 1). It builds 16 known tuning problems into a `bench` schema, including:
+[bench/](bench/) checks whether the recommendations are right ([issue #2](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/issues/2), part 1) and what applying them gains (part 2). It builds 16 known tuning problems into a `bench` schema, including:
 - low-cardinality and skewed filters
 - 10M and 5M-row fact tables where columnstore belongs
 - a write-heavy queue
@@ -386,6 +387,15 @@ It runs `sp_AIIndexTuner` against them and scores every run with 37 rubric check
 ```
 
 [bench/CASES.md](bench/CASES.md) explains each case and why its expected answer is right. [bench/PREREQUISITES.md](bench/PREREQUISITES.md) lists what a live run needs.
+
+**Impact** (part 2): each trial starts from a reverted snapshot of the challenge database. It runs a 16-query workload, tunes, applies and measures again. On SQL Server 2025, with `gpt-5.6-luna` at `medium` effort and 5 trials per arm:
+
+| Arm | Read logical reads | Read CPU | Index MB added (mean) |
+|---|---:|---:|---:|
+| `@Mode = 'CREATE'`: the proc applies its validated indexes on its own | −79% | −66% | 328 |
+| Every recommendation reviewed and applied | −93% | −81% | 206 |
+
+No query returned different results. Most of the gap comes from the filtered and columnstore indexes, which CREATE mode leaves for review. See [the report](bench/results/impact-20261028-VMEnt-SQL25-challenge.md).
 
 `sp_AIIndexTuner @CollectedData = N'…'` runs the model on supplied diagnostics instead of collecting them, for example a run's `AIIndexTuner.Run.CollectedData`. The benchmark uses it so that every iteration answers the same input. `AIIndexTuner.Run` records the payload's SHA-256, collection and model time, apply time, and the number of background polls.
 
