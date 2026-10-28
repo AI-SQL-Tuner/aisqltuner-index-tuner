@@ -395,8 +395,9 @@ It runs `sp_AIIndexTuner` against them and scores every run with 37 rubric check
 | `@Mode = 'CREATE'`: the proc applies its validated indexes on its own | −79% | −66% | 328 |
 | Every recommendation reviewed and applied | −93% | −81% | 206 |
 | For comparison: the AI SQL Tuner desktop app's IndexTuning goal, every script applied | −83% | −74% | 465 |
+| Baseline: one index per missing-index DMV suggestion, as suggested | −90% | −72% | 2,075 |
 
-No query returned different results. Most of the gap between the two proc rows comes from the filtered and columnstore indexes, which CREATE mode leaves for review. See [the report](bench/results/impact-20261028-VMEnt-SQL25-challenge.md).
+No query returned different results. Most of the gap between the two proc rows comes from the filtered and columnstore indexes, which CREATE mode leaves for review. Creating every DMV suggestion nearly matches the reviewed advice on reads, but it adds ten times the index space and can't produce filtered or columnstore indexes. See [the report](bench/results/impact-20261028-VMEnt-SQL25-challenge.md).
 
 `sp_AIIndexTuner @CollectedData = N'…'` runs the model on supplied diagnostics instead of collecting them, for example a run's `AIIndexTuner.Run.CollectedData`. The benchmark uses it so that every iteration answers the same input. `AIIndexTuner.Run` records the payload's SHA-256, collection and model time, apply time, and the number of background polls.
 
