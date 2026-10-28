@@ -1314,6 +1314,11 @@ BEGIN
             WHERE name = N'FORCE_LAST_GOOD_PLAN'
             FOR JSON PATH);
         SET @Data += CONCAT(@nl, N'=== AUTOMATIC TUNING OPTIONS ===', @nl, ISNULL(@j, N'FORCE_LAST_GOOD_PLAN option not found.'), @nl);
+        -- Standard (including Standard Developer) and Express report the option but cannot turn it on:
+        -- ALTER DATABASE ... SET AUTOMATIC_TUNING fails there with error 15707.
+        IF @EngineEdition IN (2, 4)
+            SET @Data += CONCAT(N'Automatic tuning is available only in the Enterprise and Enterprise Developer editions of SQL Server, so FORCE_LAST_GOOD_PLAN cannot be enabled on this edition (',
+                                CONVERT(nvarchar(128), SERVERPROPERTY('Edition')), N'): ALTER DATABASE ... SET AUTOMATIC_TUNING fails here with error 15707.', @nl);
     END TRY
     BEGIN CATCH
         SET @Data += CONCAT(@nl, N'=== AUTOMATIC TUNING OPTIONS ===', @nl, N'Automatic tuning options unavailable: ', ERROR_MESSAGE(), @nl);

@@ -71,6 +71,15 @@ recommendations are kept, and it replaces the procedures and functions.
     filters such as `(@SchemaName IS NULL OR s.name = @SchemaName)` get variants at compatibility
     level 170. It now uses the parent's module, in the workload and the write mix.
   - QUERY STORE FORCED PLAN FAILURES adds `ParentQueryId` for a forced plan of a variant.
+- **`FORCE_LAST_GOOD_PLAN` scripts** (found in a live run for issue #17):
+  - The model scripted the option as `ALTER DATABASE SCOPED CONFIGURATION SET FORCE_LAST_GOOD_PLAN = ON`, which
+    SQL Server rejects, in four of five live runs. The prompt now gives the statement:
+    `ALTER DATABASE [db] SET AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = ON)`.
+  - It also recommended the option on Standard Developer edition, which has no automatic tuning (error 15707).
+    On Standard and Express, AUTOMATIC TUNING OPTIONS now says the edition cannot enable it, and the prompt
+    says not to recommend it there.
+  - Test T24 runs the prompt's statement: it must turn the option on where automatic tuning exists, and fail
+    only with the edition error on Standard and Express.
 
 - **The collector's own statements in the payload**
   ([issue #18](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/issues/18)): two kinds got

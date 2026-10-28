@@ -884,5 +884,65 @@ DROP TABLE dbo.T23Orders;
 PRINT 'PASS T23: OPPO query variants are counted under their parent query, database-wide and in a run scoped to the table';
 GO
 
+/* ===== T24: the FORCE_LAST_GOOD_PLAN script the prompt gives =====
+   Live runs scripted it as a database scoped configuration, which SQL Server rejects, and recommended it on
+   Standard Developer edition, which has no automatic tuning. The statement the prompt spells out is run here
+   as it stands, with this database's name for [db]: on an edition with automatic tuning it must turn the
+   option on; on Standard or Express it must fail with the edition error 15707, not a syntax error, and
+   AUTOMATIC TUNING OPTIONS must say the edition cannot enable it. The old form must fail everywhere. */
+DECLARE @Prompt nvarchar(max) = AIIndexTuner.fn_SystemPrompt(), @Start int, @Stmt nvarchar(400), @Old nvarchar(400),
+        @NoAutoTuning bit = CASE WHEN CAST(SERVERPROPERTY('EngineEdition') AS int) IN (2, 4) THEN 1 ELSE 0 END, @Data nvarchar(max);
+SET @Start = CHARINDEX(N'the script that enables it is ', @Prompt);
+IF @Start = 0 OR @Prompt NOT LIKE N'%never ALTER DATABASE SCOPED CONFIGURATION, which has no such option%'
+   OR @Prompt NOT LIKE N'%Where AUTOMATIC TUNING OPTIONS says the edition cannot enable it%do not recommend enabling it%'
+    THROW 50999, N'FAIL T24: the prompt does not spell out the FORCE_LAST_GOOD_PLAN statement and its edition limit.', 1;
+SET @Start += LEN(N'the script that enables it is ') + 1;
+SET @Stmt = REPLACE(SUBSTRING(@Prompt, @Start, CHARINDEX(N';', @Prompt, @Start) - @Start), N'[db]', QUOTENAME(DB_NAME())) + N';';
+
+SELECT @Old = desired_state_desc FROM sys.database_automatic_tuning_options WHERE name = N'FORCE_LAST_GOOD_PLAN';
+IF @NoAutoTuning = 1
+BEGIN
+    BEGIN TRY
+        EXEC sys.sp_executesql @Stmt;
+        THROW 50999, N'FAIL T24: FORCE_LAST_GOOD_PLAN was enabled on an edition the collector says cannot enable it.', 1;
+    END TRY
+    BEGIN CATCH
+        IF ERROR_NUMBER() = 50999 THROW;
+        -- 15707 is raised with 5069 ("ALTER DATABASE statement failed"); either means the statement parsed.
+        IF ERROR_NUMBER() NOT IN (15707, 5069)
+        BEGIN
+            DECLARE @Msg24 nvarchar(2000) = CONCAT(N'FAIL T24: the prompt''s statement failed with error ', ERROR_NUMBER(), N', not the edition error 15707: ', ERROR_MESSAGE());
+            THROW 50999, @Msg24, 1;
+        END;
+    END CATCH;
+    EXEC AIIndexTuner.usp_CollectData @Data = @Data OUTPUT;
+    IF @Data NOT LIKE N'%=== AUTOMATIC TUNING OPTIONS ===%FORCE_LAST_GOOD_PLAN cannot be enabled on this edition%'
+        THROW 50999, N'FAIL T24: AUTOMATIC TUNING OPTIONS does not say this edition cannot enable FORCE_LAST_GOOD_PLAN.', 1;
+END
+ELSE
+BEGIN
+    EXEC sys.sp_executesql @Stmt;
+    IF NOT EXISTS (SELECT 1 FROM sys.database_automatic_tuning_options WHERE name = N'FORCE_LAST_GOOD_PLAN' AND desired_state_desc = N'ON')
+        THROW 50999, N'FAIL T24: the prompt''s FORCE_LAST_GOOD_PLAN statement did not turn the option on.', 1;
+END;
+
+BEGIN TRY
+    EXEC sys.sp_executesql N'ALTER DATABASE SCOPED CONFIGURATION SET FORCE_LAST_GOOD_PLAN = ON;';
+    THROW 50999, N'FAIL T24: the database scoped configuration form was accepted, so the rule rests on a wrong premise.', 1;
+END TRY
+BEGIN CATCH
+    IF ERROR_NUMBER() = 50999 THROW;
+END CATCH;
+
+IF @NoAutoTuning = 0
+BEGIN
+    SET @Stmt = CONCAT(N'ALTER DATABASE ', QUOTENAME(DB_NAME()), N' SET AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = ', CASE WHEN @Old IN (N'ON', N'OFF') THEN @Old ELSE N'DEFAULT' END, N');');
+    EXEC sys.sp_executesql @Stmt;
+END;
+PRINT CONCAT('PASS T24: the FORCE_LAST_GOOD_PLAN statement the prompt gives ',
+             CASE @NoAutoTuning WHEN 1 THEN 'parses and fails only on this edition, which the collector reports' ELSE 'turns the option on' END,
+             '; the scoped configuration form is rejected');
+GO
+
 PRINT 'ALL TESTS PASSED';
 GO
