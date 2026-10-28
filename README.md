@@ -390,7 +390,7 @@ It runs `sp_AIIndexTuner` against them and scores every run with 37 rubric check
 
 **Impact** (part 2): each trial starts from a reverted snapshot of the challenge database. It runs a 16-query workload, tunes, applies and measures again. On SQL Server 2025, with `gpt-5.6-luna` at `medium` effort and 5 trials per arm:
 
-| Arm | Read logical reads | Read CPU | Index MB added (mean) |
+| Arm | Read logical reads | Read CPU | Net index MB, after drops (mean) |
 |---|---:|---:|---:|
 | `@Mode = 'CREATE'`: the proc applies its validated indexes on its own | −79% | −66% | 328 |
 | Every recommendation reviewed and applied | −93% | −81% | 206 |

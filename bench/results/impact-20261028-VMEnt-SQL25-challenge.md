@@ -138,7 +138,7 @@ bench matrix      --scenario bench/scenarios/challenge.json --server tcp:localho
 ```
 
 Prerequisites:
-- the challenge database built by `bench/challenge/01_Create-ChallengeDb.sql`;
+- the challenge database, created by `bench/challenge/00_Create-ChallengeDb.sql` and populated by `bench/challenge/01_Create-ChallengeTables.sql`;
 - `sp_AIIndexTuner` installed, with `AIIndexTuner.Config` set to the `gpt-5.6-luna` deployment and `medium` effort;
 - the prerequisites in [PREREQUISITES.md](../PREREQUISITES.md).
 
