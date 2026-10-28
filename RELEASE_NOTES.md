@@ -11,6 +11,21 @@ recommendations are kept, and it replaces the procedures and functions.
 
 ### Added
 
+- **DOP feedback and optional parameter plan optimization** (issue #17), ported from AI SQL Tuner
+  Studio:
+  - New section DEGREE OF PARALLELISM FEEDBACK: whether DOP feedback can run for the database and
+    every reason it cannot (`DOP_FEEDBACK` off, and whether that is its default; compatibility level
+    below 160; Query Store not `READ_WRITE`), "not confirmed" on a Managed Instance whose update
+    policy cannot be told apart, its feedback rows by state and the 20 most recent.
+  - New section OPTIONAL PARAMETER PLAN OPTIMIZATION: `ACTIVE`, `NOT ACTIVE` with its blockers
+    (`OPTIONAL_PARAMETER_OPTIMIZATION` off, compatibility level below 170), or `NOT_AVAILABLE`
+    (Azure SQL Managed Instance), and how many query variants Query Store holds.
+  - Prompt rules for both: a `MAXDOP` hint makes a query ineligible for DOP feedback, while a forced
+    plan does not stop it; where OPPO is active, no drop of an index that only lacked seeks before
+    OPPO, and no `RECOMPILE` or rewrite for a catch-all predicate OPPO already handles.
+  - The prompt's input sentence names every section of the collected input by its header.
+  - Tests T20 to T23.
+
 - **Apply thresholds** ([#14](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/14)):
   `@MinPriority` and `@MinConfidence` on `sp_AIIndexTuner` and `sp_AIIndexTuner_Apply`. Each takes
   `High`, `Medium` or `Low`, or `NULL` (the default) for no minimum. Only recommendations whose
@@ -44,6 +59,18 @@ recommendations are kept, and it replaces the procedures and functions.
   [Microsoft Store](https://apps.microsoft.com/detail/9P68072ZM3N5) listing.
 
 ### Fixed
+
+- **Query Store query variants** (issue #17): an adaptive plan (Parameter Sensitive Plan, optional
+  parameter plan optimization) stores each query variant as its own query, with `object_id` 0, and
+  records no runtime stats for the parent's dispatcher plan. So:
+  - QUERY STORE WORKLOAD INSIGHTS split one statement's cost over its variants, ranked it too low,
+    and lost its module. It now counts each variant under its parent query, with the parent's text.
+  - A run scoped by module dependencies missed the variants, and one scoped by plan XML missed the
+    parents. Each now brings in the other.
+  - The self-exclusion by module missed variants of the tool's own statements, whose catch-all
+    filters such as `(@SchemaName IS NULL OR s.name = @SchemaName)` get variants at compatibility
+    level 170. It now uses the parent's module, in the workload and the write mix.
+  - QUERY STORE FORCED PLAN FAILURES adds `ParentQueryId` for a forced plan of a variant.
 
 - **The collector's own statements in the payload**
   ([issue #18](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/issues/18)): two kinds got

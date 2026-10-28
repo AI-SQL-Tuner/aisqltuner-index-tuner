@@ -86,8 +86,11 @@ can apply what it finds.
      density
    - the top 25 plan cache statements by CPU for this database
    - Query Store: the top 50 queries by total duration over 7 days (with parameter sensitivity),
-     the write workload mix, and forced plan failures
-   - automatic tuning (`FORCE_LAST_GOOD_PLAN`) and cardinality estimation feedback
+     the write workload mix, and forced plan failures. Each query variant of an adaptive plan
+     (Parameter Sensitive Plan or optional parameter plan optimization) is counted under its parent
+     query, with the parent's text
+   - automatic tuning (`FORCE_LAST_GOOD_PLAN`), cardinality estimation feedback, degree of
+     parallelism (DOP) feedback, and whether optional parameter plan optimization (OPPO) is active
    - heaps, constraints, untrusted constraints, column cardinality, large tables, statistics
      settings and `OPTIMIZED_SP_EXECUTESQL`
    - skewed low-cardinality columns, with each value's share of the rows from the statistics

@@ -759,5 +759,130 @@ EXEC sys.sp_executesql @Undo;
 PRINT 'PASS T19: @MinPriority and @MinConfidence apply only recommendations at those levels or above, the rest wait for review, and a lower minimum applies them later';
 GO
 
+/* ===== T20: the prompt names every section of the collected input =====
+   Each "=== ... ===" header of a collection must be named in the input sentence of the system prompt,
+   so a section added to usp_CollectData without it fails here. */
+DECLARE @Data nvarchar(max), @Prompt nvarchar(max) = AIIndexTuner.fn_SystemPrompt(), @Start int, @Sentence nvarchar(max), @Headers int, @Missing nvarchar(max);
+EXEC AIIndexTuner.usp_CollectData @Data = @Data OUTPUT;
+SET @Start = CHARINDEX(N'Analyze the provided input, whose sections are: ', @Prompt);
+IF @Start = 0
+    THROW 50999, N'FAIL T20: the input sentence is missing from the system prompt.', 1;
+SET @Sentence = SUBSTRING(@Prompt, @Start, CHARINDEX(N'. ', @Prompt, @Start) - @Start);
+WITH headers AS (
+    SELECT DISTINCT SUBSTRING(l.v, 5, LEN(l.v) - 8) AS h
+    FROM (SELECT LTRIM(RTRIM(REPLACE(value, NCHAR(13), N''))) AS v FROM STRING_SPLIT(@Data, NCHAR(10))) AS l
+    WHERE l.v LIKE N'=== % ===')
+SELECT @Headers = COUNT(*), @Missing = STRING_AGG(CASE WHEN CHARINDEX(LOWER(h), LOWER(@Sentence)) = 0 THEN h END, N', ')
+FROM headers;
+IF @Headers < 20
+    THROW 50999, N'FAIL T20: fewer than 20 section headers were found, so the check proves little.', 1;
+IF @Missing IS NOT NULL
+BEGIN
+    DECLARE @Msg20 nvarchar(2000) = CONCAT(N'FAIL T20: sections the prompt''s input sentence does not name: ', @Missing);
+    THROW 50999, @Msg20, 1;
+END;
+PRINT 'PASS T20: the system prompt names every section of the collected input';
+GO
+
+/* ===== T21: DOP feedback (issue #17) =====
+   ON by default on SQL Server 2025; an OFF that is not the default is reported as possibly on purpose. */
+DECLARE @Data nvarchar(max);
+EXEC AIIndexTuner.usp_CollectData @Data = @Data OUTPUT;
+IF @Data NOT LIKE N'%=== DEGREE OF PARALLELISM FEEDBACK ===%DOP feedback: ON and can run for this database (DOP_FEEDBACK ON, compatibility level 170, Query Store READ_WRITE).%DOP feedback rows by state%'
+    THROW 50999, N'FAIL T21: DOP feedback is not reported as able to run with its default settings.', 1;
+
+ALTER DATABASE SCOPED CONFIGURATION SET DOP_FEEDBACK = OFF;
+EXEC AIIndexTuner.usp_CollectData @Data = @Data OUTPUT;
+IF @Data NOT LIKE N'%DOP feedback: cannot run for this database: DOP_FEEDBACK was set OFF (not its default here, so it may have been turned off on purpose).%'
+    THROW 50999, N'FAIL T21: DOP_FEEDBACK set OFF is not reported as a choice that is not the default.', 1;
+ALTER DATABASE SCOPED CONFIGURATION SET DOP_FEEDBACK = ON;
+PRINT 'PASS T21: DOP feedback eligibility, with an OFF that is not the default reported as possibly on purpose';
+GO
+
+/* ===== T22: optional parameter plan optimization (issue #17) =====
+   ACTIVE at compatibility level 170 with the default setting; each blocker is named. DOP feedback still
+   runs at 160. Runs late: changing the compatibility level clears the database's plan cache. */
+DECLARE @Data nvarchar(max);
+EXEC AIIndexTuner.usp_CollectData @Data = @Data OUTPUT;
+IF @Data NOT LIKE N'%=== OPTIONAL PARAMETER PLAN OPTIMIZATION ===%Optional parameter plan optimization (OPPO): ACTIVE (OPTIONAL_PARAMETER_OPTIMIZATION ON, compatibility level 170).%Query Store holds % adaptive plan query variants%'
+    THROW 50999, N'FAIL T22: OPPO is not reported as active with its default settings.', 1;
+
+ALTER DATABASE CURRENT SET COMPATIBILITY_LEVEL = 160;
+EXEC AIIndexTuner.usp_CollectData @Data = @Data OUTPUT;
+IF @Data NOT LIKE N'%(OPPO): NOT ACTIVE for this database: compatibility level is 160 (needs 170).%'
+   OR @Data NOT LIKE N'%DOP feedback: ON and can run for this database (DOP_FEEDBACK ON, compatibility level 160,%'
+    THROW 50999, N'FAIL T22: at compatibility level 160, OPPO is not reported as blocked by it, or DOP feedback is.', 1;
+
+ALTER DATABASE SCOPED CONFIGURATION SET OPTIONAL_PARAMETER_OPTIMIZATION = OFF;
+EXEC AIIndexTuner.usp_CollectData @Data = @Data OUTPUT;
+IF @Data NOT LIKE N'%(OPPO): NOT ACTIVE for this database: OPTIONAL_PARAMETER_OPTIMIZATION is OFF; compatibility level is 160 (needs 170).%'
+    THROW 50999, N'FAIL T22: OPPO is not reported with both of its blockers.', 1;
+
+ALTER DATABASE SCOPED CONFIGURATION SET OPTIONAL_PARAMETER_OPTIMIZATION = ON;
+ALTER DATABASE CURRENT SET COMPATIBILITY_LEVEL = 170;
+PRINT 'PASS T22: OPPO is reported active at level 170 and not active with each of its blockers named';
+GO
+
+/* ===== T23: query variants are counted under their parent query (issue #17) =====
+   A catch-all procedure gets OPPO variants: queries with object_id 0 under a parent that has the
+   procedure's object_id. The workload must list the parent, not the variants, in a database-wide run and
+   in a run scoped to the table, whose plan-XML scope finds the variants. */
+CREATE TABLE dbo.T23Orders (OrderId int IDENTITY PRIMARY KEY, CustomerId int NOT NULL, TotalDue decimal(12, 2) NOT NULL);
+INSERT dbo.T23Orders (CustomerId, TotalDue)
+SELECT TOP (200000) 1 + n % 20000, n % 1000
+FROM (SELECT ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n FROM sys.all_columns AS a CROSS JOIN sys.all_columns AS b) AS x;
+CREATE INDEX IX_T23Orders_CustomerId ON dbo.T23Orders (CustomerId);
+GO
+CREATE PROCEDURE dbo.usp_T23FindOrders @CustomerId int = NULL
+AS
+SELECT COUNT(*), SUM(TotalDue) FROM dbo.T23Orders WHERE (@CustomerId IS NULL OR CustomerId = @CustomerId);
+GO
+SET NOCOUNT ON;
+DECLARE @i int = 0, @n int, @t decimal(18, 2);
+DECLARE @r TABLE (n int, t decimal(18, 2));
+WHILE @i < 30
+BEGIN
+    INSERT @r EXEC dbo.usp_T23FindOrders @CustomerId = 42;
+    INSERT @r EXEC dbo.usp_T23FindOrders @CustomerId = NULL;
+    SET @i += 1;
+END;
+GO
+DECLARE @Parent bigint, @Variants int;
+SELECT @Parent = MAX(qv.parent_query_id), @Variants = COUNT(*)
+FROM sys.query_store_query_variant AS qv
+INNER JOIN sys.query_store_query AS pq ON pq.query_id = qv.parent_query_id
+WHERE pq.object_id = OBJECT_ID(N'dbo.usp_T23FindOrders');
+IF @Variants < 2
+    THROW 50999, N'FAIL T23: OPPO made no query variants for the catch-all procedure, so the check proves nothing.', 1;
+
+DECLARE @Data nvarchar(max), @Json nvarchar(max), @Scoped nvarchar(max);
+EXEC AIIndexTuner.usp_CollectData @Data = @Data OUTPUT;
+SET @Json = SUBSTRING(@Data, CHARINDEX(N'=== QUERY STORE WORKLOAD INSIGHTS ===', @Data), CHARINDEX(N'=== QUERY STORE WRITE WORKLOAD MIX ===', @Data) - CHARINDEX(N'=== QUERY STORE WORKLOAD INSIGHTS ===', @Data));
+SET @Json = SUBSTRING(@Json, CHARINDEX(N'[{', @Json), LEN(@Json));
+SET @Json = LEFT(@Json, LEN(@Json) - CHARINDEX(N']', REVERSE(@Json)) + 1);
+IF NOT EXISTS (SELECT 1 FROM OPENJSON(@Json) WITH (QueryId bigint) WHERE QueryId = @Parent)
+    THROW 50999, N'FAIL T23: the workload does not list the catch-all statement under its parent query.', 1;
+IF EXISTS (SELECT 1 FROM OPENJSON(@Json) WITH (QueryId bigint) AS j INNER JOIN sys.query_store_query_variant AS qv ON qv.query_variant_query_id = j.QueryId)
+    THROW 50999, N'FAIL T23: the workload lists a query variant on its own.', 1;
+-- The collector's own catch-all filters get variants too, with object_id 0; their parents must not show.
+IF EXISTS (SELECT 1 FROM OPENJSON(@Json) WITH (QueryId bigint) AS j
+           INNER JOIN sys.query_store_query AS q ON q.query_id = j.QueryId
+           WHERE OBJECT_SCHEMA_NAME(q.object_id) LIKE N'AIIndexTuner%')
+    THROW 50999, N'FAIL T23: the workload lists one of this tool''s own statements.', 1;
+
+EXEC AIIndexTuner.usp_CollectData @SchemaName = N'dbo', @TableName = N'T23Orders', @Data = @Scoped OUTPUT;
+SET @Json = SUBSTRING(@Scoped, CHARINDEX(N'=== QUERY STORE WORKLOAD INSIGHTS ===', @Scoped), CHARINDEX(N'=== QUERY STORE WRITE WORKLOAD MIX ===', @Scoped) - CHARINDEX(N'=== QUERY STORE WORKLOAD INSIGHTS ===', @Scoped));
+IF CHARINDEX(N'[{', @Json) = 0
+    THROW 50999, N'FAIL T23: the run scoped to dbo.T23Orders has no Query Store workload rows.', 1;
+SET @Json = SUBSTRING(@Json, CHARINDEX(N'[{', @Json), LEN(@Json));
+SET @Json = LEFT(@Json, LEN(@Json) - CHARINDEX(N']', REVERSE(@Json)) + 1);
+IF NOT EXISTS (SELECT 1 FROM OPENJSON(@Json) WITH (QueryId bigint) WHERE QueryId = @Parent)
+    THROW 50999, N'FAIL T23: the run scoped to dbo.T23Orders does not list the catch-all statement under its parent query.', 1;
+
+DROP PROCEDURE dbo.usp_T23FindOrders;
+DROP TABLE dbo.T23Orders;
+PRINT 'PASS T23: OPPO query variants are counted under their parent query, database-wide and in a run scoped to the table';
+GO
+
 PRINT 'ALL TESTS PASSED';
 GO
