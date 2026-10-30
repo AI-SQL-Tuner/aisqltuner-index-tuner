@@ -158,6 +158,11 @@ IF COL_LENGTH(N'AIIndexTuner.Recommendation', N'PriorityLevel') IS NULL
         PriorityLevel varchar(10) NULL;   -- High, Medium or Low; Priority is the rank within the run (1 = most important)
 GO
 
+IF COL_LENGTH(N'AIIndexTuner.Recommendation', N'ReplacesIndex') IS NULL
+    ALTER TABLE AIIndexTuner.Recommendation ADD
+        ReplacesIndex sysname NULL;   -- ConsolidateIndex: the existing nonclustered index a widening rebuilds, under its own name
+GO
+
 /* ===== Helpers ===== */
 
 /* A High, Medium or Low level as a number to compare: 3, 2 or 1. NULL for anything else. */

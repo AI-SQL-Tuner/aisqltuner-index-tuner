@@ -172,6 +172,11 @@ IF COL_LENGTH(N'AIIndexTuner.Recommendation', N'PriorityLevel') IS NULL
         PriorityLevel varchar(10) NULL;   -- High, Medium or Low; Priority is the rank within the run (1 = most important)
 GO
 
+IF COL_LENGTH(N'AIIndexTuner.Recommendation', N'ReplacesIndex') IS NULL
+    ALTER TABLE AIIndexTuner.Recommendation ADD
+        ReplacesIndex sysname NULL;   -- ConsolidateIndex: the existing nonclustered index a widening rebuilds, under its own name
+GO
+
 /* ===== Helpers ===== */
 
 /* A High, Medium or Low level as a number to compare: 3, 2 or 1. NULL for anything else. */
@@ -1812,10 +1817,11 @@ BEGIN
         N'For CreateIndex, fill schema_name, table_name, index_name, index_type (NONCLUSTERED for a rowstore index, NONCLUSTERED COLUMNSTORE or CLUSTERED COLUMNSTORE), key_columns (in key order, each with descending), include_columns, filter_predicate (null unless the index is filtered), is_unique, fill_factor (null to use the default), data_compression (NONE, ROW, PAGE, or null to leave it unset) and estimated_size_mb, using object and column names exactly as they appear in the input, without brackets. ',
         N'For a nonclustered columnstore index, list its columns in key_columns with descending false and leave include_columns empty. For a clustered columnstore index, leave key_columns and include_columns empty. A columnstore index takes no is_unique, fill_factor or data_compression: use false and null. ',
         N'For DropIndex, fill schema_name, table_name and index_name with the index to drop, and estimated_size_mb. Use DropIndex only for a nonclustered index to drop now that does not enforce a primary key or unique constraint; put a change to a clustered index or constraint under ConsolidateIndex, and an index to confirm after a longer observation period under Other. ',
+        N'A ConsolidateIndex that widens one existing nonclustered rowstore index, keeping that index''s key columns as its leading keys in the same order and direction, keeping every column it includes, and adding key or included columns, is a widening. For a widening, set replaces_index to the existing index''s name and index_name to the same name, because the index is rebuilt in place under its own name, and fill the other fields as for CreateIndex with the complete new definition: every key column, the existing ones first, and every included column, the existing ones too. Script it as one CREATE INDEX ... WITH (DROP_EXISTING = ON). For every other recommendation, replaces_index is null. ',
         N'schema_name is always a schema that appears in the input, never the database name; it is null for a database or server setting. ',
         N'For the other categories, fill schema_name, table_name and index_name when the recommendation is about one object, fill estimated_size_mb when it changes index storage, use null for index_type and false for is_unique, and use empty arrays and null for the other fields that do not apply. ',
         N'confidence is High, Medium or Low: how sure you are, from the evidence in the input, that the change is correct and helps as described. rationale gives the evidence from the input. benefiting_queries lists the plan cache and Query Store statements that benefit, each by the QueryHash or Query Store QueryId the input reports for it (for example 0x1A2B3C4D5E6F7A8B or query_id 42), or by a short excerpt when it has neither, or is empty. ',
-        N'script is the complete T-SQL that implements the recommendation, or an empty string when there is nothing to run. For CreateIndex and DropIndex it creates or drops exactly the index the other fields describe, with the same names, columns and options. Do not put rollback, validation, diagnostic or monitoring scripts in it.');
+        N'script is the complete T-SQL that implements the recommendation, or an empty string when there is nothing to run. For CreateIndex and DropIndex it creates or drops exactly the index the other fields describe, with the same names, columns and options, and for a widening it rebuilds exactly that index with DROP_EXISTING = ON. Do not put rollback, validation, diagnostic or monitoring scripts in it.');
 END;
 GO
 
@@ -1841,9 +1847,9 @@ BEGIN
         CASE WHEN @AllowDropIndex = 0 THEN
             N'Do not recommend dropping or disabling any existing index, either on its own (DropIndex) or as part of a consolidation; widening an index with CREATE INDEX ... WITH (DROP_EXISTING = ON) is still allowed. You may name unused or redundant indexes in the summary, as candidates to review later. ' END,
         CASE WHEN @MaxNewIndexes = 0 THEN
-            N'Do not recommend any new indexes (CreateIndex). You may name the most valuable ones in the summary. '
+            N'Do not recommend any new indexes (CreateIndex) or widenings of existing ones (ConsolidateIndex with replaces_index). You may name the most valuable ones in the summary. '
              WHEN @MaxNewIndexes > 0 THEN
-            CONCAT(N'Recommend at most ', @MaxNewIndexes, N' new indexes (CreateIndex), choosing those with the greatest benefit, and give them the highest priorities. You may name others in the summary. ') END);
+            CONCAT(N'Recommend at most ', @MaxNewIndexes, N' new indexes (CreateIndex) and widenings of existing ones (ConsolidateIndex with replaces_index) in total, choosing those with the greatest benefit, and give them the highest priorities. You may name others in the summary. ') END);
 END;
 GO
 
@@ -1864,7 +1870,7 @@ BEGIN
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["priority", "priority_level", "category", "title", "schema_name", "table_name", "index_name", "index_type", "key_columns", "include_columns",
+        "required": ["priority", "priority_level", "category", "title", "schema_name", "table_name", "index_name", "replaces_index", "index_type", "key_columns", "include_columns",
                      "filter_predicate", "is_unique", "fill_factor", "data_compression", "estimated_size_mb", "confidence",
                      "rationale", "benefiting_queries", "script"],
         "properties": {
@@ -1875,6 +1881,7 @@ BEGIN
           "schema_name": { "type": ["string", "null"] },
           "table_name": { "type": ["string", "null"] },
           "index_name": { "type": ["string", "null"] },
+          "replaces_index": { "type": ["string", "null"] },
           "index_type": { "type": ["string", "null"], "enum": ["NONCLUSTERED", "NONCLUSTERED COLUMNSTORE", "CLUSTERED COLUMNSTORE", null] },
           "key_columns": {
             "type": "array",
@@ -2112,9 +2119,64 @@ SET ANSI_NULLS ON;
 SET QUOTED_IDENTIFIER ON;
 GO
 /*
+    AIIndexTuner.fn_IndexDefinition: the CREATE INDEX that puts an existing nonclustered index back as
+    the catalog has it: keys, includes, filter, options, compression and filegroup or partition
+    scheme. With @DropExisting = 1 it rebuilds an index of the same name in place
+    (WITH DROP_EXISTING = ON). The UndoDDL of a drop and of a widening.
+*/
+CREATE OR ALTER FUNCTION AIIndexTuner.fn_IndexDefinition(@ObjectId int, @IndexId int, @DropExisting bit)
+RETURNS nvarchar(max)
+AS
+BEGIN
+    -- A variable, so the name takes the database collation and does not conflict with the catalog's.
+    DECLARE @Target nvarchar(300) = QUOTENAME(OBJECT_SCHEMA_NAME(@ObjectId)) + N'.' + QUOTENAME(OBJECT_NAME(@ObjectId));
+    RETURN (
+        SELECT CONCAT(
+            N'CREATE ', CASE WHEN i.is_unique = 1 THEN N'UNIQUE ' END, N'NONCLUSTERED ', CASE WHEN i.type = 6 THEN N'COLUMNSTORE ' END,
+            N'INDEX ', QUOTENAME(i.name COLLATE DATABASE_DEFAULT), N' ON ', @Target, N' (',
+            CASE WHEN i.type = 6
+                 THEN (SELECT STRING_AGG(CAST(QUOTENAME(c.name COLLATE DATABASE_DEFAULT) AS nvarchar(max)), N', ') WITHIN GROUP (ORDER BY ic.index_column_id)
+                       FROM sys.index_columns AS ic INNER JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+                       WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id)
+                 ELSE (SELECT STRING_AGG(CAST(QUOTENAME(c.name COLLATE DATABASE_DEFAULT) + CASE WHEN ic.is_descending_key = 1 THEN N' DESC' ELSE N' ASC' END AS nvarchar(max)), N', ')
+                              WITHIN GROUP (ORDER BY ic.key_ordinal)
+                       FROM sys.index_columns AS ic INNER JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+                       WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0) END,
+            N')',
+            CASE WHEN i.type = 2 THEN
+                (SELECT N' INCLUDE (' + STRING_AGG(CAST(QUOTENAME(c.name COLLATE DATABASE_DEFAULT) AS nvarchar(max)), N', ') WITHIN GROUP (ORDER BY ic.index_column_id) + N')'
+                 FROM sys.index_columns AS ic INNER JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+                 WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 1) END,
+            CASE WHEN i.has_filter = 1 THEN N' WHERE ' + i.filter_definition COLLATE DATABASE_DEFAULT END,
+            N' WITH (' + NULLIF(STUFF(CONCAT(
+                CASE WHEN i.fill_factor > 0 THEN CONCAT(N', FILLFACTOR = ', i.fill_factor) END,
+                CASE WHEN i.is_padded = 1 THEN N', PAD_INDEX = ON' END,
+                CASE WHEN i.ignore_dup_key = 1 THEN N', IGNORE_DUP_KEY = ON' END,
+                CASE WHEN i.type = 2 AND i.allow_row_locks = 0 THEN N', ALLOW_ROW_LOCKS = OFF' END,
+                CASE WHEN i.type = 2 AND i.allow_page_locks = 0 THEN N', ALLOW_PAGE_LOCKS = OFF' END,
+                CASE WHEN i.optimize_for_sequential_key = 1 THEN N', OPTIMIZE_FOR_SEQUENTIAL_KEY = ON' END,
+                CASE WHEN p.data_compression_desc IN (N'ROW', N'PAGE', N'COLUMNSTORE_ARCHIVE') THEN N', DATA_COMPRESSION = ' + p.data_compression_desc COLLATE DATABASE_DEFAULT END,
+                CASE WHEN @DropExisting = 1 THEN N', DROP_EXISTING = ON' END),
+                1, 2, N''), N'') + N')',
+            N' ON ', QUOTENAME(ds.name COLLATE DATABASE_DEFAULT),
+            CASE WHEN ds.type = 'PS' THEN
+                (SELECT N'(' + QUOTENAME(c.name COLLATE DATABASE_DEFAULT) + N')'
+                 FROM sys.index_columns AS ic INNER JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+                 WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.partition_ordinal = 1) END,
+            N';')
+        FROM sys.indexes AS i
+        INNER JOIN sys.data_spaces AS ds ON ds.data_space_id = i.data_space_id
+        OUTER APPLY (SELECT TOP (1) data_compression_desc FROM sys.partitions
+                     WHERE object_id = i.object_id AND index_id = i.index_id ORDER BY partition_number) AS p
+        WHERE i.object_id = @ObjectId AND i.index_id = @IndexId);
+END;
+GO
+
+/*
     AIIndexTuner.usp_ApplyRecommendation
 
-    Applies one stored CreateIndex or DropIndex recommendation. The model's own script is never
+    Applies one stored CreateIndex or DropIndex recommendation, or a ConsolidateIndex one that
+    widens an existing index. The model's own script is never
     executed: plan cache text goes into the prompt, so a crafted query could steer what the model
     writes. The DDL is built here from the structured fields, after every name is checked against
     the catalog, with QUOTENAME and an allow-list for each option.
@@ -2131,8 +2193,13 @@ GO
 
     Applied: new rowstore indexes; new columnstore indexes when allowed; drops of nonclustered
     indexes when allowed, nothing depends on them, and either another index makes them redundant
-    or the usage statistics cover at least 7 days. Every other category, and any filtered index,
-    is left for review. The outcome is written to the recommendation row: Applied (with the DDL and
+    or the usage statistics cover at least 7 days; and widenings. A widening is a ConsolidateIndex
+    that names the index it replaces (ReplacesIndex): a nonclustered rowstore index that is not
+    unique, not filtered, not partitioned and not disabled. The new index must keep its keys as
+    its leading keys, in the same order and direction, and keep every column it includes. It is
+    rebuilt in place under its own name (CREATE INDEX ... WITH (DROP_EXISTING = ON)), so nothing
+    that names it breaks, and it counts as a new index for @MaxNewIndexes. Every other category,
+    and any filtered index, is left for review. The outcome is written to the recommendation row: Applied (with the DDL and
     the DDL that reverses it), Skipped (with the reason) or Failed (with the error). Skipped and
     Failed recommendations can be applied again, for example with a setting that allows them.
 */
@@ -2150,12 +2217,13 @@ BEGIN
     DECLARE @Category varchar(30), @Status varchar(20), @SchemaName sysname, @TableName sysname, @IndexName sysname,
             @IndexType varchar(30), @KeyColumns nvarchar(max), @IncludeColumns nvarchar(max), @Filter nvarchar(4000), @IsUnique bit,
             @FillFactor tinyint, @Compression varchar(10), @RunId int, @PriorityLevel varchar(10), @Confidence varchar(10),
+            @ReplacesIndex sysname, @Script nvarchar(max),
             @RunColumnstore bit, @RunDropIndex bit, @RunMaxNew int, @RunMinPriority varchar(10), @RunMinConfidence varchar(10);
 
     SELECT @Category = r.Category, @Status = r.Status, @SchemaName = r.SchemaName, @TableName = r.TableName, @IndexName = r.IndexName,
            @IndexType = r.IndexType, @KeyColumns = r.KeyColumns, @IncludeColumns = r.IncludeColumns, @Filter = r.FilterPredicate,
            @IsUnique = r.IsUnique, @FillFactor = r.[FillFactor], @Compression = r.DataCompression, @RunId = r.RunId,
-           @PriorityLevel = r.PriorityLevel, @Confidence = r.Confidence,
+           @PriorityLevel = r.PriorityLevel, @Confidence = r.Confidence, @ReplacesIndex = NULLIF(LTRIM(r.ReplacesIndex), N''), @Script = r.Script,
            @RunColumnstore = run.AllowColumnstore, @RunDropIndex = run.AllowDropIndex, @RunMaxNew = run.MaxNewIndexes,
            @RunMinPriority = run.MinPriority, @RunMinConfidence = run.MinConfidence
     FROM AIIndexTuner.Recommendation AS r
@@ -2179,15 +2247,26 @@ BEGIN
            @MinPriority = ISNULL(@MinPriority, @RunMinPriority),
            @MinConfidence = ISNULL(@MinConfidence, @RunMinConfidence);
 
-    SET @IndexType = CASE WHEN @Category = 'CreateIndex' THEN ISNULL(@IndexType, 'NONCLUSTERED') END;
+    -- A widening builds a new index from the same fields as CreateIndex, under the replaced index's name.
+    DECLARE @IsWidening bit = CASE WHEN @Category = 'ConsolidateIndex' AND @ReplacesIndex IS NOT NULL THEN 1 ELSE 0 END;
+    SET @IndexType = CASE WHEN @Category = 'CreateIndex' OR @IsWidening = 1 THEN ISNULL(@IndexType, 'NONCLUSTERED') END;
 
     DECLARE @Reason nvarchar(4000) = NULL, @ObjectId int, @Ddl nvarchar(max), @Undo nvarchar(max),
             @IsColumnstore bit = CASE WHEN @IndexType LIKE '%COLUMNSTORE' THEN 1 ELSE 0 END,
             @Target nvarchar(300) = QUOTENAME(@SchemaName) + N'.' + QUOTENAME(@TableName);
 
     /* ----- Validation: each failed check skips the recommendation with a reason ----- */
-    IF @Category NOT IN ('CreateIndex', 'DropIndex')
+    IF @Category = 'ConsolidateIndex' AND @IsWidening = 0
+        SET @Reason = N'ConsolidateIndex is applied only when it widens one existing index, and this one does not name the index it replaces (replaces_index). Review the script and apply it yourself.';
+    ELSE IF @Category NOT IN ('CreateIndex', 'DropIndex', 'ConsolidateIndex')
         SET @Reason = CONCAT(N'Category ', @Category, N' is recommend-only; review the script and apply it yourself.');
+    ELSE IF @IsWidening = 1 AND @IndexType <> 'NONCLUSTERED'
+        SET @Reason = N'Only a nonclustered rowstore index is widened here; a columnstore index is recommended under CreateIndex.';
+    -- The model's script is never run, but one that builds a clustered index means the fields describe something else.
+    ELSE IF @IsWidening = 1 AND @Script LIKE N'%CREATE%[^N]CLUSTERED%INDEX%'
+        SET @Reason = N'The script creates a clustered index, which is not a widening of a nonclustered one. Review it and apply it yourself.';
+    ELSE IF @IsWidening = 1 AND @IsUnique = 1
+        SET @Reason = N'A widening keeps the index non-unique; a unique index changes which rows the table accepts. Review it and apply it yourself.';
     ELSE IF @Category = 'DropIndex' AND @AllowDropIndex = 0
         SET @Reason = N'Index drops are not allowed (@AllowDropIndex = 0).';
     ELSE IF @Category = 'DropIndex' AND @AllowDropIndex IS NULL
@@ -2204,11 +2283,11 @@ BEGIN
     ELSE IF ISNULL(AIIndexTuner.fn_LevelRank(@Confidence), 1) < AIIndexTuner.fn_LevelRank(@MinConfidence)
         SET @Reason = CONCAT(N'Confidence ', ISNULL(@Confidence, N'(none)'), N' is below the minimum of ', @MinConfidence,
                              N' (@MinConfidence). Review it, then apply it with sp_AIIndexTuner_Apply @RecommendationId = ', @RecommendationId, N', @MinConfidence = ''Low''.');
-    ELSE IF @Category = 'CreateIndex' AND @MaxNewIndexes IS NOT NULL
+    ELSE IF @Category IN ('CreateIndex', 'ConsolidateIndex') AND @MaxNewIndexes IS NOT NULL
          AND (SELECT COUNT(*) FROM AIIndexTuner.Recommendation
-              WHERE RunId = @RunId AND Category = 'CreateIndex' AND Status = 'Applied') >= @MaxNewIndexes
+              WHERE RunId = @RunId AND Category IN ('CreateIndex', 'ConsolidateIndex') AND Status = 'Applied') >= @MaxNewIndexes
         SET @Reason = CONCAT(N'The limit of ', @MaxNewIndexes, N' new index(es) for this run (@MaxNewIndexes) has been reached.');
-    ELSE IF @Category = 'CreateIndex' AND NULLIF(LTRIM(@Filter), N'') IS NOT NULL
+    ELSE IF @Category IN ('CreateIndex', 'ConsolidateIndex') AND NULLIF(LTRIM(@Filter), N'') IS NOT NULL
         SET @Reason = N'Filtered indexes are recommend-only: the filter predicate is free text from the model. Review the script and apply it yourself.';
     ELSE IF @SchemaName IS NULL OR @TableName IS NULL
         SET @Reason = N'The recommendation does not name a schema and table.';
@@ -2333,43 +2412,7 @@ BEGIN
         END;
 
         -- The CREATE that puts the index back, from the catalog.
-        SELECT @Undo = CONCAT(
-            N'CREATE ', CASE WHEN i.is_unique = 1 THEN N'UNIQUE ' END, N'NONCLUSTERED ', CASE WHEN i.type = 6 THEN N'COLUMNSTORE ' END,
-            N'INDEX ', QUOTENAME(i.name), N' ON ', @Target, N' (',
-            CASE WHEN i.type = 6
-                 THEN (SELECT STRING_AGG(CAST(QUOTENAME(c.name) AS nvarchar(max)), N', ') WITHIN GROUP (ORDER BY ic.index_column_id)
-                       FROM sys.index_columns AS ic INNER JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
-                       WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id)
-                 ELSE (SELECT STRING_AGG(CAST(QUOTENAME(c.name) + CASE WHEN ic.is_descending_key = 1 THEN N' DESC' ELSE N' ASC' END AS nvarchar(max)), N', ')
-                              WITHIN GROUP (ORDER BY ic.key_ordinal)
-                       FROM sys.index_columns AS ic INNER JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
-                       WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0) END,
-            N')',
-            CASE WHEN i.type = 2 THEN
-                (SELECT N' INCLUDE (' + STRING_AGG(CAST(QUOTENAME(c.name) AS nvarchar(max)), N', ') WITHIN GROUP (ORDER BY ic.index_column_id) + N')'
-                 FROM sys.index_columns AS ic INNER JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
-                 WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 1) END,
-            CASE WHEN i.has_filter = 1 THEN N' WHERE ' + i.filter_definition END,
-            N' WITH (' + NULLIF(STUFF(CONCAT(
-                CASE WHEN i.fill_factor > 0 THEN CONCAT(N', FILLFACTOR = ', i.fill_factor) END,
-                CASE WHEN i.is_padded = 1 THEN N', PAD_INDEX = ON' END,
-                CASE WHEN i.ignore_dup_key = 1 THEN N', IGNORE_DUP_KEY = ON' END,
-                CASE WHEN i.type = 2 AND i.allow_row_locks = 0 THEN N', ALLOW_ROW_LOCKS = OFF' END,
-                CASE WHEN i.type = 2 AND i.allow_page_locks = 0 THEN N', ALLOW_PAGE_LOCKS = OFF' END,
-                CASE WHEN i.optimize_for_sequential_key = 1 THEN N', OPTIMIZE_FOR_SEQUENTIAL_KEY = ON' END,
-                CASE WHEN p.data_compression_desc IN (N'ROW', N'PAGE', N'COLUMNSTORE_ARCHIVE') THEN N', DATA_COMPRESSION = ' + p.data_compression_desc END),
-                1, 2, N''), N'') + N')',
-            N' ON ', QUOTENAME(ds.name),
-            CASE WHEN ds.type = 'PS' THEN
-                (SELECT N'(' + QUOTENAME(c.name) + N')'
-                 FROM sys.index_columns AS ic INNER JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
-                 WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.partition_ordinal = 1) END,
-            N';')
-        FROM sys.indexes AS i
-        INNER JOIN sys.data_spaces AS ds ON ds.data_space_id = i.data_space_id
-        OUTER APPLY (SELECT TOP (1) data_compression_desc FROM sys.partitions
-                     WHERE object_id = i.object_id AND index_id = i.index_id ORDER BY partition_number) AS p
-        WHERE i.object_id = @ObjectId AND i.index_id = @IndexId;
+        SET @Undo = AIIndexTuner.fn_IndexDefinition(@ObjectId, @IndexId, 0);
 
         SET @Ddl = CONCAT(N'DROP INDEX ', QUOTENAME(@IndexName), N' ON ', @Target, N';');
 
@@ -2449,7 +2492,51 @@ BEGIN
             SET @Reason = N'The table has a clustered rowstore index. Converting it to clustered columnstore replaces that index and any primary key on it, so it is recommend-only.';
     END;
 
+    -- A widening: the replaced index must be a plain nonclustered rowstore index, and the new one must keep
+    -- its keys as its leading keys and every column it includes, so no query it served loses anything.
+    DECLARE @OldId int, @OldFilegroup sysname;
+    IF @Reason IS NULL AND @IsWidening = 1
+    BEGIN
+        DECLARE @OldType tinyint, @OldTypeDesc nvarchar(60), @OldUnique bit, @OldFilter bit, @OldDisabled bit, @OldSpaceType char(2),
+                @OldSig nvarchar(max), @NewSig nvarchar(max), @Lost nvarchar(max);
+
+        SELECT @OldId = i.index_id, @OldType = i.type, @OldTypeDesc = i.type_desc, @OldUnique = i.is_unique, @OldFilter = i.has_filter,
+               @OldDisabled = i.is_disabled, @OldSpaceType = ds.type, @OldFilegroup = ds.name
+        FROM sys.indexes AS i
+        INNER JOIN sys.data_spaces AS ds ON ds.data_space_id = i.data_space_id
+        WHERE i.object_id = @ObjectId AND i.name = @ReplacesIndex;
+
+        SET @OldSig = (SELECT STRING_AGG(CONCAT(column_id, CASE WHEN is_descending_key = 1 THEN 'D' ELSE 'A' END), ',') WITHIN GROUP (ORDER BY key_ordinal)
+                       FROM sys.index_columns WHERE object_id = @ObjectId AND index_id = @OldId AND key_ordinal > 0);
+        SET @NewSig = (SELECT STRING_AGG(CONCAT(column_id, CASE WHEN is_descending = 1 THEN 'D' ELSE 'A' END), ',') WITHIN GROUP (ORDER BY ordinal) FROM @Keys);
+        SET @Lost = (SELECT STRING_AGG(c.name, N', ') WITHIN GROUP (ORDER BY ic.index_column_id)
+                     FROM sys.index_columns AS ic INNER JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+                     WHERE ic.object_id = @ObjectId AND ic.index_id = @OldId AND ic.is_included_column = 1
+                       AND NOT EXISTS (SELECT 1 FROM @Keys AS k WHERE k.column_id = ic.column_id)
+                       AND NOT EXISTS (SELECT 1 FROM @Includes AS inc WHERE inc.column_id = ic.column_id));
+
+        IF @OldId IS NULL
+            SET @Reason = CONCAT(N'Index ', QUOTENAME(@ReplacesIndex), N', which the recommendation widens, does not exist on ', @Target, N'.');
+        ELSE IF @OldType <> 2
+            SET @Reason = CONCAT(N'Only a nonclustered rowstore index is widened here; ', QUOTENAME(@ReplacesIndex), N' is ', @OldTypeDesc, N'.');
+        ELSE IF @OldUnique = 1
+            SET @Reason = CONCAT(QUOTENAME(@ReplacesIndex), N' is unique or enforces a constraint, so widening it is left for review.');
+        ELSE IF @OldFilter = 1
+            SET @Reason = CONCAT(QUOTENAME(@ReplacesIndex), N' is filtered, so widening it is left for review.');
+        ELSE IF @OldDisabled = 1
+            SET @Reason = CONCAT(QUOTENAME(@ReplacesIndex), N' is disabled, so widening it is left for review.');
+        ELSE IF @OldSpaceType <> 'FG'
+            SET @Reason = CONCAT(QUOTENAME(@ReplacesIndex), N' is partitioned, so widening it is left for review.');
+        ELSE IF NOT (@NewSig = @OldSig OR LEFT(@NewSig, LEN(@OldSig) + 1) = @OldSig + ',')
+            SET @Reason = CONCAT(N'The new keys do not start with the keys of ', QUOTENAME(@ReplacesIndex),
+                                 N' in the same order and direction, so this is not a widening. Review the script and apply it yourself.');
+        ELSE IF @Lost IS NOT NULL
+            SET @Reason = CONCAT(N'The new index leaves out column(s) that ', QUOTENAME(@ReplacesIndex), N' includes: ', @Lost,
+                                 N'. Review the script and apply it yourself.');
+    END;
+
     -- An existing index with the same leading keys that already covers the includes makes this one redundant.
+    -- For a widening that adds nothing, that index is the one it would replace.
     IF @Reason IS NULL AND @IsColumnstore = 0
     BEGIN
         DECLARE @KeySig nvarchar(max) = (SELECT STRING_AGG(CONCAT(column_id, CASE WHEN is_descending = 1 THEN 'D' ELSE 'A' END), ',') WITHIN GROUP (ORDER BY ordinal) FROM @Keys);
@@ -2471,8 +2558,18 @@ BEGIN
             SET @Reason = CONCAT(N'Existing index ', QUOTENAME(@Covering), N' already has these leading keys and covers the included columns.');
     END;
 
-    -- Name: the model's when it is free, otherwise a generated one.
-    IF @Reason IS NULL
+    -- Name: a widening keeps the replaced index's, so hints and plans that name it still work.
+    DECLARE @Note nvarchar(4000) = NULL;
+    IF @Reason IS NULL AND @IsWidening = 1
+    BEGIN
+        SET @Note = CONCAT(N'Widened ', QUOTENAME(@ReplacesIndex), N' in place, keeping its keys and included columns.',
+                           CASE WHEN NULLIF(LTRIM(@IndexName), N'') IS NOT NULL AND @IndexName <> @ReplacesIndex
+                                THEN CONCAT(N' The recommendation named the new index ', QUOTENAME(@IndexName), N'; it keeps the name of the index it replaces.') END);
+        SET @IndexName = @ReplacesIndex;
+    END;
+
+    -- Otherwise the model's name when it is free, or a generated one.
+    IF @Reason IS NULL AND @IsWidening = 0
     BEGIN
         IF NULLIF(LTRIM(@IndexName), N'') IS NULL OR LEN(@IndexName) > 128
             SET @IndexName = LEFT(CONCAT(CASE @IndexType WHEN 'NONCLUSTERED COLUMNSTORE' THEN N'NCCI' WHEN 'CLUSTERED COLUMNSTORE' THEN N'CCI' ELSE N'IX' END,
@@ -2490,9 +2587,10 @@ BEGIN
 
     /* ----- Build the DDL from validated parts ----- */
     DECLARE @EngineEdition int = CAST(SERVERPROPERTY('EngineEdition') AS int),
-            @Options nvarchar(400) = N'';
+            @Options nvarchar(400) = CASE WHEN @IsWidening = 1 THEN N', DROP_EXISTING = ON' ELSE N'' END;
 
     -- Online index operations: Enterprise (and Developer), Azure SQL Database and Managed Instance.
+    -- With DROP_EXISTING, the old index keeps serving queries until the new one is built.
     IF @EngineEdition IN (3, 5, 8)
         SET @Options += N', ONLINE = ON';
     IF @IsColumnstore = 0 AND @FillFactor BETWEEN 1 AND 100
@@ -2515,8 +2613,11 @@ BEGIN
                                    FROM @Includes AS i INNER JOIN sys.columns AS c ON c.object_id = @ObjectId AND c.column_id = i.column_id) + N')'
              ELSE N'' END,
         CASE WHEN @Options <> N'' THEN N' WITH (' + STUFF(@Options, 1, 2, N'') + N')' ELSE N'' END,
+        CASE WHEN @IsWidening = 1 THEN N' ON ' + QUOTENAME(@OldFilegroup) ELSE N'' END,
         N';');
-    SET @Undo = CONCAT(N'DROP INDEX ', QUOTENAME(@IndexName), N' ON ', @Target, N';');
+    -- A new index is undone by dropping it; a widening by rebuilding the old definition in place.
+    SET @Undo = CASE WHEN @IsWidening = 1 THEN AIIndexTuner.fn_IndexDefinition(@ObjectId, @OldId, 1)
+                     ELSE CONCAT(N'DROP INDEX ', QUOTENAME(@IndexName), N' ON ', @Target, N';') END;
 
     BEGIN TRY
         EXEC sys.sp_executesql @Ddl;
@@ -2528,23 +2629,32 @@ BEGIN
         RETURN;
     END CATCH;
 
-    -- Tag the index so it can be found and rolled back later. The index exists either way, so a
-    -- tagging failure is noted but does not mark the recommendation Failed.
-    DECLARE @TagNote nvarchar(4000) = NULL;
+    -- Tag the index so it can be found and rolled back later. A widened index existed before, so its tag
+    -- says so: it is rolled back with its UndoDDL, not dropped. The index exists either way, so a tagging
+    -- failure is noted but does not mark the recommendation Failed.
     BEGIN TRY
-        DECLARE @Tag sql_variant = CONCAT(N'Created by aisqltuner-index-tuner, run ', @RunId, N', recommendation ', @RecommendationId, N', ', CONVERT(varchar(19), SYSDATETIME(), 120));
-        EXEC sys.sp_addextendedproperty
-            @name = N'AIIndexTuner', @value = @Tag,
-            @level0type = N'SCHEMA', @level0name = @SchemaName,
-            @level1type = N'TABLE', @level1name = @TableName,
-            @level2type = N'INDEX', @level2name = @IndexName;
+        DECLARE @Tag sql_variant = CONCAT(CASE WHEN @IsWidening = 1 THEN N'Widened' ELSE N'Created' END, N' by aisqltuner-index-tuner, run ', @RunId,
+                                          N', recommendation ', @RecommendationId, N', ', CONVERT(varchar(19), SYSDATETIME(), 120));
+        IF EXISTS (SELECT 1 FROM sys.extended_properties AS ep INNER JOIN sys.indexes AS i ON i.object_id = ep.major_id AND i.index_id = ep.minor_id
+                   WHERE ep.class = 7 AND ep.name = N'AIIndexTuner' AND i.object_id = @ObjectId AND i.name = @IndexName)
+            EXEC sys.sp_updateextendedproperty
+                @name = N'AIIndexTuner', @value = @Tag,
+                @level0type = N'SCHEMA', @level0name = @SchemaName,
+                @level1type = N'TABLE', @level1name = @TableName,
+                @level2type = N'INDEX', @level2name = @IndexName;
+        ELSE
+            EXEC sys.sp_addextendedproperty
+                @name = N'AIIndexTuner', @value = @Tag,
+                @level0type = N'SCHEMA', @level0name = @SchemaName,
+                @level1type = N'TABLE', @level1name = @TableName,
+                @level2type = N'INDEX', @level2name = @IndexName;
     END TRY
     BEGIN CATCH
-        SET @TagNote = CONCAT(N'Index created, but tagging it failed: ', ERROR_MESSAGE());
+        SET @Note = CONCAT(@Note + N' ', N'Index ', CASE WHEN @IsWidening = 1 THEN N'widened' ELSE N'created' END, N', but tagging it failed: ', ERROR_MESSAGE());
     END CATCH;
 
     UPDATE AIIndexTuner.Recommendation
-    SET Status = 'Applied', StatusReason = @TagNote, IndexName = @IndexName, IndexType = @IndexType, AppliedDDL = @Ddl, UndoDDL = @Undo,
+    SET Status = 'Applied', StatusReason = @Note, IndexName = @IndexName, IndexType = @IndexType, AppliedDDL = @Ddl, UndoDDL = @Undo,
         AppliedAt = SYSDATETIME(), AppliedBy = ORIGINAL_LOGIN()
     WHERE RecommendationId = @RecommendationId;
 END;
@@ -2567,7 +2677,8 @@ GO
     deployment, stores the recommendations in AIIndexTuner.Recommendation and returns them.
     It changes nothing in the schema.
 
-    CREATE does the same, then applies the CreateIndex recommendations that pass validation (see
+    CREATE does the same, then applies the CreateIndex recommendations, and the ConsolidateIndex
+    ones that widen an existing index in place, that pass validation (see
     AIIndexTuner.usp_ApplyRecommendation). Every other recommendation stays for you to review.
 
     Change controls (each restricts the prompt, and is enforced again when applying):
@@ -2575,7 +2686,8 @@ GO
                             1 = they may also be created; 0 = they are not recommended or created.
         @AllowDropIndex     NULL (default) index drops may be recommended but are not run;
                             1 = they may also be run; 0 = they are not recommended or run.
-        @MaxNewIndexes      at most this many new indexes are recommended and created (NULL = no limit).
+        @MaxNewIndexes      at most this many new or widened indexes are recommended and created
+                            (NULL = no limit).
 
     A recommend-only (NULL) change can be applied after review with sp_AIIndexTuner_Apply and the
     matching setting set to 1. A 0 cannot be overridden later.
@@ -2729,12 +2841,12 @@ BEGIN
 
         INSERT AIIndexTuner.Recommendation
             (RunId, Priority, PriorityLevel, Category, Title, SchemaName, TableName, IndexName, IndexType, KeyColumns, IncludeColumns, FilterPredicate,
-             IsUnique, [FillFactor], DataCompression, EstimatedSizeMB, Confidence, Rationale, BenefitingQueries, Script)
+             IsUnique, [FillFactor], DataCompression, EstimatedSizeMB, Confidence, Rationale, BenefitingQueries, Script, ReplacesIndex)
         SELECT @RunId, r.priority,
                CASE WHEN r.priority_level IN ('High', 'Medium', 'Low') THEN r.priority_level END,
                CASE WHEN r.category IN ('CreateIndex', 'DropIndex', 'ConsolidateIndex', 'RebuildIndex', 'Constraint', 'Statistics', 'Setting', 'QueryChange') THEN r.category ELSE 'Other' END,
                LEFT(r.title, 400), LEFT(r.schema_name, 128), LEFT(r.table_name, 128), LEFT(r.index_name, 128),
-               CASE WHEN r.category = 'CreateIndex'
+               CASE WHEN r.category = 'CreateIndex' OR (r.category = 'ConsolidateIndex' AND NULLIF(LTRIM(r.replaces_index), N'') IS NOT NULL)
                     THEN CASE WHEN UPPER(r.index_type) IN ('NONCLUSTERED COLUMNSTORE', 'CLUSTERED COLUMNSTORE') THEN UPPER(r.index_type) ELSE 'NONCLUSTERED' END END,
                ISNULL(r.key_columns, N'[]'), ISNULL(r.include_columns, N'[]'), LEFT(r.filter_predicate, 4000),
                r.is_unique,
@@ -2742,13 +2854,14 @@ BEGIN
                CASE WHEN UPPER(r.data_compression) IN ('NONE', 'ROW', 'PAGE') THEN UPPER(r.data_compression) END,
                TRY_CAST(r.estimated_size_mb AS decimal(18, 2)),
                CASE WHEN r.confidence IN ('High', 'Medium', 'Low') THEN r.confidence END,
-               r.rationale, r.benefiting_queries, r.script
+               r.rationale, r.benefiting_queries, r.script,
+               CASE WHEN r.category = 'ConsolidateIndex' THEN LEFT(NULLIF(LTRIM(r.replaces_index), N''), 128) END
         FROM OPENJSON(@Text, '$.recommendations')
              WITH (priority int, priority_level varchar(20), category varchar(30), title nvarchar(4000), schema_name nvarchar(4000), table_name nvarchar(4000),
                    index_name nvarchar(4000), index_type varchar(40), key_columns nvarchar(max) AS JSON, include_columns nvarchar(max) AS JSON,
                    filter_predicate nvarchar(max), is_unique bit, fill_factor int, data_compression varchar(20),
                    estimated_size_mb float, confidence varchar(20), rationale nvarchar(max),
-                   benefiting_queries nvarchar(max) AS JSON, script nvarchar(max)) AS r;
+                   benefiting_queries nvarchar(max) AS JSON, script nvarchar(max), replaces_index nvarchar(4000)) AS r;
 
         UPDATE AIIndexTuner.Run
         SET Summary = JSON_VALUE(@Text, '$.summary'), Status = 'Succeeded', CompletedAt = SYSDATETIME()
@@ -2769,14 +2882,16 @@ BEGIN
     IF @Mode = 'CREATE'
     BEGIN
         DECLARE @RecId int, @ApplyStarted datetime2(7) = SYSDATETIME();
-        -- New rowstore indexes, plus the columnstore indexes and drops this run has a setting for.
-        -- Recommend-only ones (setting NULL) stay Recommended, for review. A change the run does not
-        -- allow (0) is still passed, so that it is marked Skipped if the model recommended it anyway.
-        -- Below @MinPriority or @MinConfidence is passed too, and marked Skipped with how to apply it.
+        -- New rowstore indexes and widenings of existing ones, plus the columnstore indexes and drops
+        -- this run has a setting for. Recommend-only ones (setting NULL) stay Recommended, for review.
+        -- A change the run does not allow (0) is still passed, so that it is marked Skipped if the model
+        -- recommended it anyway. Below @MinPriority or @MinConfidence is passed too, and marked Skipped
+        -- with how to apply it.
         DECLARE apply_cur CURSOR LOCAL FAST_FORWARD FOR
             SELECT RecommendationId FROM AIIndexTuner.Recommendation
             WHERE RunId = @RunId
               AND ((Category = 'CreateIndex' AND (IndexType = 'NONCLUSTERED' OR @AllowColumnstore IS NOT NULL))
+                   OR (Category = 'ConsolidateIndex' AND ReplacesIndex IS NOT NULL)
                    OR (Category = 'DropIndex' AND @AllowDropIndex IS NOT NULL))
             ORDER BY Priority, RecommendationId;
         OPEN apply_cur;
@@ -2796,7 +2911,7 @@ BEGIN
            N'Free and open source from AI SQL Tuner. For query tuning, deadlock analysis, server health checks, code review, HTML reports or SQL Server 2022 and earlier, see AI SQL Tuner Studio: https://aisqltuner.com or https://apps.microsoft.com/detail/9P68072ZM3N5' AS MoreFrom
     FROM AIIndexTuner.Run AS r WHERE r.RunId = @RunId;
 
-    SELECT RecommendationId, Priority, PriorityLevel, Category, Title, SchemaName, TableName, IndexName, IndexType, Confidence, EstimatedSizeMB,
+    SELECT RecommendationId, Priority, PriorityLevel, Category, Title, SchemaName, TableName, IndexName, IndexType, ReplacesIndex, Confidence, EstimatedSizeMB,
            Status, StatusReason, Rationale, Script, AppliedDDL, UndoDDL
     FROM AIIndexTuner.Recommendation
     WHERE RunId = @RunId
@@ -2808,7 +2923,7 @@ GO
     dbo.sp_AIIndexTuner_Apply: apply stored recommendations after reviewing them.
 
         EXEC dbo.sp_AIIndexTuner_Apply @RecommendationId = 42;   -- one recommendation
-        EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7;               -- the new rowstore indexes of a run
+        EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7;               -- the new rowstore indexes and widenings of a run
         EXEC dbo.sp_AIIndexTuner_Apply @RecommendationId = 43, @AllowDropIndex = 1;
         EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @AllowColumnstore = 1, @AllowDropIndex = 1;
         EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @MinPriority = 'Medium', @MinConfidence = 'High';
@@ -2855,6 +2970,7 @@ BEGIN
         WHERE r.RunId = @RunId
           AND ((r.Category = 'CreateIndex' AND (ISNULL(r.IndexType, 'NONCLUSTERED') = 'NONCLUSTERED'
                                                 OR run.AllowColumnstore IS NOT NULL OR @AllowColumnstore IS NOT NULL))
+               OR (r.Category = 'ConsolidateIndex' AND r.ReplacesIndex IS NOT NULL)
                OR (r.Category = 'DropIndex' AND (run.AllowDropIndex IS NOT NULL OR @AllowDropIndex IS NOT NULL)));
 
     -- In priority order, so a @MaxNewIndexes limit keeps the most important indexes.

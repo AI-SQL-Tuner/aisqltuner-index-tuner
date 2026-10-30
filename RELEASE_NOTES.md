@@ -11,6 +11,35 @@ recommendations are kept, and it replaces the procedures and functions.
 
 ### Added
 
+- **CREATE mode widens indexes in place** (issue #26). Before, a `ConsolidateIndex`
+  recommendation was always left for review, so the same covering index was built or not depending
+  on which category the model chose. In the sqlstorm-oltp benchmark that decided between −79% and
+  −1% read reads.
+  - **New field:** `replaces_index` in the response schema, stored as
+    `AIIndexTuner.Recommendation.ReplacesIndex`. The prompt asks the model to fill it for a
+    widening: a `ConsolidateIndex` that keeps an existing nonclustered index's keys as its leading
+    keys, keeps its included columns, and adds key or included columns.
+  - **What is applied:** CREATE mode and `sp_AIIndexTuner_Apply @RunId` now apply widenings, by
+    default. The index is rebuilt in place under its own name from the validated fields, with
+    `CREATE INDEX ... WITH (DROP_EXISTING = ON)`, on its own filegroup, and online where the edition
+    allows it. The model's script is still never run.
+  - **What stays for review, with a reason:**
+    - a consolidation with no `replaces_index`;
+    - a replaced index that is clustered, unique or constraint-backed, filtered, partitioned or
+      disabled;
+    - new keys that don't start with the old ones in the same order and direction;
+    - a new index that loses an included column;
+    - a unique, filtered or columnstore new index;
+    - a script that builds a clustered index.
+  - **Change controls:** a widening counts towards `@MaxNewIndexes`, and the prompt rule for it now
+    says so. It obeys `@MinPriority` and `@MinConfidence`, and needs no `@AllowDropIndex`.
+  - **Undo and tag:** `UndoDDL` rebuilds the old definition in place, options included. The
+    `AIIndexTuner` extended property says *Widened by*, not *Created by*, so the index is rolled
+    back with its `UndoDDL`, not dropped.
+  - **New function:** `AIIndexTuner.fn_IndexDefinition` scripts an index from the catalog. It is
+    shared by the drop and widening undo scripts.
+  - **Test:** T25.
+
 - **DOP feedback and optional parameter plan optimization** (issue #17), ported from AI SQL Tuner
   Studio:
   - New section DEGREE OF PARALLELISM FEEDBACK: whether DOP feedback can run for the database and

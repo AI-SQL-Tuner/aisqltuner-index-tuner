@@ -14,7 +14,8 @@ GO
     deployment, stores the recommendations in AIIndexTuner.Recommendation and returns them.
     It changes nothing in the schema.
 
-    CREATE does the same, then applies the CreateIndex recommendations that pass validation (see
+    CREATE does the same, then applies the CreateIndex recommendations, and the ConsolidateIndex
+    ones that widen an existing index in place, that pass validation (see
     AIIndexTuner.usp_ApplyRecommendation). Every other recommendation stays for you to review.
 
     Change controls (each restricts the prompt, and is enforced again when applying):
@@ -22,7 +23,8 @@ GO
                             1 = they may also be created; 0 = they are not recommended or created.
         @AllowDropIndex     NULL (default) index drops may be recommended but are not run;
                             1 = they may also be run; 0 = they are not recommended or run.
-        @MaxNewIndexes      at most this many new indexes are recommended and created (NULL = no limit).
+        @MaxNewIndexes      at most this many new or widened indexes are recommended and created
+                            (NULL = no limit).
 
     A recommend-only (NULL) change can be applied after review with sp_AIIndexTuner_Apply and the
     matching setting set to 1. A 0 cannot be overridden later.
@@ -176,12 +178,12 @@ BEGIN
 
         INSERT AIIndexTuner.Recommendation
             (RunId, Priority, PriorityLevel, Category, Title, SchemaName, TableName, IndexName, IndexType, KeyColumns, IncludeColumns, FilterPredicate,
-             IsUnique, [FillFactor], DataCompression, EstimatedSizeMB, Confidence, Rationale, BenefitingQueries, Script)
+             IsUnique, [FillFactor], DataCompression, EstimatedSizeMB, Confidence, Rationale, BenefitingQueries, Script, ReplacesIndex)
         SELECT @RunId, r.priority,
                CASE WHEN r.priority_level IN ('High', 'Medium', 'Low') THEN r.priority_level END,
                CASE WHEN r.category IN ('CreateIndex', 'DropIndex', 'ConsolidateIndex', 'RebuildIndex', 'Constraint', 'Statistics', 'Setting', 'QueryChange') THEN r.category ELSE 'Other' END,
                LEFT(r.title, 400), LEFT(r.schema_name, 128), LEFT(r.table_name, 128), LEFT(r.index_name, 128),
-               CASE WHEN r.category = 'CreateIndex'
+               CASE WHEN r.category = 'CreateIndex' OR (r.category = 'ConsolidateIndex' AND NULLIF(LTRIM(r.replaces_index), N'') IS NOT NULL)
                     THEN CASE WHEN UPPER(r.index_type) IN ('NONCLUSTERED COLUMNSTORE', 'CLUSTERED COLUMNSTORE') THEN UPPER(r.index_type) ELSE 'NONCLUSTERED' END END,
                ISNULL(r.key_columns, N'[]'), ISNULL(r.include_columns, N'[]'), LEFT(r.filter_predicate, 4000),
                r.is_unique,
@@ -189,13 +191,14 @@ BEGIN
                CASE WHEN UPPER(r.data_compression) IN ('NONE', 'ROW', 'PAGE') THEN UPPER(r.data_compression) END,
                TRY_CAST(r.estimated_size_mb AS decimal(18, 2)),
                CASE WHEN r.confidence IN ('High', 'Medium', 'Low') THEN r.confidence END,
-               r.rationale, r.benefiting_queries, r.script
+               r.rationale, r.benefiting_queries, r.script,
+               CASE WHEN r.category = 'ConsolidateIndex' THEN LEFT(NULLIF(LTRIM(r.replaces_index), N''), 128) END
         FROM OPENJSON(@Text, '$.recommendations')
              WITH (priority int, priority_level varchar(20), category varchar(30), title nvarchar(4000), schema_name nvarchar(4000), table_name nvarchar(4000),
                    index_name nvarchar(4000), index_type varchar(40), key_columns nvarchar(max) AS JSON, include_columns nvarchar(max) AS JSON,
                    filter_predicate nvarchar(max), is_unique bit, fill_factor int, data_compression varchar(20),
                    estimated_size_mb float, confidence varchar(20), rationale nvarchar(max),
-                   benefiting_queries nvarchar(max) AS JSON, script nvarchar(max)) AS r;
+                   benefiting_queries nvarchar(max) AS JSON, script nvarchar(max), replaces_index nvarchar(4000)) AS r;
 
         UPDATE AIIndexTuner.Run
         SET Summary = JSON_VALUE(@Text, '$.summary'), Status = 'Succeeded', CompletedAt = SYSDATETIME()
@@ -216,14 +219,16 @@ BEGIN
     IF @Mode = 'CREATE'
     BEGIN
         DECLARE @RecId int, @ApplyStarted datetime2(7) = SYSDATETIME();
-        -- New rowstore indexes, plus the columnstore indexes and drops this run has a setting for.
-        -- Recommend-only ones (setting NULL) stay Recommended, for review. A change the run does not
-        -- allow (0) is still passed, so that it is marked Skipped if the model recommended it anyway.
-        -- Below @MinPriority or @MinConfidence is passed too, and marked Skipped with how to apply it.
+        -- New rowstore indexes and widenings of existing ones, plus the columnstore indexes and drops
+        -- this run has a setting for. Recommend-only ones (setting NULL) stay Recommended, for review.
+        -- A change the run does not allow (0) is still passed, so that it is marked Skipped if the model
+        -- recommended it anyway. Below @MinPriority or @MinConfidence is passed too, and marked Skipped
+        -- with how to apply it.
         DECLARE apply_cur CURSOR LOCAL FAST_FORWARD FOR
             SELECT RecommendationId FROM AIIndexTuner.Recommendation
             WHERE RunId = @RunId
               AND ((Category = 'CreateIndex' AND (IndexType = 'NONCLUSTERED' OR @AllowColumnstore IS NOT NULL))
+                   OR (Category = 'ConsolidateIndex' AND ReplacesIndex IS NOT NULL)
                    OR (Category = 'DropIndex' AND @AllowDropIndex IS NOT NULL))
             ORDER BY Priority, RecommendationId;
         OPEN apply_cur;
@@ -243,7 +248,7 @@ BEGIN
            N'Free and open source from AI SQL Tuner. For query tuning, deadlock analysis, server health checks, code review, HTML reports or SQL Server 2022 and earlier, see AI SQL Tuner Studio: https://aisqltuner.com or https://apps.microsoft.com/detail/9P68072ZM3N5' AS MoreFrom
     FROM AIIndexTuner.Run AS r WHERE r.RunId = @RunId;
 
-    SELECT RecommendationId, Priority, PriorityLevel, Category, Title, SchemaName, TableName, IndexName, IndexType, Confidence, EstimatedSizeMB,
+    SELECT RecommendationId, Priority, PriorityLevel, Category, Title, SchemaName, TableName, IndexName, IndexType, ReplacesIndex, Confidence, EstimatedSizeMB,
            Status, StatusReason, Rationale, Script, AppliedDDL, UndoDDL
     FROM AIIndexTuner.Recommendation
     WHERE RunId = @RunId
@@ -255,7 +260,7 @@ GO
     dbo.sp_AIIndexTuner_Apply: apply stored recommendations after reviewing them.
 
         EXEC dbo.sp_AIIndexTuner_Apply @RecommendationId = 42;   -- one recommendation
-        EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7;               -- the new rowstore indexes of a run
+        EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7;               -- the new rowstore indexes and widenings of a run
         EXEC dbo.sp_AIIndexTuner_Apply @RecommendationId = 43, @AllowDropIndex = 1;
         EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @AllowColumnstore = 1, @AllowDropIndex = 1;
         EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @MinPriority = 'Medium', @MinConfidence = 'High';
@@ -302,6 +307,7 @@ BEGIN
         WHERE r.RunId = @RunId
           AND ((r.Category = 'CreateIndex' AND (ISNULL(r.IndexType, 'NONCLUSTERED') = 'NONCLUSTERED'
                                                 OR run.AllowColumnstore IS NOT NULL OR @AllowColumnstore IS NOT NULL))
+               OR (r.Category = 'ConsolidateIndex' AND r.ReplacesIndex IS NOT NULL)
                OR (r.Category = 'DropIndex' AND (run.AllowDropIndex IS NOT NULL OR @AllowDropIndex IS NOT NULL)));
 
     -- In priority order, so a @MaxNewIndexes limit keeps the most important indexes.

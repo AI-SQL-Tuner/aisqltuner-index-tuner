@@ -121,6 +121,43 @@ Each write statement takes about 16 ms of CPU, so write CPU is noise and is not 
    - **Statistics scripts:** three runs wrote theirs with `USE [master]`, which the harness blocks: proc-create rep 1, proc-reviewed rep 4 and desktop rep 4. For the desktop app this is the defect reported in [AI-SQL-Tuner/aisqltuner#248](https://github.com/AI-SQL-Tuner/aisqltuner/issues/248). It shows up in the proc as well.
    - **Foreign-key re-trust:** every reviewed run re-trusted the foreign keys, without effect on this workload.
 
+## Rerun: CREATE mode with widenings (issue #26)
+
+[Issue #26](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/issues/26) lets CREATE mode apply a `ConsolidateIndex` that widens an existing index. The index is rebuilt in place under its own name with `DROP_EXISTING = ON`.
+
+**Setup:**
+- The build from [#27](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/27) was installed in `SQLStormOltp`, and the image was re-taken with `bench prepare`.
+- Matrix 9 then ran 5 `proc-create` trials on the same scenario, `gpt-5.6-luna` at `medium` effort.
+- The noise floor is still matrix 5, because the scenario and workload are unchanged.
+- The system prompt is new (hash `D6C7E42CA8C59459`), because it now asks for `replaces_index`. So the rerun's input is not identical to matrix 6's.
+
+| Trial | Read reads | Read CPU | Total time | Net index MB | How the two covering indexes were built |
+|---:|---:|---:|---:|---:|---|
+| 47 | −78.6% | −62.2% | −44.2% | 45 | Widened `IX_Posts_OwnerUserId` and `IX_Badges_UserId` in place |
+| 48 | −79.0% | −52.6% | −38.9% | 32 | Created as new indexes (*CreateIndex*) |
+| 49 | −78.6% | −60.4% | −42.8% | 45 | Widened in place |
+| 50 | −79.0% | −63.6% | −45.5% | 45 | Widened in place |
+| 51 | −79.0% | −62.9% | −43.9% | 45 | Widened in place |
+
+**Mean of 5:** −78.8% reads, −60.3% read CPU, −43.1% total time and 42 MB.
+
+| Arm | Read reads | Read CPU |
+|---|---:|---:|
+| `proc-create` before the change (matrix 6) | −32.2% | −34.3% |
+| `proc-reviewed`, every recommendation applied | −78.8% | −54.0% |
+| `proc-create` after the change (this rerun) | −78.8% | −60.3% |
+
+The proc-create and proc-reviewed CPU results differ by less than the 15.8% floor.
+
+**Every trial built both covering indexes,** whichever category the model chose:
+- `r04` fell 97.1%–97.3% in every trial, and `r07` 94.3%–94.8%.
+- No result hash changed, and no trial was flagged as suspect.
+- All 21 index scripts were applied, and none failed. The statistics, re-trust and deferred-drop recommendations stayed for review, as before.
+
+**The trials also widened other indexes.** In 4 trials the model also widened `IX_Comments_PostId`, and in 2 also `IX_PostLinks_PostId`. All of them were rebuilt in place.
+
+**Widening in place is cheaper than adding an index.** The rebuilt `IX_Posts_OwnerUserId` grew by 9 MB. In trial 48, the separate new index beside it took 11 MB, and the old foreign-key index stayed as well.
+
 ## Limits
 
 - **The tool's own foreign key in the image.** The scenario's setup requires every foreign key to be untrusted, so the image's `FK_AIIndexTuner_Recommendation_Run` was disabled and re-enabled to make it untrusted. The proc's collector leaves the `AIIndexTuner` schema out, so the proc arms never saw it. The desktop collector doesn't, and one desktop run (rep 3) re-trusted it alongside the `dbo` foreign keys. That had no effect on the workload.
