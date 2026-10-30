@@ -22,12 +22,13 @@ about Microsoft's 2006 `AutoIndex.sql` prototype: a modern version, with AI doin
 > from the [Microsoft Store](https://apps.microsoft.com/detail/9P68072ZM3N5).
 > [How they compare](#compared-with-ai-sql-tuner-studio).
 
-> **Status: prototype.** The collectors, prompt, storage and apply logic are tested against SQL
-> Server 2025 with canned model answers. The live path has also been run end to end against Azure
-> OpenAI `gpt-5.6-luna` on SQL Server 2025: collection, the background-mode call, storage, the
-> change controls and CREATE mode. See [Testing](#testing) and [Benchmark](#benchmark). Not yet run: the
-> rest of the impact benchmark (one scenario of three so far),
-> Azure SQL Database, Fabric SQL Database, and `ONLINE = ON` index builds.
+> **Status.** The collectors, prompt, storage and apply logic are tested against SQL Server 2025
+> with canned model answers. The live path has been run end to end against Azure OpenAI
+> `gpt-5.6-luna` on SQL Server 2025 Standard Developer and Enterprise Developer editions:
+> collection, the background-mode call, storage, the change controls and CREATE mode, including
+> `ONLINE = ON` index builds on Enterprise. On Enterprise it has also been benchmarked for whether
+> its recommendations are right and what applying them gains. See [Testing](#testing) and
+> [Benchmark](#benchmark). Not yet run: Azure SQL Database and Fabric SQL Database.
 
 ## Requirements
 
@@ -155,7 +156,7 @@ must also pass the change controls and safety checks. The rest are skipped with 
 stay for you to review. A recommendation the model gave no level counts as `Low`. Both levels
 are the model's own estimates, so a threshold lowers the risk but does not replace review.
 
-The levels vary between runs, as the answers do (see [Known limitations](#known-limitations-prototype)),
+The levels vary between runs, as the answers do (see [Known limitations](#known-limitations)),
 so two CREATE runs on the same database can apply different sets. In five live runs of
 `gpt-5.6-luna` on the benchmark database, with the same input:
 - the model never gave `Low` confidence, so `@MinConfidence = 'Medium'` held nothing back and only
@@ -270,7 +271,7 @@ They include:
 Statement text can contain literal values. Set `IncludeQueryText = 0` to leave it out. To see
 exactly what would be sent, run `EXEC dbo.sp_AIIndexTuner @CollectOnly = 1;`.
 
-## Known limitations (prototype)
+## Known limitations
 
 - **Claude:** Claude deployments are not supported yet.
 - **No timeouts:** T-SQL has no per-statement timeout, so a collector section cannot be cut off
@@ -364,6 +365,9 @@ Results on SQL Server 2025 Standard Developer with `gpt-5.6-luna`, medium effort
 | Change controls | With columnstore and drops disallowed and `@MaxNewIndexes = 1`, the model recommended no columnstore index, no drop and one new index |
 | CREATE mode | Created the one index that passed validation, with the model's fill factor and compression, and stored its `UndoDDL`. Other categories stayed for review. |
 | Usage window | On a few hours of usage data, the model deferred unused indexes rather than dropping them, and filed them under `Other` |
+
+The [benchmark](#benchmark) repeated the live path on SQL Server 2025 Enterprise Developer, where
+CREATE mode built its indexes with `ONLINE = ON`.
 
 ## Benchmark
 

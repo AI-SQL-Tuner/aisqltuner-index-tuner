@@ -5,7 +5,7 @@ This policy covers the open-source aisqltuner-index-tuner only. For
 
 ## Supported versions
 
-This project is a prototype. Only the latest version on `main` receives security fixes.
+Only the latest version on `main` receives security fixes.
 
 ## Reporting a vulnerability
 
