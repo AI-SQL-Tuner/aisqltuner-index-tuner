@@ -18,8 +18,9 @@
   | 6 | `proc-create`, `proc-reviewed` | 2 × 5, in randomized order | `39e21f1a65a9bbfc` (the proc's collector) | `A11117F53BDB1EA2`, the same as on the challenge scenario |
   | 7 | `desktop` | 5 | `4d92f7ab7f0331ea` (the desktop app's collector) | `3df11a761fb32f72` |
   | 8 | `naive-missing-index` | 5 | the missing-index DMV's 1 suggestion | none: no model |
+  | 11 | `stats-only` | 5 | `3695023b912818bc`: the scenario's 6 tables | none: no model |
 
-The arms are the ones described in the [challenge report](impact-20261028-VMEnt-SQL25-challenge.md#arms).
+The arms are the ones described in the [challenge report](impact-20261028-VMEnt-SQL25-challenge.md#arms). `stats-only` runs `UPDATE STATISTICS ... WITH FULLSCAN` on each table the scenario lists, and nothing else.
 
 ## Workload and protocol
 
@@ -75,6 +76,7 @@ Each write statement takes about 16 ms of CPU, so write CPU is noise and is not 
 | desktop | 4 | 40 | −78.6% | −58.9% | −44.1% | 6 | 5 / 5 | 1 / 0 | 44 |
 | desktop | 5 | 41 | −79.0% | −54.0% | −37.5% | 5 | 5 / 5 | 3 / 0 | 30 |
 | naive-missing-index | 1–5 | 42–46 | −1.0% | −9.7% to −22.9% | −4.1% to −19.2% | 1 | 1 / 1 | 1 / 0 | 13 |
+| stats-only | 1–5 | 57–61 | +0.3% | −3.7% to +0.6% | −0.4% to −2.6%; −57.1% in rep 3 | 6 | 6 / 6 | 0 / 0 | 0 |
 
 *Indexes added* counts index objects. A script that rebuilds an index under its own name, with `DROP` and then `CREATE`, adds none, which is why some trials show 1 added for 3 index scripts.
 
@@ -86,6 +88,9 @@ Each write statement takes about 16 ms of CPU, so write CPU is noise and is not 
 | **proc-reviewed** | **−78.8%** (−78.6 to −79.0) | **−54.0%** | −39.2% | 37 | ~2,320 | 26 of 26 applicable |
 | **desktop** | **−77.7%** (−72.7 to −79.0) | **−52.7%** | −38.0% | 34 | ~2,320 | 23 of 23 applicable |
 | **naive-missing-index** | **−1.0%** | **−18.6%** | −13.9% | 13 | 77 | 5 of 5 |
+| **stats-only** | **+0.3%** | **−1.8%** | −1.8% without rep 3 | 0 | — | 30 of 30 |
+
+**Fresh statistics alone change nothing measurable here.** Read CPU moved 1.8%, against a 15.8% floor. Rep 3's −57.1% total time came from its baseline: its committed writes waited far longer than in any other trial, and its reads and CPU match the other four reps.
 
 **No result hash changed** in any of the 160 hashed query comparisons (8 queries × 20 trials). **No trial was flagged as suspect.**
 
@@ -93,14 +98,14 @@ Each write statement takes about 16 ms of CPU, so write CPU is noise and is not 
 
 | Query | Baseline reads | proc-create | improved | proc-reviewed | improved | desktop | improved | naive | improved | Why |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| r01 post by id | 10,338 | +3.8% | 0/5 | +3.8% | 0/5 | +3.8% | 0/5 | +3.8% | 0/5 | The same in every arm. It follows the one index every arm created, `Votes (PostId)` |
+| r01 post by id | 10,338 | +3.8% | 0/5 | +3.8% | 0/5 | +3.8% | 0/5 | +3.8% | 0/5 | The same in every arm. `stats-only` gave +3.7%, so it follows fresh statistics on `Votes`, not an index |
 | r02 answers | 7,240 | 0% | 0/5 | 0% | 0/5 | 0% | 0/5 | 0% | 0/5 | Already served by the foreign-key index |
 | r03 latest comments | 13,535 | 0% | 0/5 | 0% | 0/5 | 0% | 0/5 | 0% | 0/5 | An ordered Comments index was applied in 4 trials (proc-reviewed reps 1 and 3, desktop reps 3 and 4) and didn't change its reads |
 | **r04 a user's latest posts** | **129,904** | −38.9% | 2/5 | **−97.2%** | 5/5 | **−95.1%** | 5/5 | **0%** | 0/5 | The workload's largest read. The fix is an ordered covering index, `Posts (OwnerUserId, CreationDate DESC, Id DESC) INCLUDE (Title, PostTypeId)`. The DMV never suggested it |
 | r05 vote tally | 3,551 | −86.3% | 5/5 | −86.2% | 5/5 | −86.3% | 5/5 | −85.9% | 5/5 | Every arm indexed `Votes.PostId`, the only thing the DMV suggested |
 | r06 user profile | 4,900 | +0.1% | 0/5 | +4.7% | 0/5 (reads up in 4) | +1.5% | 0/5 | 0% | 0/5 | A small plan change in some reviewed trials |
 | **r07 a user's badges** | **53,241** | −37.9% | 2/5 | **−94.5%** | 5/5 | **−94.6%** | 5/5 | **0%** | 0/5 | The same pattern on Badges: `Badges (UserId, Date DESC, Id DESC) INCLUDE (Name, Class)` |
-| r08 related posts | 3,981 | +10.0% | 5/5 regressed | +10.0% | 5/5 regressed | +10.0% | 5/5 regressed | +9.9% | 5/5 regressed | The same in every arm, the naive one included, so it follows `Votes (PostId)` |
+| r08 related posts | 3,981 | +10.0% | 5/5 regressed | +10.0% | 5/5 regressed | +10.0% | 5/5 regressed | +9.9% | 5/5 regressed | The same in every arm, the naive one included. `stats-only` gave +10.0% too, so it follows fresh statistics on `Votes`, not an index |
 | w01 vote insert | 3,730 | **+13.0%** | 5/5 regressed | **+12.9%** | 5/5 regressed | **+12.9%** | 5/5 regressed | **+13.0%** | 5/5 regressed | The write cost of the new `Votes (PostId)` index: each vote insert now maintains it |
 | w02 comment insert | 2,925 | 0% | — | 0% | — | 0% | — | 0% | — | |
 | w03 view count | 1,874 | 0% | — | 0% | — | 0% | — | 0% | — | |
@@ -115,7 +120,7 @@ Each write statement takes about 16 ms of CPU, so write CPU is noise and is not 
 
    This is the opposite of the challenge scenario, where the DMV's 21 suggestions got within 2.4 points of the reviewed advice. Across the two scenarios, the DMV baseline swings from strong to useless. The reviewed AI advice stays close to the best result in both.
 4. **The write cost is small and the same for every arm.** The one index that every arm created, `Votes (PostId)`, made the vote insert (`w01`) read 13% more, against a 0.6% floor. The covering indexes on `Posts` and `Badges` added no measurable write cost, because no write in this workload touches the columns they cover.
-5. **Two side effects are the same in every arm**, the naive one included, so they follow `Votes (PostId)`: `r08` read 10% more, and `r01` 3.8% more.
+5. **Two side effects are the same in every arm**, the naive one included: `r08` read 10% more, and `r01` 3.8% more. This report first put them down to the `Votes (PostId)` index. The `stats-only` arm (matrix 11) shows the same two changes with no index at all. So they follow the full-scan statistics that every new `Votes (PostId)` index brings, not the index itself.
 6. **Scripts ran cleanly:**
    - **The model arms:** every applicable script succeeded, in both proc-reviewed and desktop.
    - **Statistics scripts:** three runs wrote theirs with `USE [master]`, which the harness blocks: proc-create rep 1, proc-reviewed rep 4 and desktop rep 4. For the desktop app this is the defect reported in [AI-SQL-Tuner/aisqltuner#248](https://github.com/AI-SQL-Tuner/aisqltuner/issues/248). It shows up in the proc as well.
@@ -184,4 +189,4 @@ bench matrix      ... --models gpt-5.6-luna
 bench matrix      ... --models naive-missing-index
 ```
 
-All of the results are in the harness's `TunerBench` database on SQL25, in matrices 5 to 8.
+The `stats-only` arm runs with `--models stats-only`. All of the results are in the harness's `TunerBench` database on SQL25: matrices 5 to 8, the widening rerun in matrix 9, and `stats-only` in matrix 11.

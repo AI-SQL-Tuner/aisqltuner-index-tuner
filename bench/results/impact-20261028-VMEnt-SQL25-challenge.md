@@ -14,6 +14,7 @@
   | 2 | `proc-create`, `proc-reviewed` | 2 × 5, in randomized order | `a97961f2ec009fed` (the proc's collector) | `A11117F53BDB1EA2` |
   | 3 | `desktop` | 5 | `a03bdcce80235226` (the desktop app's collector) | `3df11a761fb32f72` |
   | 4 | `naive-missing-index` | 5 | the missing-index DMV's 21 suggestions | none: no model |
+  | 10 | `stats-only`, run on 2026-10-30 | 5 | `7a4b829f489f4108`: the scenario's 15 tables | none: no model |
 
   The harness can't put proc, desktop and naive arms in one matrix, because each answers a different input. The matrices share the snapshot, the workload, the protocol and the noise floor, and every result is a change measured within its own trial. So they compare **the two products as they run**, not two prompts on the same input.
 
@@ -25,6 +26,7 @@
 | `proc-reviewed` | `sp_AIIndexTuner @Mode = 'RECOMMEND'`, then every stored script classified and applied by the harness, the way a DBA who follows all the advice would. Scripts with no SQL, or with a Query Store call against IDs from another database, are counted as not applicable |
 | `desktop` | The desktop app's IndexTuning goal through the dev EMS, then every script in its report classified and applied the same way as `proc-reviewed` |
 | `naive-missing-index` | One nonclustered index per `sys.dm_db_missing_index_details` row for the database, keyed and included exactly as suggested: no model, no consolidation, no weighing of writes. Close to what Microsoft's 2006 AutoIndex prototype did. The suggestions are captured after the baseline, like the other arms' input, and pinned, so all 5 trials apply the same 21 indexes |
+| `stats-only` | `UPDATE STATISTICS ... WITH FULLSCAN` on each table the scenario lists, and nothing else: no model, no index. A control for how much of a gain fresh statistics alone would give |
 
 ## Workload and protocol
 
@@ -80,6 +82,7 @@ Write CPU is a few milliseconds per pass, so it is almost all noise. **The write
 | naive-missing-index | 3 | 21 | −90.1% | −73.0% | −71.6% | 8 / 0 | 21 | 21 / 21 | 2,075 |
 | naive-missing-index | 4 | 22 | −90.1% | −72.1% | −70.3% | 7 / 0 | 21 | 21 / 21 | 2,075 |
 | naive-missing-index | 5 | 23 | −90.1% | −72.9% | −71.1% | 9 / 0 | 21 | 21 / 21 | 2,075 |
+| stats-only | 1–5 | 52–56 | −0.3% | −0.3% to +0.7% | −0.3% to +0.3% | 0–2 / 0–2 | 15 | 15 / 15 | 0 |
 
 The *improved / regressed* column counts queries whose CPU moved by more than the noise floor.
 
@@ -91,8 +94,11 @@ The *improved / regressed* column counts queries whose CPU moved by more than th
 | **proc-reviewed** | **−92.5%** (−91 to −94) | **−80.7%** | −76.6% | 206 | 83 of 85 applicable | 49–57 s |
 | **desktop** | **−83.3%** (−69 to −92) | **−74.3%** | −72.4% | 465 | 55 of 61 applicable | 79–102 s |
 | **naive-missing-index** | **−90.1%** | **−72.5%** | −70.7% | **2,075** | 105 of 105 | none |
+| **stats-only** | **−0.3%** | **0.0%** | 0.0% | 0 | 75 of 75 | none |
 
-**Every arm improves by far more than the noise floor in every trial.** Even the weakest trial, proc-create rep 3, is more than 4 times the read CPU floor.
+**Fresh statistics alone change nothing measurable.** A full-scan refresh of all 15 tables moved read CPU by less than 1%, against an 11.6% floor. So none of the other arms' gains come from the statistics their new indexes bring. The one query it moved was `r08` (C9, non-SARGable): −10.6% reads in every trial. That matches the desktop and naive arms' `r08` result, so their gain there is probably the statistics, not an index.
+
+**Every model and naive arm improves by far more than the noise floor in every trial.** Even the weakest trial, proc-create rep 3, is more than 4 times the read CPU floor.
 
 **proc-reviewed is the best arm on every benefit measure.** It also adds the least index space and is the most consistent among the model arms: its read reads fall within a 3-point range, against 23 points for desktop and 34 for proc-create. The naive arm applies the same 21 indexes every time, so its spread is only measurement noise.
 
@@ -113,7 +119,7 @@ The *improved / regressed* column counts queries whose CPU moved by more than th
 | r05 | C6 overlapping suggestions | 2,071,690 | −99.8% | 5/5 | −99.9% | 5/5 | −79.9% | 4/5 | −99.7% | 5/5 | Desktop rep 2 recommended no CustomerContacts index. The naive arm created all 4 overlapping suggestions (159 MB) where one index serves |
 | r06 | C7 key order | 522,900 | −99.9% | 5/5 | −99.9% | 5/5 | −99.9% | 5/5 | −99.9% | 5/5 | |
 | r07 | C8 LOB in INCLUDE | 1,171,800 | −99.9% | 5/5 | −99.9% | 5/5 | −59.9% | 3/5 | −100.0% | 5/5 | Desktop reps 1 and 4 recommended no Documents index. The naive arm copied `Body nvarchar(max)` into INCLUDE (174 MB), as the DMV suggested |
-| r08 | C9 non-SARGable | ~272,000 | −3% | 1/5 | −2% | 1/5 | −10.6% | 3/5 | −10.9% | 5/5 | Expected: the fix is a query rewrite, and the benchmark measures the original text |
+| r08 | C9 non-SARGable | ~272,000 | −3% | 1/5 | −2% | 1/5 | −10.6% | 3/5 | −10.9% | 5/5 | Expected: the fix is a query rewrite, and the benchmark measures the original text. The `stats-only` arm got −10.6% from a statistics refresh alone |
 | r09 | C10 duplicates | 394,629 | 0% | 0/5 | −35.9% | 3/5 | −35.8% | 3/5 | −59.7% | 5/5 | The naive arm's Accounts index gave −59.7% every time. The reviewed arms reached the same figure in 3 trials, not yet traced to one script |
 | r10 | C11 already covered | 582 | 0% | 0/5 | 0% | 0/5 | 0% | 0/5 | 0% | 0/5 | Expected: nothing to do |
 | r11 | C12 heap | 3,113,214 | −80.0% | 4/5 | −99.97% | 5/5 | −99.9% | 5/5 | −99.9% | 5/5 | Every arm covers the query with an index on `BatchId`. proc-create rep 3 left it out |
@@ -163,10 +169,10 @@ The *improved / regressed* column counts queries whose CPU moved by more than th
 
 ## Limits
 
-- **One scenario and one model.** The [sqlstorm-oltp report](impact-20261030-VMEnt-SQL25-sqlstorm-oltp.md) runs the same arms on an OLTP workload. `tpch10-realistic` and the `stats-only` arm are the next slices in the issue #2 plan.
+- **One scenario and one model.** The [sqlstorm-oltp report](impact-20261030-VMEnt-SQL25-sqlstorm-oltp.md) runs the same arms on an OLTP workload, and the [tpch10-realistic report](impact-20261030-VMEnt-SQL25-tpch10-realistic.md) on a 10 GB reporting workload.
 - **Different inputs for proc and desktop.** Each answered its own collector's payload, so the comparison covers the collector, the prompt and the scripts together. It can't say which of those made the difference.
 - **A read-heavy workload.** The 3 write queries are light, so storage and index maintenance cost little here. That flatters the naive arm, whose cost shows up mainly in storage and writes.
-- **Statistics were frozen**, so none of the gain comes from fresh statistics. A `stats-only` arm would confirm that.
+- **Statistics were frozen**, so none of the gain comes from refreshing them. The `stats-only` arm (matrix 10) confirms that a full-scan refresh alone gains nothing here.
 - **Each query has equal weight (1).** The read totals are dominated by the large scans (`r05`, `r07`, `r11`), so the CPU column is the fairer headline.
 - **Write CPU is below the noise floor** and is not reported as a finding.
 - **Run cost:**
@@ -197,4 +203,4 @@ Prerequisites:
 - `sp_AIIndexTuner` installed, with `AIIndexTuner.Config` set to the `gpt-5.6-luna` deployment and `medium` effort;
 - the prerequisites in [PREREQUISITES.md](../PREREQUISITES.md).
 
-All of the results are in the harness's `TunerBench` database. Matrix 1 is the noise floor, matrix 2 holds the proc arms, matrix 3 the desktop arm, and matrix 4 the naive arm.
+All of the results are in the harness's `TunerBench` database. Matrix 1 is the noise floor, matrix 2 holds the proc arms, matrix 3 the desktop arm, matrix 4 the naive arm, and matrix 10 the stats-only arm (`--models stats-only`).
