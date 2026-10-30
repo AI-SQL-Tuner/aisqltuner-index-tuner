@@ -7,11 +7,12 @@ To upgrade, run the new [aisqltuner-index-tuner.sql](aisqltuner-index-tuner.sql)
 where the tool is installed. It adds new columns with `ALTER TABLE`, so earlier runs and
 recommendations are kept, and it replaces the procedures and functions.
 
-## Unreleased
+## 2026-10-30
 
 ### Added
 
-- **CREATE mode widens indexes in place** (issue #26). Before, a `ConsolidateIndex`
+- **CREATE mode widens indexes in place**
+  ([#27](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/27), issue #26). Before, a `ConsolidateIndex`
   recommendation was always left for review, so the same covering index was built or not depending
   on which category the model chose. In the sqlstorm-oltp benchmark that decided between −79% and
   −1% read reads.
@@ -40,8 +41,35 @@ recommendations are kept, and it replaces the procedures and functions.
     shared by the drop and widening undo scripts.
   - **Test:** T25.
 
-- **DOP feedback and optional parameter plan optimization** (issue #17), ported from AI SQL Tuner
-  Studio:
+- **Benchmark, part 2** ([#22](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/22),
+  [#23](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/23),
+  [#24](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/24),
+  [#25](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/25),
+  [#28](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/28) and
+  [#30](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/30); closes issue #2):
+  [BENCHMARK.md](BENCHMARK.md) summarizes both parts, and the reports are in
+  [bench/results/](bench/results/).
+  - **Rubric:** live batches 2 to 4 on SQL Server 2025 Enterprise Developer. Required + forbidden
+    was 91.3% before the widenings, and 95.3% and 94.7% with them.
+  - **Impact:** three scenarios (challenge, sqlstorm-oltp and tpch10-realistic), each measured
+    before and after tuning against its own noise floor. Five arms are compared: `proc-create`,
+    `proc-reviewed`, the AI SQL Tuner desktop app, one index per missing-index suggestion, and a
+    statistics refresh alone.
+
+### Changed
+
+- **No longer a prototype** ([#25](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/25)):
+  the README says the tool was tested on SQL Server 2025 Standard Developer and Enterprise
+  Developer, and benchmarked on Enterprise Developer. Azure SQL Database and Fabric SQL Database
+  have not been run yet. SECURITY.md no longer calls the project a prototype.
+
+## 2026-10-28
+
+### Added
+
+- **DOP feedback and optional parameter plan optimization**
+  ([#20](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/20), issue #17), ported from
+  AI SQL Tuner Studio:
   - New section DEGREE OF PARALLELISM FEEDBACK: whether DOP feedback can run for the database and
     every reason it cannot (`DOP_FEEDBACK` off, and whether that is its default; compatibility level
     below 160; Query Store not `READ_WRITE`), "not confirmed" on a Managed Instance whose update
@@ -54,6 +82,54 @@ recommendations are kept, and it replaces the procedures and functions.
     OPPO, and no `RECOMPILE` or rewrite for a catch-all predicate OPPO already handles.
   - The prompt's input sentence names every section of the collected input by its header.
   - Tests T20 to T23.
+
+### Fixed
+
+- **Query Store query variants** (#20, issue #17): an adaptive plan (Parameter Sensitive Plan,
+  optional parameter plan optimization) stores each query variant as its own query, with
+  `object_id` 0, and records no runtime stats for the parent's dispatcher plan. So:
+  - QUERY STORE WORKLOAD INSIGHTS split one statement's cost over its variants, ranked it too low,
+    and lost its module. It now counts each variant under its parent query, with the parent's text.
+  - A run scoped by module dependencies missed the variants, and one scoped by plan XML missed the
+    parents. Each now brings in the other.
+  - The self-exclusion by module missed variants of the tool's own statements, whose catch-all
+    filters such as `(@SchemaName IS NULL OR s.name = @SchemaName)` get variants at compatibility
+    level 170. It now uses the parent's module, in the workload and the write mix.
+  - QUERY STORE FORCED PLAN FAILURES adds `ParentQueryId` for a forced plan of a variant.
+- **`FORCE_LAST_GOOD_PLAN` scripts** (#20, found in a live run for issue #17):
+  - The model scripted the option as `ALTER DATABASE SCOPED CONFIGURATION SET FORCE_LAST_GOOD_PLAN = ON`, which
+    SQL Server rejects, in four of five live runs. The prompt now gives the statement:
+    `ALTER DATABASE [db] SET AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = ON)`.
+  - It also recommended the option on Standard Developer edition, which has no automatic tuning (error 15707).
+    On Standard and Express, AUTOMATIC TUNING OPTIONS now says the edition cannot enable it, and the prompt
+    says not to recommend it there.
+  - Test T24 runs the prompt's statement: it must turn the option on where automatic tuning exists, and fail
+    only with the edition error on Standard and Express.
+
+## 2026-10-26
+
+### Fixed
+
+- **The collector's own statements in the payload**
+  ([#19](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/19),
+  [issue #18](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/issues/18)): two kinds got
+  through the filters and were shown to the model as workload.
+  - The width sampling of wide `INCLUDE` columns, added in #13, is dynamic SQL, which has no
+    `object_id` in the plan cache or Query Store. It appeared in PLAN CACHE QUERY STATISTICS and
+    QUERY STORE WORKLOAD INSIGHTS as a query that reads the wide column. It now carries an
+    `/* AIIndexTuner collector */` marker inside the statement, where Query Store keeps it.
+  - QUERY STORE WRITE WORKLOAD MIX counted the collector's own temp-table writes, such as one
+    `INSERT #RawDensity` per statistic read. It now leaves out statements of the tool's modules
+    and internal queries, as the workload section does.
+  - Payloads collected before this fix, including pinned benchmark payloads, may include these
+    statements.
+  - T13 now checks for the sampling statement itself, and that two more collector runs leave the
+    write mix unchanged. The test workload has a query that returns `dbo.Orders.Notes`, so the
+    sampling runs.
+
+## 2026-10-25
+
+### Added
 
 - **Apply thresholds** ([#14](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/14)):
   `@MinPriority` and `@MinConfidence` on `sp_AIIndexTuner` and `sp_AIIndexTuner_Apply`. Each takes
@@ -86,45 +162,10 @@ recommendations are kept, and it replaces the procedures and functions.
   commercial desktop app. The `MoreFrom` column of `sp_AIIndexTuner`'s run result, and the install
   script's header, link to Studio's website and its
   [Microsoft Store](https://apps.microsoft.com/detail/9P68072ZM3N5) listing.
-
-### Fixed
-
-- **Query Store query variants** (issue #17): an adaptive plan (Parameter Sensitive Plan, optional
-  parameter plan optimization) stores each query variant as its own query, with `object_id` 0, and
-  records no runtime stats for the parent's dispatcher plan. So:
-  - QUERY STORE WORKLOAD INSIGHTS split one statement's cost over its variants, ranked it too low,
-    and lost its module. It now counts each variant under its parent query, with the parent's text.
-  - A run scoped by module dependencies missed the variants, and one scoped by plan XML missed the
-    parents. Each now brings in the other.
-  - The self-exclusion by module missed variants of the tool's own statements, whose catch-all
-    filters such as `(@SchemaName IS NULL OR s.name = @SchemaName)` get variants at compatibility
-    level 170. It now uses the parent's module, in the workload and the write mix.
-  - QUERY STORE FORCED PLAN FAILURES adds `ParentQueryId` for a forced plan of a variant.
-- **`FORCE_LAST_GOOD_PLAN` scripts** (found in a live run for issue #17):
-  - The model scripted the option as `ALTER DATABASE SCOPED CONFIGURATION SET FORCE_LAST_GOOD_PLAN = ON`, which
-    SQL Server rejects, in four of five live runs. The prompt now gives the statement:
-    `ALTER DATABASE [db] SET AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = ON)`.
-  - It also recommended the option on Standard Developer edition, which has no automatic tuning (error 15707).
-    On Standard and Express, AUTOMATIC TUNING OPTIONS now says the edition cannot enable it, and the prompt
-    says not to recommend it there.
-  - Test T24 runs the prompt's statement: it must turn the option on where automatic tuning exists, and fail
-    only with the edition error on Standard and Express.
-
-- **The collector's own statements in the payload**
-  ([issue #18](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/issues/18)): two kinds got
-  through the filters and were shown to the model as workload.
-  - The width sampling of wide `INCLUDE` columns, added in #13, is dynamic SQL, which has no
-    `object_id` in the plan cache or Query Store. It appeared in PLAN CACHE QUERY STATISTICS and
-    QUERY STORE WORKLOAD INSIGHTS as a query that reads the wide column. It now carries an
-    `/* AIIndexTuner collector */` marker inside the statement, where Query Store keeps it.
-  - QUERY STORE WRITE WORKLOAD MIX counted the collector's own temp-table writes, such as one
-    `INSERT #RawDensity` per statistic read. It now leaves out statements of the tool's modules
-    and internal queries, as the workload section does.
-  - Payloads collected before this fix, including pinned benchmark payloads, may include these
-    statements.
-  - T13 now checks for the sampling statement itself, and that two more collector runs leave the
-    write mix unchanged. The test workload has a query that returns `dbo.Orders.Notes`, so the
-    sampling runs.
+- **Rubric check C4-P1** ([#15](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/15),
+  issue #12) now expects a nonclustered columnstore on FactEvents, filtered or not, whose title or
+  rationale weighs the writes. The old answer, filtered to cold rows, had no evidence behind it:
+  the rows the workload updates span every date.
 
 ## 2026-10-24
 
