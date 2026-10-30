@@ -88,13 +88,15 @@ The workload has 6 reads and 2 refresh writes, from the scenario definition:
 
 ### Per arm (mean of 5)
 
-| Arm | Read reads | Read CPU | Write reads | Write CPU | Net index MB | Read points per GB | Scripts applied |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| **proc-create** | **−85.9%** | **−22.9%** | −52.4% | **−77.0%** | 6,507 | 13.5 | 20 of 91 |
-| **proc-reviewed** | **−86.1%** (−84.6 to −88.4) | **−17.2%** (−23.4 to +2.9) | −52.6% | **−79.5%** | 5,315 | 20.7 | 81 of 81 applicable |
-| **desktop** | **−84.8%** (−78.7 to −87.9) | **−12.6%** (−23.6 to +16.8) | −54.8% | **−80.9%** | 3,736 | 28.9 | 25 of 30 attempted |
-| **naive-missing-index** | **−86.1%** | **−22.6%** | −51.8% | **−76.1%** | 5,895 | 15.0 | 20 of 20 |
-| **stats-only** | **−58.5%** | **−12.9%** | −0.9% | +0.8% | 0 | — | 40 of 40 |
+| Arm | Read reads | Read CPU | Write reads | Write CPU | Total time | Net index MB | Read points per GB | Scripts applied |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **proc-create** | **−85.9%** | **−22.9%** | −52.4% | **−77.0%** | −14.2% | 6,507 | 13.5 | 20 of 91 |
+| **proc-reviewed** | **−86.1%** (−84.6 to −88.4) | **−17.2%** (−23.4 to +2.9) | −52.6% | **−79.5%** | −14.9% | 5,315 | 20.7 | 81 of 81 applicable |
+| **desktop** | **−84.8%** (−78.7 to −87.9) | **−12.6%** (−23.6 to +16.8) | −54.8% | **−80.9%** | −21.1% | 3,736 | 28.9 | 25 of 30 attempted |
+| **naive-missing-index** | **−86.1%** | **−22.6%** | −51.8% | **−76.1%** | −14.1% | 5,895 | 15.0 | 20 of 20 |
+| **stats-only** | **−58.5%** | **−12.9%** | −0.9% | +0.8% | −16.5% | 0 | — | 40 of 40 |
+
+Total time is inside its 22.2% floor for every arm, so it is shown for completeness and supports no claim.
 
 **No result hash changed** in any of the 150 hashed query comparisons (6 queries × 25 trials). **No trial was flagged as suspect.**
 

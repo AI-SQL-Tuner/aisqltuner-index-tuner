@@ -392,6 +392,8 @@ CREATE mode built its indexes with `ONLINE = ON`.
 
 ## Benchmark
 
+**[BENCHMARK.md](BENCHMARK.md) summarizes the method and every result, including the total execution time impact.**
+
 [bench/](bench/) checks whether the recommendations are right ([issue #2](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/issues/2), part 1) and what applying them gains (part 2). It builds 16 known tuning problems into a `bench` schema, including:
 - low-cardinality and skewed filters
 - 10M and 5M-row fact tables where columnstore belongs
