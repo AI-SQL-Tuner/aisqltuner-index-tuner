@@ -125,7 +125,7 @@ Bold changes are beyond the scenario's noise floor:
    - **challenge:** it is near-best on reads, at ten times the index space.
    - **sqlstorm-oltp:** it is useless. It never suggested the two ordered covering indexes that matter.
    - **tpch10-realistic:** every arm built its four suggestions.
-4. **Writes pay where they should, and can gain.** New indexes made some writes cost more: 47–100% more reads on challenge's FactEvents writes, depending on the arm,, and +13% on sqlstorm-oltp's vote insert. On tpch10-realistic the refresh writes got about 80% cheaper, because a new index serves a trigger's lookup.
+4. **Writes pay where they should, and can gain.** New indexes made some writes cost more: 47–100% more reads on challenge's FactEvents writes, depending on the arm, and +13% on sqlstorm-oltp's vote insert. On tpch10-realistic the refresh writes got about 80% cheaper, because a new index serves a trigger's lookup.
 5. **A statistics refresh alone gains nothing on two scenarios, and a lot on the third.** On tpch10-realistic it cut reads by 59%. All of that was on one query, whose plan improved once its statistics were built from a full scan instead of the default sample. No model recommended it.
 
 Reports, with per-trial and per-query results:
