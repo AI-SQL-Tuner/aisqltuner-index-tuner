@@ -413,18 +413,20 @@ It runs `sp_AIIndexTuner` against them and scores every run with 37 rubric check
 
 [bench/CASES.md](bench/CASES.md) explains each case and why its expected answer is right. [bench/PREREQUISITES.md](bench/PREREQUISITES.md) lists what a live run needs.
 
-**Impact** (part 2): each trial starts from a reverted snapshot of the database, runs a workload, tunes, applies and measures again. Two scenarios:
+**Impact** (part 2): each trial starts from a reverted snapshot of the database, runs a workload, tunes, applies and measures again. Three scenarios:
 - **challenge:** the 16-query workload over the challenge database's cases;
-- **sqlstorm-oltp:** a Stack Overflow-shaped OLTP workload of 4,000 short reads and 480 committed writes per pass.
+- **sqlstorm-oltp:** a Stack Overflow-shaped OLTP workload of 4,000 short reads and 480 committed writes per pass;
+- **tpch10-realistic:** six TPC-H-derived reports and two refresh writes on a 10 GB database, with triggers that maintain summary tables.
 
-Both ran on SQL Server 2025 Enterprise Developer, with `gpt-5.6-luna` at `medium` effort and 5 trials per arm. Mean changes:
+All three ran on SQL Server 2025 Enterprise Developer, with `gpt-5.6-luna` at `medium` effort and 5 trials per arm. Mean changes, as read logical reads / read CPU / net index space:
 
-| Arm | challenge: read reads | read CPU | net index MB | sqlstorm-oltp: read reads | read CPU | net index MB |
-|---|---:|---:|---:|---:|---:|---:|
-| `@Mode = 'CREATE'`: the proc applies its validated indexes on its own | −79% | −66% | 328 | −32% | −34% | 26 |
-| Every recommendation reviewed and applied | −93% | −81% | 206 | −79% | −54% | 37 |
-| For comparison: the AI SQL Tuner desktop app's IndexTuning goal, every script applied | −83% | −74% | 465 | −78% | −53% | 34 |
-| Baseline: one index per missing-index DMV suggestion, as suggested | −90% | −72% | 2,075 | −1% | −19% | 13 |
+| Arm | challenge | sqlstorm-oltp | tpch10-realistic |
+|---|---|---|---|
+| `@Mode = 'CREATE'`: the proc applies its validated indexes on its own | −79% / −66% / 328 MB | −32% / −34% / 26 MB | −86% / −23% / 6.4 GB |
+| Every recommendation reviewed and applied | −93% / −81% / 206 MB | −79% / −54% / 37 MB | −86% / −17% / 5.2 GB |
+| For comparison: the AI SQL Tuner desktop app's IndexTuning goal, every script applied | −83% / −74% / 465 MB | −78% / −53% / 34 MB | −85% / −13% / 3.6 GB |
+| Baseline: one index per missing-index DMV suggestion, as suggested | −90% / −72% / 2,075 MB | −1% / −19% / 13 MB | −86% / −23% / 5.8 GB |
+| Control: a full-scan statistics refresh, and no index | −0.3% / 0% / none | +0.3% / −2% / none | −59% / −13% / none |
 
 **No query returned different results.**
 
@@ -432,9 +434,14 @@ Both ran on SQL Server 2025 Enterprise Developer, with `gpt-5.6-luna` at `medium
 - **challenge:** most of the gap between the two proc rows comes from the filtered and columnstore indexes, which CREATE mode leaves for review.
 - **sqlstorm-oltp:** in 3 of 5 runs, the model filed the two covering indexes that matter as replacements of existing indexes (*ConsolidateIndex*). CREATE mode didn't apply that category then. In the other 2 runs it filed them as new indexes, and CREATE mode got the full −79%. CREATE mode now widens such indexes in place ([issue #26](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/issues/26)). In a rerun of 5 CREATE-mode trials, it built both indexes every time, for −78.8% reads and −60.3% read CPU, the same as applying every recommendation.
 
-**The DMV baseline swings from strong to useless.** On the challenge scenario it nearly matches the reviewed advice on reads, at ten times the index space. On sqlstorm-oltp it suggested a single index, and reads barely moved.
+**The DMV baseline swings from strong to useless.** On the challenge scenario it nearly matches the reviewed advice on reads, at ten times the index space. On sqlstorm-oltp it suggested a single index, and reads barely moved. On tpch10-realistic, every arm built the DMV's four indexes, so all of them landed within a point and a half on reads.
 
-Reports: [challenge](bench/results/impact-20261028-VMEnt-SQL25-challenge.md), [sqlstorm-oltp](bench/results/impact-20261030-VMEnt-SQL25-sqlstorm-oltp.md).
+**tpch10-realistic:**
+- **The writes got cheaper.** The refresh writes cost about 80% less CPU after tuning. A trigger on `orders` recounts each customer's orders, and the new `orders (o_custkey, o_orderdate)` index turns its scan into a seek.
+- **Compression cost CPU.** Runs that page- or row-compressed the new indexes used a third of the space. But one report query's CPU rose by up to 113%, which cancelled the read CPU gain in two runs.
+- **Statistics alone did a lot.** A full-scan statistics refresh got two-thirds of the read reduction with no index. On the other two scenarios it changed nothing.
+
+Reports: [challenge](bench/results/impact-20261028-VMEnt-SQL25-challenge.md), [sqlstorm-oltp](bench/results/impact-20261030-VMEnt-SQL25-sqlstorm-oltp.md), [tpch10-realistic](bench/results/impact-20261030-VMEnt-SQL25-tpch10-realistic.md).
 
 `sp_AIIndexTuner @CollectedData = N'…'` runs the model on supplied diagnostics instead of collecting them, for example a run's `AIIndexTuner.Run.CollectedData`. The benchmark uses it so that every iteration answers the same input. `AIIndexTuner.Run` records the payload's SHA-256, collection and model time, apply time, and the number of background polls.
 
