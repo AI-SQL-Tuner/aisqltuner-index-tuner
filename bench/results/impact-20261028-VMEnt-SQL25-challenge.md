@@ -138,7 +138,8 @@ The *improved / regressed* column counts queries whose CPU moved by more than th
    - **Some of its scripts don't run.** 6 of its 61 applicable scripts failed, against 2 of 85 for proc-reviewed:
      - 4 of 5 trials wrote last-good-plan correction as `ALTER DATABASE SCOPED CONFIGURATION SET FORCE_LAST_GOOD_PLAN = ON`, or as part of `ALTER DATABASE ... SET`. That isn't valid syntax. The proc writes the correct `SET AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = ON)`.
      - Two columnstore scripts failed: one with an unclosed quotation mark, and one with no key list for a nonclustered columnstore index. The second cost rep 3 its C3 gain.
-     - One script started with `USE [master]`, so the harness blocked it.
+
+     One more script started with `USE [master]`. The harness blocked it before applying it, so it isn't counted among the 61 applicable scripts.
    - **It writes more expensive indexes.** Of the three model arms, it added the most space and taxed the FactEvents writes the most: +95% reads on `w02`, nearly tripled in 2 trials.
 4. **Creating every missing-index suggestion is a strong baseline on reads, and that is what the AI arms have to beat.** On this workload it came within 2.4 points of proc-reviewed on reads (−90.1% against −92.5%), and it beat proc-create and desktop. The AI arms' advantage is elsewhere:
    - **Storage:** the naive arm added **2,075 MB**, ten times proc-reviewed's 206 MB. That is 44 read points per GB, against about 910.
