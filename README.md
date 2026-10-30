@@ -111,6 +111,7 @@ can apply what it finds.
      `Statistics`, `Setting`, `QueryChange` or `Other`)
    - for a new index, its type (`NONCLUSTERED`, `NONCLUSTERED COLUMNSTORE` or
      `CLUSTERED COLUMNSTORE`)
+   - for a consolidation that widens an existing index, the index it replaces (`ReplacesIndex`)
    - table, keys, includes, compression and fill factor
    - priority: `Priority` ranks the recommendations (1 is the most important), and
      `PriorityLevel` is `High`, `Medium` or `Low`
@@ -119,6 +120,9 @@ can apply what it finds.
    - the model's script
 4. **Applies** (with `@Mode = 'CREATE'`, or later with `sp_AIIndexTuner_Apply`):
    - new nonclustered rowstore indexes
+   - widenings: a `ConsolidateIndex` that keeps an existing nonclustered index's keys as its leading
+     keys and its included columns, and adds columns. It is rebuilt in place under its own name with
+     `DROP_EXISTING = ON` (see [Apply-mode safety](#apply-mode-safety))
    - new columnstore indexes, when `@AllowColumnstore = 1`
    - index drops, when `@AllowDropIndex = 1`
 
@@ -136,8 +140,8 @@ cannot make the change.
 | `@AllowColumnstore` | Columnstore indexes may be recommended, but are not created | Also created | Not recommended or created |
 | `@AllowDropIndex` | Index drops may be recommended, but are not run | Also run | Not recommended or run |
 
-`@MaxNewIndexes` (default `NULL`, no limit) asks for at most that many new indexes, and creates at
-most that many, in priority order. `0` asks for none.
+`@MaxNewIndexes` (default `NULL`, no limit) asks for at most that many new or widened indexes, and
+creates or widens at most that many, in priority order. `0` asks for none.
 
 A run's settings are stored in `AIIndexTuner.Run`. A recommend-only (`NULL`) change can be applied
 after review by passing the setting to `sp_AIIndexTuner_Apply`. A `0` cannot be overridden later:
@@ -191,8 +195,8 @@ EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @MinPriority = 'Low', @MinConfidence 
 ### Apply-mode safety
 
 - **The model's script is never executed.** Plan cache text goes into the prompt, so a crafted
-  query could try to steer what the model writes. The proc builds the `CREATE INDEX` or
-  `DROP INDEX` itself:
+  query could try to steer what the model writes. The proc builds the `CREATE INDEX`,
+  `CREATE INDEX ... WITH (DROP_EXISTING = ON)` or `DROP INDEX` itself:
   - It uses only the structured fields.
   - It checks every table and column against the catalog.
   - It quotes every name with `QUOTENAME`.
@@ -218,14 +222,29 @@ EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @MinPriority = 'Low', @MinConfidence 
     also needs the error log to confirm the period, which takes securityadmin or sysadmin and doesn't
     work inside `INSERT ... EXEC`. On Azure SQL Database a failover can reset the statistics without
     a trace, so the 7 days are counted from the times it can see.
+- **Widenings it refuses, each with a reason:**
+  - a consolidation that doesn't name the index it replaces (`replaces_index`), such as a merge of
+    two indexes or a new clustered index
+  - a replaced index that is clustered, unique or backs a constraint, filtered, partitioned or
+    disabled
+  - new keys that don't start with the replaced index's keys, in the same order and direction
+  - a new index that leaves out a column the replaced index includes
+  - a unique, filtered or columnstore new index, or a script that builds a clustered index
+- **How it widens:** in place, under the replaced index's name, with `DROP_EXISTING = ON` on the
+  same filegroup. The old index keeps serving queries until the new one is built, and hints and plan
+  guides that name it keep working. A widening counts towards `@MaxNewIndexes` but needs no
+  `@AllowDropIndex`, because the old index's keys and columns all survive.
 - **What it adds:** `ONLINE = ON` where the edition supports it (Enterprise, Azure SQL Database,
   Managed Instance).
 - **Tagging:** each index it creates gets the extended property `AIIndexTuner`, naming the run and
-  the recommendation.
+  the recommendation. A widened index existed before, so its tag says *Widened by*: roll it back with
+  its `UndoDDL`, not by dropping it.
 - **Undo:** each applied recommendation stores `UndoDDL`:
   - for a created index, the `DROP INDEX`
   - for a dropped index, the `CREATE INDEX` that restores it from the catalog: keys, includes,
     filter, options, compression and filegroup or partition scheme
+  - for a widened index, the same definition with `DROP_EXISTING = ON`, which rebuilds the old
+    index in place
 
 ```sql
 -- Review, then apply one recommendation or a whole run
@@ -329,6 +348,8 @@ The tests use `@TestResponse` canned model answers, so they need no AI endpoint.
 - change controls: their prompt rules, their enforcement when the model ignores them, columnstore
   creation, the drop safety checks, `UndoDDL` restoring each change, and applying recommend-only
   changes after review
+- widenings: an index rebuilt in place under its own name and restored by its `UndoDDL`, every case
+  that stays for review, and a widening counting towards `@MaxNewIndexes`
 - apply thresholds: `@MinPriority` and `@MinConfidence` holding back lower recommendations, a
   recommendation with no level counting as `Low`, and applying held-back ones after review
 - idempotent reruns
@@ -409,7 +430,7 @@ Both ran on SQL Server 2025 Enterprise Developer, with `gpt-5.6-luna` at `medium
 
 **What CREATE mode leaves on the table:**
 - **challenge:** most of the gap between the two proc rows comes from the filtered and columnstore indexes, which CREATE mode leaves for review.
-- **sqlstorm-oltp:** in 3 of 5 runs, the model filed the two covering indexes that matter as replacements of existing indexes (*ConsolidateIndex*). CREATE mode doesn't apply that category. In the other 2 runs it filed them as new indexes, and CREATE mode got the full −79%.
+- **sqlstorm-oltp:** in 3 of 5 runs, the model filed the two covering indexes that matter as replacements of existing indexes (*ConsolidateIndex*). CREATE mode didn't apply that category then. In the other 2 runs it filed them as new indexes, and CREATE mode got the full −79%. CREATE mode now applies such widenings ([issue #26](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/issues/26)); the benchmark has not been rerun since.
 
 **The DMV baseline swings from strong to useless.** On the challenge scenario it nearly matches the reviewed advice on reads, at ten times the index space. On sqlstorm-oltp it suggested a single index, and reads barely moved.
 

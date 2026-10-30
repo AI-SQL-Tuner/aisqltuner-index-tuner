@@ -70,10 +70,11 @@ BEGIN
         N'For CreateIndex, fill schema_name, table_name, index_name, index_type (NONCLUSTERED for a rowstore index, NONCLUSTERED COLUMNSTORE or CLUSTERED COLUMNSTORE), key_columns (in key order, each with descending), include_columns, filter_predicate (null unless the index is filtered), is_unique, fill_factor (null to use the default), data_compression (NONE, ROW, PAGE, or null to leave it unset) and estimated_size_mb, using object and column names exactly as they appear in the input, without brackets. ',
         N'For a nonclustered columnstore index, list its columns in key_columns with descending false and leave include_columns empty. For a clustered columnstore index, leave key_columns and include_columns empty. A columnstore index takes no is_unique, fill_factor or data_compression: use false and null. ',
         N'For DropIndex, fill schema_name, table_name and index_name with the index to drop, and estimated_size_mb. Use DropIndex only for a nonclustered index to drop now that does not enforce a primary key or unique constraint; put a change to a clustered index or constraint under ConsolidateIndex, and an index to confirm after a longer observation period under Other. ',
+        N'A ConsolidateIndex that widens one existing nonclustered rowstore index, keeping that index''s key columns as its leading keys in the same order and direction, keeping every column it includes, and adding key or included columns, is a widening. For a widening, set replaces_index to the existing index''s name and index_name to the same name, because the index is rebuilt in place under its own name, and fill the other fields as for CreateIndex with the complete new definition: every key column, the existing ones first, and every included column, the existing ones too. Script it as one CREATE INDEX ... WITH (DROP_EXISTING = ON). For every other recommendation, replaces_index is null. ',
         N'schema_name is always a schema that appears in the input, never the database name; it is null for a database or server setting. ',
         N'For the other categories, fill schema_name, table_name and index_name when the recommendation is about one object, fill estimated_size_mb when it changes index storage, use null for index_type and false for is_unique, and use empty arrays and null for the other fields that do not apply. ',
         N'confidence is High, Medium or Low: how sure you are, from the evidence in the input, that the change is correct and helps as described. rationale gives the evidence from the input. benefiting_queries lists the plan cache and Query Store statements that benefit, each by the QueryHash or Query Store QueryId the input reports for it (for example 0x1A2B3C4D5E6F7A8B or query_id 42), or by a short excerpt when it has neither, or is empty. ',
-        N'script is the complete T-SQL that implements the recommendation, or an empty string when there is nothing to run. For CreateIndex and DropIndex it creates or drops exactly the index the other fields describe, with the same names, columns and options. Do not put rollback, validation, diagnostic or monitoring scripts in it.');
+        N'script is the complete T-SQL that implements the recommendation, or an empty string when there is nothing to run. For CreateIndex and DropIndex it creates or drops exactly the index the other fields describe, with the same names, columns and options, and for a widening it rebuilds exactly that index with DROP_EXISTING = ON. Do not put rollback, validation, diagnostic or monitoring scripts in it.');
 END;
 GO
 
@@ -99,9 +100,9 @@ BEGIN
         CASE WHEN @AllowDropIndex = 0 THEN
             N'Do not recommend dropping or disabling any existing index, either on its own (DropIndex) or as part of a consolidation; widening an index with CREATE INDEX ... WITH (DROP_EXISTING = ON) is still allowed. You may name unused or redundant indexes in the summary, as candidates to review later. ' END,
         CASE WHEN @MaxNewIndexes = 0 THEN
-            N'Do not recommend any new indexes (CreateIndex). You may name the most valuable ones in the summary. '
+            N'Do not recommend any new indexes (CreateIndex) or widenings of existing ones (ConsolidateIndex with replaces_index). You may name the most valuable ones in the summary. '
              WHEN @MaxNewIndexes > 0 THEN
-            CONCAT(N'Recommend at most ', @MaxNewIndexes, N' new indexes (CreateIndex), choosing those with the greatest benefit, and give them the highest priorities. You may name others in the summary. ') END);
+            CONCAT(N'Recommend at most ', @MaxNewIndexes, N' new indexes (CreateIndex) and widenings of existing ones (ConsolidateIndex with replaces_index) in total, choosing those with the greatest benefit, and give them the highest priorities. You may name others in the summary. ') END);
 END;
 GO
 
@@ -122,7 +123,7 @@ BEGIN
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["priority", "priority_level", "category", "title", "schema_name", "table_name", "index_name", "index_type", "key_columns", "include_columns",
+        "required": ["priority", "priority_level", "category", "title", "schema_name", "table_name", "index_name", "replaces_index", "index_type", "key_columns", "include_columns",
                      "filter_predicate", "is_unique", "fill_factor", "data_compression", "estimated_size_mb", "confidence",
                      "rationale", "benefiting_queries", "script"],
         "properties": {
@@ -133,6 +134,7 @@ BEGIN
           "schema_name": { "type": ["string", "null"] },
           "table_name": { "type": ["string", "null"] },
           "index_name": { "type": ["string", "null"] },
+          "replaces_index": { "type": ["string", "null"] },
           "index_type": { "type": ["string", "null"], "enum": ["NONCLUSTERED", "NONCLUSTERED COLUMNSTORE", "CLUSTERED COLUMNSTORE", null] },
           "key_columns": {
             "type": "array",

@@ -944,5 +944,149 @@ PRINT CONCAT('PASS T24: the FORCE_LAST_GOOD_PLAN statement the prompt gives ',
              '; the scoped configuration form is rejected');
 GO
 
+/* ===== T25: CREATE mode widens an existing index in place (issue #26) =====
+   A ConsolidateIndex that names the index it replaces, keeps its keys as the leading keys and keeps its
+   included columns is rebuilt under the old name with DROP_EXISTING, and its UndoDDL puts the old
+   definition back. Everything else a consolidation can be stays for review, with a reason. */
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_T25_Narrow')
+    CREATE INDEX IX_T25_Narrow ON dbo.Orders (CustomerId) INCLUDE (Status) WITH (FILLFACTOR = 95);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_T25_Order')
+    CREATE INDEX IX_T25_Order ON dbo.Orders (OrderDate) INCLUDE (TotalDue);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_T25_Filtered')
+    CREATE INDEX IX_T25_Filtered ON dbo.Orders (Status) WHERE Status = 2;
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_T25_Unique')
+    CREATE UNIQUE INDEX IX_T25_Unique ON dbo.Customers (Email);
+GO
+CREATE TABLE #T25 (Name varchar(20) PRIMARY KEY, Body nvarchar(max));
+INSERT #T25 VALUES ('widen', N'{"summary": "widenings", "recommendations": [
+  {"priority": 1, "category": "ConsolidateIndex", "title": "Widen the CustomerId index", "schema_name": "dbo", "table_name": "Orders",
+   "index_name": "IX_T25_Wide", "replaces_index": "IX_T25_Narrow", "index_type": "NONCLUSTERED",
+   "key_columns": [{"column": "CustomerId", "descending": false}, {"column": "OrderDate", "descending": true}], "include_columns": ["Status", "TotalDue"],
+   "filter_predicate": null, "is_unique": false, "fill_factor": null, "data_compression": null, "confidence": "High", "rationale": "t",
+   "script": "DROP INDEX IX_T25_Narrow ON dbo.Orders; CREATE NONCLUSTERED INDEX IX_T25_Narrow ON dbo.Orders (CustomerId, OrderDate DESC) INCLUDE (Status, TotalDue);"},
+  {"priority": 2, "category": "ConsolidateIndex", "title": "Unique", "schema_name": "dbo", "table_name": "Customers",
+   "index_name": "IX_T25_Unique", "replaces_index": "IX_T25_Unique", "index_type": "NONCLUSTERED",
+   "key_columns": [{"column": "Email", "descending": false}, {"column": "Region", "descending": false}], "include_columns": [],
+   "filter_predicate": null, "is_unique": false, "confidence": "Medium", "rationale": "t", "script": ""},
+  {"priority": 3, "category": "ConsolidateIndex", "title": "Filtered", "schema_name": "dbo", "table_name": "Orders",
+   "index_name": "IX_T25_Filtered", "replaces_index": "IX_T25_Filtered", "index_type": "NONCLUSTERED",
+   "key_columns": [{"column": "Status", "descending": false}, {"column": "OrderDate", "descending": false}], "include_columns": [],
+   "filter_predicate": null, "is_unique": false, "confidence": "Medium", "rationale": "t", "script": ""},
+  {"priority": 4, "category": "ConsolidateIndex", "title": "Not a prefix", "schema_name": "dbo", "table_name": "Orders",
+   "index_name": "IX_T25_Order", "replaces_index": "IX_T25_Order", "index_type": "NONCLUSTERED",
+   "key_columns": [{"column": "Status", "descending": false}, {"column": "OrderDate", "descending": false}], "include_columns": ["TotalDue"],
+   "filter_predicate": null, "is_unique": false, "confidence": "Medium", "rationale": "t", "script": ""},
+  {"priority": 5, "category": "ConsolidateIndex", "title": "Loses an include", "schema_name": "dbo", "table_name": "Orders",
+   "index_name": "IX_T25_Order", "replaces_index": "IX_T25_Order", "index_type": "NONCLUSTERED",
+   "key_columns": [{"column": "OrderDate", "descending": false}, {"column": "Status", "descending": false}], "include_columns": [],
+   "filter_predicate": null, "is_unique": false, "confidence": "Medium", "rationale": "t", "script": ""},
+  {"priority": 6, "category": "ConsolidateIndex", "title": "Merge two indexes", "schema_name": "dbo", "table_name": "Customers",
+   "index_name": "IX_Customers_Region", "replaces_index": null, "index_type": null,
+   "key_columns": [{"column": "Region", "descending": false}], "include_columns": ["Email"],
+   "filter_predicate": null, "is_unique": false, "confidence": "Medium", "rationale": "t", "script": ""},
+  {"priority": 7, "category": "ConsolidateIndex", "title": "Missing", "schema_name": "dbo", "table_name": "Orders",
+   "index_name": "IX_T25_Nope", "replaces_index": "IX_T25_Nope", "index_type": "NONCLUSTERED",
+   "key_columns": [{"column": "OrderDate", "descending": false}], "include_columns": ["TotalDue", "Status"],
+   "filter_predicate": null, "is_unique": false, "confidence": "Low", "rationale": "t", "script": ""},
+  {"priority": 8, "category": "ConsolidateIndex", "title": "Clustered", "schema_name": "dbo", "table_name": "Orders",
+   "index_name": "IX_T25_Order", "replaces_index": "IX_T25_Order", "index_type": "NONCLUSTERED",
+   "key_columns": [{"column": "OrderDate", "descending": false}], "include_columns": ["TotalDue", "Status"],
+   "filter_predicate": null, "is_unique": false, "confidence": "Low", "rationale": "t",
+   "script": "CREATE CLUSTERED INDEX IX_T25_Order ON dbo.Orders (OrderDate) WITH (DROP_EXISTING = ON);"},
+  {"priority": 9, "category": "ConsolidateIndex", "title": "Primary key", "schema_name": "dbo", "table_name": "Orders",
+   "index_name": "PK_Orders", "replaces_index": "PK_Orders", "index_type": "NONCLUSTERED",
+   "key_columns": [{"column": "OrderId", "descending": false}, {"column": "Status", "descending": false}], "include_columns": [],
+   "filter_predicate": null, "is_unique": false, "confidence": "Low", "rationale": "t", "script": ""},
+  {"priority": 10, "category": "ConsolidateIndex", "title": "Columnstore", "schema_name": "dbo", "table_name": "Orders",
+   "index_name": "IX_T25_Order", "replaces_index": "IX_T25_Order", "index_type": "NONCLUSTERED COLUMNSTORE",
+   "key_columns": [{"column": "OrderDate", "descending": false}, {"column": "TotalDue", "descending": false}], "include_columns": [],
+   "filter_predicate": null, "is_unique": false, "confidence": "Low", "rationale": "t", "script": ""}]}');
+INSERT #T25 VALUES ('limit', N'{"summary": "limit", "recommendations": [
+  {"priority": 1, "category": "ConsolidateIndex", "title": "Widen", "schema_name": "dbo", "table_name": "Orders",
+   "index_name": "IX_T25_Narrow", "replaces_index": "IX_T25_Narrow", "index_type": "NONCLUSTERED",
+   "key_columns": [{"column": "CustomerId", "descending": false}], "include_columns": ["Status", "TotalDue"],
+   "filter_predicate": null, "is_unique": false, "confidence": "High", "rationale": "t", "script": ""},
+  {"priority": 2, "category": "CreateIndex", "title": "New", "schema_name": "dbo", "table_name": "Customers",
+   "index_name": "IX_T25_New", "index_type": "NONCLUSTERED",
+   "key_columns": [{"column": "CustomerName", "descending": false}], "include_columns": [],
+   "filter_predicate": null, "is_unique": false, "confidence": "High", "rationale": "t", "script": ""}]}');
+
+DECLARE @Answer nvarchar(max) = (SELECT Body FROM #T25 WHERE Name = 'widen');
+EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @TestResponse = @Answer;
+
+DECLARE @RunId int = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
+DECLARE @Expected TABLE (Priority int PRIMARY KEY, Status varchar(20), ReasonLike nvarchar(400));
+INSERT @Expected VALUES
+    (1, 'Applied', N'Widened \[IX\_T25\_Narrow\] in place, keeping its keys and included columns. The recommendation named the new index \[IX\_T25\_Wide\]; it keeps the name of the index it replaces.'),
+    (2, 'Skipped', N'\[IX\_T25\_Unique\] is unique or enforces a constraint, so widening it is left for review.'),
+    (3, 'Skipped', N'\[IX\_T25\_Filtered\] is filtered, so widening it is left for review.'),
+    (4, 'Skipped', N'The new keys do not start with the keys of \[IX\_T25\_Order\] in the same order and direction%'),
+    (5, 'Skipped', N'The new index leaves out column(s) that \[IX\_T25\_Order\] includes: TotalDue.%'),
+    (6, 'Recommended', NULL),
+    (7, 'Skipped', N'Index \[IX\_T25\_Nope\], which the recommendation widens, does not exist on \[dbo\].\[Orders\].'),
+    (8, 'Skipped', N'The script creates a clustered index%'),
+    (9, 'Skipped', N'Only a nonclustered rowstore index is widened here; \[PK\_Orders\] is CLUSTERED.'),
+    (10, 'Skipped', N'Only a nonclustered rowstore index is widened here; a columnstore index is recommended under CreateIndex.');
+IF EXISTS (SELECT 1 FROM @Expected AS e
+           LEFT JOIN AIIndexTuner.Recommendation AS r ON r.RunId = @RunId AND r.Priority = e.Priority
+           WHERE r.Status IS NULL OR r.Status <> e.Status
+              OR (e.ReasonLike IS NOT NULL AND ISNULL(r.StatusReason, N'') NOT LIKE e.ReasonLike ESCAPE N'\'))
+BEGIN
+    SELECT e.Priority, e.Status AS Expected, r.Status AS Actual, r.StatusReason, r.AppliedDDL
+    FROM @Expected AS e LEFT JOIN AIIndexTuner.Recommendation AS r ON r.RunId = @RunId AND r.Priority = e.Priority;
+    THROW 50999, N'FAIL T25: statuses differ from expected (see the result set above).', 1;
+END;
+
+-- Rebuilt in place from the validated fields: the old name, DROP_EXISTING, the old filegroup, no second index.
+DECLARE @Ddl nvarchar(max) = (SELECT AppliedDDL FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 1);
+IF @Ddl NOT LIKE N'CREATE NONCLUSTERED INDEX \[IX\_T25\_Narrow\] ON \[dbo\].\[Orders\] (\[CustomerId\] ASC, \[OrderDate\] DESC) INCLUDE (\[Status\], \[TotalDue\]) WITH (DROP\_EXISTING = ON%) ON \[PRIMARY\];' ESCAPE N'\'
+   OR EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_T25_Wide')
+   OR (SELECT COUNT(*) FROM sys.index_columns WHERE object_id = OBJECT_ID(N'dbo.Orders') AND index_id = INDEXPROPERTY(OBJECT_ID(N'dbo.Orders'), N'IX_T25_Narrow', 'IndexID')) <> 4
+   OR (SELECT IndexName FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 1) <> N'IX_T25_Narrow'
+BEGIN
+    SELECT @Ddl AS AppliedDDL;
+    THROW 50999, N'FAIL T25: the widening was not rebuilt in place from the validated fields (see the result set above).', 1;
+END;
+IF NOT EXISTS (SELECT 1 FROM sys.extended_properties
+               WHERE class = 7 AND major_id = OBJECT_ID(N'dbo.Orders') AND name = N'AIIndexTuner'
+                 AND minor_id = INDEXPROPERTY(OBJECT_ID(N'dbo.Orders'), N'IX_T25_Narrow', 'IndexID')
+                 AND CAST(value AS nvarchar(400)) LIKE N'Widened by aisqltuner-index-tuner%')
+    THROW 50999, N'FAIL T25: the widened index is not tagged as widened.', 1;
+
+-- A consolidation that does not name what it replaces explains how to apply it.
+DECLARE @MergeId int = (SELECT RecommendationId FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 6);
+INSERT #Applied EXEC dbo.sp_AIIndexTuner_Apply @RecommendationId = @MergeId;
+IF (SELECT StatusReason FROM AIIndexTuner.Recommendation WHERE RecommendationId = @MergeId) NOT LIKE N'ConsolidateIndex is applied only when it widens one existing index%'
+    THROW 50999, N'FAIL T25: a consolidation without replaces_index was not left for review with a reason.', 1;
+
+-- The UndoDDL rebuilds the old definition in place, options included.
+DECLARE @Undo nvarchar(max) = (SELECT UndoDDL FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 1);
+IF @Undo <> N'CREATE NONCLUSTERED INDEX [IX_T25_Narrow] ON [dbo].[Orders] ([CustomerId] ASC) INCLUDE ([Status]) WITH (FILLFACTOR = 95, DROP_EXISTING = ON) ON [PRIMARY];'
+BEGIN
+    SELECT @Undo AS UndoDDL;
+    THROW 50999, N'FAIL T25: unexpected UndoDDL for the widening (see the result set above).', 1;
+END;
+EXEC sys.sp_executesql @Undo;
+IF (SELECT COUNT(*) FROM sys.index_columns WHERE object_id = OBJECT_ID(N'dbo.Orders') AND index_id = INDEXPROPERTY(OBJECT_ID(N'dbo.Orders'), N'IX_T25_Narrow', 'IndexID')) <> 2
+   OR (SELECT fill_factor FROM sys.indexes WHERE object_id = OBJECT_ID(N'dbo.Orders') AND name = N'IX_T25_Narrow') <> 95
+    THROW 50999, N'FAIL T25: the UndoDDL did not restore the old index.', 1;
+
+-- A widening counts as a new index for @MaxNewIndexes.
+SET @Answer = (SELECT Body FROM #T25 WHERE Name = 'limit');
+EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @TestResponse = @Answer, @MaxNewIndexes = 1;
+SET @RunId = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
+IF (SELECT Status FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 1) <> 'Applied'
+   OR (SELECT StatusReason FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 2) NOT LIKE N'The limit of 1 new index(es)%'
+   OR EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_T25_New')
+    THROW 50999, N'FAIL T25: a widening did not count towards @MaxNewIndexes.', 1;
+
+DROP TABLE #T25;
+DROP INDEX IX_T25_Narrow ON dbo.Orders;
+DROP INDEX IX_T25_Order ON dbo.Orders;
+DROP INDEX IX_T25_Filtered ON dbo.Orders;
+DROP INDEX IX_T25_Unique ON dbo.Customers;
+PRINT 'PASS T25: CREATE mode widens an index in place under its own name, with UndoDDL that restores it and a widened tag; non-widenings, unique, filtered, clustered and columnstore cases stay for review, and a widening counts towards @MaxNewIndexes';
+GO
+
 PRINT 'ALL TESTS PASSED';
 GO
