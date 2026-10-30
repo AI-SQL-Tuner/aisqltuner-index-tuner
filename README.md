@@ -430,7 +430,7 @@ Both ran on SQL Server 2025 Enterprise Developer, with `gpt-5.6-luna` at `medium
 
 **What CREATE mode leaves on the table:**
 - **challenge:** most of the gap between the two proc rows comes from the filtered and columnstore indexes, which CREATE mode leaves for review.
-- **sqlstorm-oltp:** in 3 of 5 runs, the model filed the two covering indexes that matter as replacements of existing indexes (*ConsolidateIndex*). CREATE mode didn't apply that category then. In the other 2 runs it filed them as new indexes, and CREATE mode got the full −79%. CREATE mode now applies such widenings ([issue #26](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/issues/26)); the benchmark has not been rerun since.
+- **sqlstorm-oltp:** in 3 of 5 runs, the model filed the two covering indexes that matter as replacements of existing indexes (*ConsolidateIndex*). CREATE mode didn't apply that category then. In the other 2 runs it filed them as new indexes, and CREATE mode got the full −79%. CREATE mode now widens such indexes in place ([issue #26](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/issues/26)). In a rerun of 5 CREATE-mode trials, it built both indexes every time, for −78.8% reads and −60.3% read CPU, the same as applying every recommendation.
 
 **The DMV baseline swings from strong to useless.** On the challenge scenario it nearly matches the reviewed advice on reads, at ten times the index space. On sqlstorm-oltp it suggested a single index, and reads barely moved.
 
