@@ -163,7 +163,7 @@ The *improved / regressed* column counts queries whose CPU moved by more than th
 
 ## Limits
 
-- **One scenario and one model.** `tpch10-realistic`, `sqlstorm-oltp` and the `stats-only` arm are the next slices in the issue #2 plan.
+- **One scenario and one model.** The [sqlstorm-oltp report](impact-20261030-VMEnt-SQL25-sqlstorm-oltp.md) runs the same arms on an OLTP workload. `tpch10-realistic` and the `stats-only` arm are the next slices in the issue #2 plan.
 - **Different inputs for proc and desktop.** Each answered its own collector's payload, so the comparison covers the collector, the prompt and the scripts together. It can't say which of those made the difference.
 - **A read-heavy workload.** The 3 write queries are light, so storage and index maintenance cost little here. That flatters the naive arm, whose cost shows up mainly in storage and writes.
 - **Statistics were frozen**, so none of the gain comes from fresh statistics. A `stats-only` arm would confirm that.

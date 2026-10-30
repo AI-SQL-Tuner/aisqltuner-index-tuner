@@ -22,12 +22,13 @@ about Microsoft's 2006 `AutoIndex.sql` prototype: a modern version, with AI doin
 > from the [Microsoft Store](https://apps.microsoft.com/detail/9P68072ZM3N5).
 > [How they compare](#compared-with-ai-sql-tuner-studio).
 
-> **Status: prototype.** The collectors, prompt, storage and apply logic are tested against SQL
-> Server 2025 with canned model answers. The live path has also been run end to end against Azure
-> OpenAI `gpt-5.6-luna` on SQL Server 2025: collection, the background-mode call, storage, the
-> change controls and CREATE mode. See [Testing](#testing) and [Benchmark](#benchmark). Not yet run: the
-> rest of the impact benchmark (one scenario of three so far),
-> Azure SQL Database, Fabric SQL Database, and `ONLINE = ON` index builds.
+> **Status.** The collectors, prompt, storage and apply logic are tested against SQL Server 2025
+> with canned model answers. The live path has been run end to end against Azure OpenAI
+> `gpt-5.6-luna` on SQL Server 2025 Standard Developer and Enterprise Developer editions:
+> collection, the background-mode call, storage, the change controls and CREATE mode, including
+> `ONLINE = ON` index builds on Enterprise. On Enterprise it has also been benchmarked for whether
+> its recommendations are right and what applying them gains. See [Testing](#testing) and
+> [Benchmark](#benchmark). Not yet run: Azure SQL Database and Fabric SQL Database.
 
 ## Requirements
 
@@ -155,7 +156,7 @@ must also pass the change controls and safety checks. The rest are skipped with 
 stay for you to review. A recommendation the model gave no level counts as `Low`. Both levels
 are the model's own estimates, so a threshold lowers the risk but does not replace review.
 
-The levels vary between runs, as the answers do (see [Known limitations](#known-limitations-prototype)),
+The levels vary between runs, as the answers do (see [Known limitations](#known-limitations)),
 so two CREATE runs on the same database can apply different sets. In five live runs of
 `gpt-5.6-luna` on the benchmark database, with the same input:
 - the model never gave `Low` confidence, so `@MinConfidence = 'Medium'` held nothing back and only
@@ -270,7 +271,7 @@ They include:
 Statement text can contain literal values. Set `IncludeQueryText = 0` to leave it out. To see
 exactly what would be sent, run `EXEC dbo.sp_AIIndexTuner @CollectOnly = 1;`.
 
-## Known limitations (prototype)
+## Known limitations
 
 - **Claude:** Claude deployments are not supported yet.
 - **No timeouts:** T-SQL has no per-statement timeout, so a collector section cannot be cut off
@@ -365,6 +366,9 @@ Results on SQL Server 2025 Standard Developer with `gpt-5.6-luna`, medium effort
 | CREATE mode | Created the one index that passed validation, with the model's fill factor and compression, and stored its `UndoDDL`. Other categories stayed for review. |
 | Usage window | On a few hours of usage data, the model deferred unused indexes rather than dropping them, and filed them under `Other` |
 
+The [benchmark](#benchmark) repeated the live path on SQL Server 2025 Enterprise Developer, where
+CREATE mode built its indexes with `ONLINE = ON`.
+
 ## Benchmark
 
 [bench/](bench/) checks whether the recommendations are right ([issue #2](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/issues/2), part 1) and what applying them gains (part 2). It builds 16 known tuning problems into a `bench` schema, including:
@@ -388,16 +392,28 @@ It runs `sp_AIIndexTuner` against them and scores every run with 37 rubric check
 
 [bench/CASES.md](bench/CASES.md) explains each case and why its expected answer is right. [bench/PREREQUISITES.md](bench/PREREQUISITES.md) lists what a live run needs.
 
-**Impact** (part 2): each trial starts from a reverted snapshot of the challenge database. It runs a 16-query workload, tunes, applies and measures again. On SQL Server 2025, with `gpt-5.6-luna` at `medium` effort and 5 trials per arm:
+**Impact** (part 2): each trial starts from a reverted snapshot of the database, runs a workload, tunes, applies and measures again. Two scenarios:
+- **challenge:** the 16-query workload over the challenge database's cases;
+- **sqlstorm-oltp:** a Stack Overflow-shaped OLTP workload of 4,000 short reads and 480 committed writes per pass.
 
-| Arm | Read logical reads | Read CPU | Net index MB, after drops (mean) |
-|---|---:|---:|---:|
-| `@Mode = 'CREATE'`: the proc applies its validated indexes on its own | −79% | −66% | 328 |
-| Every recommendation reviewed and applied | −93% | −81% | 206 |
-| For comparison: the AI SQL Tuner desktop app's IndexTuning goal, every script applied | −83% | −74% | 465 |
-| Baseline: one index per missing-index DMV suggestion, as suggested | −90% | −72% | 2,075 |
+Both ran on SQL Server 2025 Enterprise Developer, with `gpt-5.6-luna` at `medium` effort and 5 trials per arm. Mean changes:
 
-No query returned different results. Most of the gap between the two proc rows comes from the filtered and columnstore indexes, which CREATE mode leaves for review. Creating every DMV suggestion nearly matches the reviewed advice on reads, but it adds ten times the index space and can't produce filtered or columnstore indexes. See [the report](bench/results/impact-20261028-VMEnt-SQL25-challenge.md).
+| Arm | challenge: read reads | read CPU | net index MB | sqlstorm-oltp: read reads | read CPU | net index MB |
+|---|---:|---:|---:|---:|---:|---:|
+| `@Mode = 'CREATE'`: the proc applies its validated indexes on its own | −79% | −66% | 328 | −32% | −34% | 26 |
+| Every recommendation reviewed and applied | −93% | −81% | 206 | −79% | −54% | 37 |
+| For comparison: the AI SQL Tuner desktop app's IndexTuning goal, every script applied | −83% | −74% | 465 | −78% | −53% | 34 |
+| Baseline: one index per missing-index DMV suggestion, as suggested | −90% | −72% | 2,075 | −1% | −19% | 13 |
+
+**No query returned different results.**
+
+**What CREATE mode leaves on the table:**
+- **challenge:** most of the gap between the two proc rows comes from the filtered and columnstore indexes, which CREATE mode leaves for review.
+- **sqlstorm-oltp:** in 3 of 5 runs, the model filed the two covering indexes that matter as replacements of existing indexes (*ConsolidateIndex*). CREATE mode doesn't apply that category. In the other 2 runs it filed them as new indexes, and CREATE mode got the full −79%.
+
+**The DMV baseline swings from strong to useless.** On the challenge scenario it nearly matches the reviewed advice on reads, at ten times the index space. On sqlstorm-oltp it suggested a single index, and reads barely moved.
+
+Reports: [challenge](bench/results/impact-20261028-VMEnt-SQL25-challenge.md), [sqlstorm-oltp](bench/results/impact-20261030-VMEnt-SQL25-sqlstorm-oltp.md).
 
 `sp_AIIndexTuner @CollectedData = N'…'` runs the model on supplied diagnostics instead of collecting them, for example a run's `AIIndexTuner.Run.CollectedData`. The benchmark uses it so that every iteration answers the same input. `AIIndexTuner.Run` records the payload's SHA-256, collection and model time, apply time, and the number of background polls.
 
