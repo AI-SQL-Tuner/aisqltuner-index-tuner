@@ -143,6 +143,7 @@ INSERT #Canned VALUES ('P3-bad', N'{"summary": "s", "recommendations": [
 INSERT #Canned VALUES ('P4-good', N'{"summary": "s", "recommendations": []}');
 INSERT #Canned VALUES ('P4-bad-trunc', N'{"summary": "s", "recommendations": []}');   -- marked Truncated after the run
 INSERT #Canned VALUES ('P4-bad-fail', N'This is not JSON.');
+INSERT #Canned VALUES ('P4-bad-rate', N'This is not JSON.');   -- given a rate-limit error after the run
 
 /* ----- Run them ----- */
 DECLARE @BatchId int, @Base int, @RunId int, @Body nvarchar(max), @Name varchar(20);
@@ -167,6 +168,10 @@ BEGIN
                              @PinRunId = @Pin, @TestResponse = @Body, @Canned = @Name, @RunId = @RunId OUTPUT;
     IF @Name = 'P4-bad-trunc'
         UPDATE AIIndexTuner.Run SET Truncated = 1 WHERE RunId = @RunId;
+    IF @Name = 'P4-bad-rate'
+        UPDATE AIIndexTuner.Run
+        SET ErrorMessage = N'The AI endpoint returned HTTP 429: Your requests to gpt-5.6-luna for gpt-5.6-luna in eastus2 have exceeded token rate limit.'
+        WHERE RunId = @RunId;
     FETCH NEXT FROM canned_cur INTO @Name;
 END;
 CLOSE canned_cur;
@@ -204,7 +209,8 @@ UNION ALL SELECT 'P1-bad', 'P1-P1'
 UNION ALL SELECT 'P2-bad', 'P2-F1'
 UNION ALL SELECT 'P3-bad', 'P3-F1'
 UNION ALL SELECT 'P4-bad-trunc', 'P4-F1'
-UNION ALL SELECT 'P4-bad-fail', 'P4-R1';
+UNION ALL SELECT 'P4-bad-fail', 'P4-R1'
+UNION ALL SELECT 'P4-bad-rate', 'P4-R1';
 
 DROP TABLE IF EXISTS #Mismatch;
 SELECT rr.Canned, res.CheckId, res.Passed, res.Hits, res.Error,

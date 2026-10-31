@@ -57,6 +57,7 @@ UPDATE AIIndexTuner.Config SET
     MaxWaitSec          = 900,
     UseStructuredOutput = 1,         -- schema-constrained JSON; set 0 for a model that rejects it
     IncludeQueryText    = 1,         -- 0 leaves plan cache query text out of the prompt
-    KeepRunDetail       = 1          -- keep the collected data and raw response on AIIndexTuner.Run
+    KeepRunDetail       = 1,         -- keep the collected data and raw response on AIIndexTuner.Run
+    MaxPayloadChars     = 500000     -- larger collected data fails before the request; NULL = no limit
 WHERE ConfigId = 1;
 */

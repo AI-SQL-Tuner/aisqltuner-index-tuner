@@ -481,10 +481,17 @@ BEGIN
     END CATCH;
 
     /* ===== DUPLICATE AND OVERLAPPING INDEXES =====
-       Exact key duplicates and strict left-prefix overlaps within a table, compared as exact strings. */
+       Exact key duplicates and strict left-prefix overlaps within a table, compared as exact strings.
+       NarrowerIsRedundant is the apply step's test for a drop at any usage window: the narrower index
+       is nonclustered, the wider one covers its included columns and filter, and no uniqueness is
+       lost. A live run deferred such a drop as low use when this was left for the model to infer.
+       Of two exact key duplicates, the one to keep is listed as the wider: the clustered index, then
+       one that backs a constraint, then a unique one, then the older one. */
     BEGIN TRY
         WITH IndexKeys AS (
-            SELECT i.object_id, i.index_id, i.name AS index_name, i.is_unique, i.has_filter,
+            SELECT i.object_id, i.index_id, i.type, i.name AS index_name, i.is_unique, i.has_filter,
+                   CASE WHEN i.is_primary_key = 1 OR i.is_unique_constraint = 1 THEN 1 ELSE 0 END AS is_constraint,
+                   CASE WHEN i.type = 1 THEN 0 WHEN i.is_primary_key = 1 OR i.is_unique_constraint = 1 THEN 1 WHEN i.is_unique = 1 THEN 2 ELSE 3 END AS keep_rank,
                    ISNULL(i.filter_definition, N'') AS filter_definition,
                    (SELECT STRING_AGG(CAST(c.name AS nvarchar(max)) + CASE WHEN ic.is_descending_key = 1 THEN N' DESC' ELSE N'' END, N', ') WITHIN GROUP (ORDER BY ic.key_ordinal)
                     FROM sys.index_columns AS ic INNER JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
@@ -511,6 +518,15 @@ BEGIN
                 CASE WHEN a.key_columns = b.key_columns THEN 'EXACT KEY DUPLICATE' ELSE 'LEFT-PREFIX OVERLAP' END AS OverlapType,
                 b.is_unique AS NarrowerIsUnique,
                 CASE WHEN a.filter_definition <> b.filter_definition THEN 'DIFFERENT FILTERS' WHEN a.has_filter = 1 THEN 'BOTH FILTERED' ELSE '' END AS FilterNote,
+                CAST(CASE WHEN b.type = 2 AND b.is_constraint = 0
+                           AND (a.has_filter = 0 OR a.filter_definition = b.filter_definition)
+                           AND (b.is_unique = 0 OR (a.is_unique = 1 AND a.key_columns = b.key_columns))
+                           AND (a.type = 1   -- the clustered index covers every column
+                                OR NOT EXISTS (SELECT 1 FROM sys.index_columns AS inc
+                                               WHERE inc.object_id = b.object_id AND inc.index_id = b.index_id AND inc.is_included_column = 1
+                                                 AND NOT EXISTS (SELECT 1 FROM sys.index_columns AS ic
+                                                                 WHERE ic.object_id = a.object_id AND ic.index_id = a.index_id AND ic.column_id = inc.column_id)))
+                          THEN 1 ELSE 0 END AS bit) AS NarrowerIsRedundant,
                 ISNULL(us.user_seeks, 0) + ISNULL(us.user_scans, 0) + ISNULL(us.user_lookups, 0) AS NarrowerReads,
                 ISNULL(us.user_updates, 0) AS NarrowerWrites,
                 ISNULL(ps.size_mb, 0) AS NarrowerSizeMB,
@@ -518,7 +534,7 @@ BEGIN
             FROM IndexKeys AS a
             INNER JOIN IndexKeys AS b
                 ON a.object_id = b.object_id AND a.index_id <> b.index_id
-               AND ((a.key_columns = b.key_columns AND a.index_id < b.index_id)
+               AND ((a.key_columns = b.key_columns AND (a.keep_rank < b.keep_rank OR (a.keep_rank = b.keep_rank AND a.index_id < b.index_id)))
                     OR LEFT(a.key_columns, LEN(b.key_columns) + 1) = b.key_columns + N',')
             INNER JOIN sys.objects AS o ON o.object_id = a.object_id
             LEFT JOIN sys.dm_db_index_usage_stats AS us ON us.database_id = DB_ID() AND us.object_id = b.object_id AND us.index_id = b.index_id
@@ -563,6 +579,80 @@ BEGIN
     END TRY
     BEGIN CATCH
         SET @Data += CONCAT(@nl, N'=== PLAN CACHE QUERY STATISTICS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
+    END CATCH;
+
+    /* ===== NON-SARGABLE PREDICATES =====
+       Table columns wrapped in a function, conversion or arithmetic inside a scan or filter
+       predicate of the top 50 plan cache statements by CPU, read from each statement's showplan. No
+       index on the column can be sought for such a predicate, so the statement needs a rewrite.
+       A live run missed YEAR() and DATEDIFF() around Invoices columns, seen only in query text. */
+    BEGIN TRY
+        DROP TABLE IF EXISTS #NonSargable;
+        WITH XMLNAMESPACES (DEFAULT 'http://schemas.microsoft.com/sqlserver/2004/07/showplan'),
+        stmts AS (
+            SELECT TOP (50) ROW_NUMBER() OVER (ORDER BY qs.total_worker_time DESC) AS stmt_id,
+                   qs.query_hash, qs.execution_count, qs.total_worker_time, qs.total_logical_reads,
+                   -- NULL for a plan nested deeper than the xml type allows.
+                   TRY_CONVERT(xml, tqp.query_plan) AS plan_xml
+            FROM sys.dm_exec_query_stats AS qs
+            CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
+            CROSS APPLY (SELECT CAST(pa.value AS int) AS dbid FROM sys.dm_exec_plan_attributes(qs.plan_handle) AS pa WHERE pa.attribute = N'dbid') AS pdb
+            CROSS APPLY sys.dm_exec_text_query_plan(qs.plan_handle, qs.statement_start_offset, qs.statement_end_offset) AS tqp
+            -- The same statements as the plan cache section, without this tool's own.
+            WHERE pdb.dbid = DB_ID()
+              AND (st.objectid IS NULL OR OBJECT_SCHEMA_NAME(st.objectid, st.dbid) IS NULL OR OBJECT_SCHEMA_NAME(st.objectid, st.dbid) NOT LIKE N'AIIndexTuner%')
+              AND st.text NOT LIKE N'%AIIndexTuner%'
+            ORDER BY qs.total_worker_time DESC)
+        -- A column of a table in this database (parameters and variables have no Table) under an
+        -- Intrinsic (YEAR shows as datepart), Convert, Arithmetic or user-defined function. LIKE is an
+        -- Intrinsic too, but it compares the column rather than wrapping it.
+        SELECT DISTINCT s.stmt_id, s.query_hash, s.execution_count, s.total_worker_time, s.total_logical_reads,
+               PARSENAME(c.n.value('@Schema', 'nvarchar(260)'), 1) AS schema_name,
+               PARSENAME(c.n.value('@Table', 'nvarchar(260)'), 1) AS table_name,
+               c.n.value('@Column', 'sysname') AS column_name,
+               ro.n.value('@NodeId', 'int') AS node_id,
+               ro.n.value('@PhysicalOp', 'nvarchar(60)') AS operator,
+               ro.n.value('(*/Predicate/ScalarOperator/@ScalarString)[1]', 'nvarchar(max)') AS predicate,
+               CASE f.n.value('local-name(.)', 'nvarchar(30)')
+                    WHEN N'Convert' THEN CASE WHEN f.n.value('@Implicit', 'bit') = 1 THEN N'CONVERT_IMPLICIT' ELSE N'CONVERT' END
+                    WHEN N'Arithmetic' THEN CONCAT(N'arithmetic (', f.n.value('@Operation', 'nvarchar(30)'), N')')
+                    ELSE f.n.value('@FunctionName', 'nvarchar(260)') END AS wrapper
+        INTO #NonSargable
+        FROM stmts AS s
+        CROSS APPLY s.plan_xml.nodes('//RelOp[*/Predicate]') AS ro(n)
+        CROSS APPLY ro.n.nodes('*/Predicate//*[self::Intrinsic[@FunctionName != "like"] or self::Convert or self::Arithmetic or self::UserDefinedFunction]') AS f(n)
+        CROSS APPLY f.n.nodes('.//ColumnReference[@Table]') AS c(n)
+        WHERE c.n.value('@Database', 'nvarchar(260)') = QUOTENAME(DB_NAME());
+
+        SELECT @j = (
+            SELECT TOP (25)
+                CONVERT(varchar(18), k.query_hash, 1) AS QueryHash,
+                k.schema_name + N'.' + k.table_name AS TableName,
+                k.column_name AS ColumnName,
+                (SELECT STRING_AGG(w.wrapper, N', ') WITHIN GROUP (ORDER BY w.wrapper)
+                 FROM (SELECT DISTINCT n.wrapper FROM #NonSargable AS n
+                       WHERE n.stmt_id = k.stmt_id AND n.schema_name = k.schema_name AND n.table_name = k.table_name AND n.column_name = k.column_name) AS w) AS WrappedBy,
+                p.operator AS Operator,
+                k.execution_count AS ExecutionCount,
+                k.total_worker_time / k.execution_count AS AvgCpuTimeMicroseconds,
+                k.total_logical_reads / k.execution_count AS AvgLogicalReads,
+                -- The predicate can hold literals, so it follows IncludeQueryText.
+                CASE WHEN @IncludeQueryText = 1 THEN LEFT(REPLACE(p.predicate, QUOTENAME(DB_NAME()) + N'.', N''), 400)
+                ELSE N'(predicate omitted by configuration)' END AS Predicate
+            FROM (SELECT DISTINCT stmt_id, query_hash, execution_count, total_worker_time, total_logical_reads, schema_name, table_name, column_name
+                  FROM #NonSargable
+                  WHERE schema_name NOT LIKE N'AIIndexTuner%'
+                    AND (@SchemaName IS NULL OR schema_name = @SchemaName) AND (@TableName IS NULL OR table_name = @TableName)) AS k
+            -- The deepest operator whose predicate wraps the column, usually the scan.
+            CROSS APPLY (SELECT TOP (1) n.operator, n.predicate FROM #NonSargable AS n
+                         WHERE n.stmt_id = k.stmt_id AND n.schema_name = k.schema_name AND n.table_name = k.table_name AND n.column_name = k.column_name
+                         ORDER BY n.node_id DESC) AS p
+            ORDER BY k.total_worker_time DESC, TableName, ColumnName
+            FOR JSON PATH);
+        SET @Data += CONCAT(@nl, N'=== NON-SARGABLE PREDICATES ===', @nl, ISNULL(@j, N'(none)'), @nl);
+    END TRY
+    BEGIN CATCH
+        SET @Data += CONCAT(@nl, N'=== NON-SARGABLE PREDICATES ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
     /* ===== HEAP TABLE ANALYSIS ===== heaps of 10,000 rows or more, physical stats sampled per heap */

@@ -85,8 +85,13 @@ can apply what it finds.
      are listed with their types, and wide or `(max)` columns with an average width sampled from up
      to 1,000 rows, so a suggestion that would copy a large column into an index can be spotted
    - index usage, duplicate and left-prefix overlapping indexes, operational hotspots and page
-     density
+     density. Each overlap says whether the narrower index is redundant: the wider index covers
+     its keys, included columns and filter, and no uniqueness is lost, so it can be dropped
+     whatever the usage window
    - the top 25 plan cache statements by CPU for this database
+   - non-SARGable predicates: table columns that the plans of the top 50 plan cache statements
+     wrap in a function, conversion or arithmetic, such as `YEAR(InvoiceDate)` or
+     `CONVERT_IMPLICIT`, read from the showplan XML, so the model can recommend the rewrite
    - Query Store: the top 50 queries by total duration over 7 days (with parameter sensitivity),
      the write workload mix, and forced plan failures. Each query variant of an adaptive plan
      (Parameter Sensitive Plan or optional parameter plan optimization) is counted under its parent
@@ -277,6 +282,7 @@ WHERE ep.name = N'AIIndexTuner';
 | `UseStructuredOutput` | 1 | Schema-constrained JSON; set 0 for a model that rejects it |
 | `IncludeQueryText` | 1 | 0 leaves plan cache query text out of the prompt |
 | `KeepRunDetail` | 1 | Keep the collected data and raw response on each run |
+| `MaxPayloadChars` | 500000 | The largest collected payload sent to the model, in characters (NULL = no limit). A larger one fails before the request with an error that names its size; narrow the scope or raise the limit |
 
 ## Data disclosure
 
@@ -286,8 +292,10 @@ They include:
 - object, index and column names
 - row counts and usage counters
 - up to 600 characters of each of the top plan cache statements
+- up to 400 characters of each non-SARGable predicate, from the plan
 
-Statement text can contain literal values. Set `IncludeQueryText = 0` to leave it out. To see
+Statement text and predicates can contain literal values. Set `IncludeQueryText = 0` to leave
+them out. To see
 exactly what would be sent, run `EXEC dbo.sp_AIIndexTuner @CollectOnly = 1;`.
 
 ## Known limitations

@@ -7,6 +7,36 @@ To upgrade, run the new [aisqltuner-index-tuner.sql](aisqltuner-index-tuner.sql)
 where the tool is installed. It adds new columns with `ALTER TABLE`, so earlier runs and
 recommendations are kept, and it replaces the procedures and functions.
 
+## 2026-10-31
+
+### Added
+
+- **Payload size limit** (issue #21). New `AIIndexTuner.Config.MaxPayloadChars`, 500,000 by
+  default and given to existing installs too; NULL means no limit. Collected data over it fails
+  the run before the request, with error 50211, which names the size and the limit. Before, a
+  payload that large failed with whatever the deployment returned. On the benchmark's P4 that was a
+  tokens-per-minute rate limit, which says nothing about size. A `@TestResponse` run sends nothing,
+  so it is not limited.
+- **New collector section, `NON-SARGABLE PREDICATES`** (issue #21). It lists the table columns
+  that the top 50 plan cache statements wrap in a function, conversion or arithmetic inside a scan
+  or filter predicate. It reads them from the showplan XML and gives the predicate, for example
+  `datepart(year,[bench].[Invoices].[InvoiceDate] ...)=[@y]`. The predicate follows
+  `IncludeQueryText`, since it can hold literals. A new prompt rule asks for a `QueryChange` with
+  the SARGable rewrite for each costly statement that has one, and an index only together with it.
+  In the benchmark, 4 of 5 runs had made no Invoices recommendation at all.
+
+### Changed
+
+- **Redundant overlaps are marked** (issue #21). Each row of `DUPLICATE AND OVERLAPPING INDEXES`
+  has `NarrowerIsRedundant`, the apply step's own test: the narrower index is nonclustered and backs
+  no constraint, the wider one covers its keys, included columns and filter, and no uniqueness is
+  lost. The prompt says such an index is a `DropIndex` whatever its reads and usage window, never
+  an `Other` to confirm later. In the benchmark, 4 of 5 runs had deferred dropping
+  `IX_Accounts_Email` as a low-use index. Of two exact key duplicates, the one listed as the wider,
+  to keep, is now the clustered index, then one that backs a constraint, then a unique one.
+- **Benchmark P4-R1** no longer passes on a rate-limit error (`rate limit` or HTTP 429), though
+  it contains "token". `Validate-Rubric.sql` has a canned case for it.
+
 ## 2026-10-30
 
 ### Added
