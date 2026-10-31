@@ -117,6 +117,17 @@ IF COL_LENGTH(N'AIIndexTuner.Run', N'AllowColumnstore') IS NULL
         MaxNewIndexes    int NULL;   -- at most this many new indexes are recommended and created
 GO
 
+/* The largest collected payload sent to the model, in characters; NULL = no limit. A larger one fails
+   before the request with an error that names its size, rather than with whatever the deployment
+   returns: a context-length error, or a tokens-per-minute rate limit that says nothing about size.
+   500,000 characters is roughly 125,000 to 170,000 tokens. WITH VALUES gives existing installs the
+   default too. */
+IF COL_LENGTH(N'AIIndexTuner.Config', N'MaxPayloadChars') IS NULL
+    ALTER TABLE AIIndexTuner.Config ADD
+        MaxPayloadChars int NULL CONSTRAINT DF_AIIndexTuner_Config_MaxPayload DEFAULT (500000) WITH VALUES
+                                 CONSTRAINT CK_AIIndexTuner_Config_MaxPayload CHECK (MaxPayloadChars > 0);
+GO
+
 /* Apply thresholds (sp_AIIndexTuner @MinPriority, @MinConfidence): High, Medium or Low. Only a
    recommendation whose priority level and confidence are at that level or above is applied; the
    rest stay for review. NULL = no minimum. Unlike the change controls, they do not change the prompt. */
@@ -736,10 +747,17 @@ BEGIN
     END CATCH;
 
     /* ===== DUPLICATE AND OVERLAPPING INDEXES =====
-       Exact key duplicates and strict left-prefix overlaps within a table, compared as exact strings. */
+       Exact key duplicates and strict left-prefix overlaps within a table, compared as exact strings.
+       NarrowerIsRedundant is the apply step's test for a drop at any usage window: the narrower index
+       is nonclustered, the wider one covers its included columns and filter, and no uniqueness is
+       lost. A live run deferred such a drop as low use when this was left for the model to infer.
+       Of two exact key duplicates, the one to keep is listed as the wider: the clustered index, then
+       one that backs a constraint, then a unique one, then the older one. */
     BEGIN TRY
         WITH IndexKeys AS (
-            SELECT i.object_id, i.index_id, i.name AS index_name, i.is_unique, i.has_filter,
+            SELECT i.object_id, i.index_id, i.type, i.name AS index_name, i.is_unique, i.has_filter,
+                   CASE WHEN i.is_primary_key = 1 OR i.is_unique_constraint = 1 THEN 1 ELSE 0 END AS is_constraint,
+                   CASE WHEN i.type = 1 THEN 0 WHEN i.is_primary_key = 1 OR i.is_unique_constraint = 1 THEN 1 WHEN i.is_unique = 1 THEN 2 ELSE 3 END AS keep_rank,
                    ISNULL(i.filter_definition, N'') AS filter_definition,
                    (SELECT STRING_AGG(CAST(c.name AS nvarchar(max)) + CASE WHEN ic.is_descending_key = 1 THEN N' DESC' ELSE N'' END, N', ') WITHIN GROUP (ORDER BY ic.key_ordinal)
                     FROM sys.index_columns AS ic INNER JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
@@ -766,6 +784,15 @@ BEGIN
                 CASE WHEN a.key_columns = b.key_columns THEN 'EXACT KEY DUPLICATE' ELSE 'LEFT-PREFIX OVERLAP' END AS OverlapType,
                 b.is_unique AS NarrowerIsUnique,
                 CASE WHEN a.filter_definition <> b.filter_definition THEN 'DIFFERENT FILTERS' WHEN a.has_filter = 1 THEN 'BOTH FILTERED' ELSE '' END AS FilterNote,
+                CAST(CASE WHEN b.type = 2 AND b.is_constraint = 0
+                           AND (a.has_filter = 0 OR a.filter_definition = b.filter_definition)
+                           AND (b.is_unique = 0 OR (a.is_unique = 1 AND a.key_columns = b.key_columns))
+                           AND (a.type = 1   -- the clustered index covers every column
+                                OR NOT EXISTS (SELECT 1 FROM sys.index_columns AS inc
+                                               WHERE inc.object_id = b.object_id AND inc.index_id = b.index_id AND inc.is_included_column = 1
+                                                 AND NOT EXISTS (SELECT 1 FROM sys.index_columns AS ic
+                                                                 WHERE ic.object_id = a.object_id AND ic.index_id = a.index_id AND ic.column_id = inc.column_id)))
+                          THEN 1 ELSE 0 END AS bit) AS NarrowerIsRedundant,
                 ISNULL(us.user_seeks, 0) + ISNULL(us.user_scans, 0) + ISNULL(us.user_lookups, 0) AS NarrowerReads,
                 ISNULL(us.user_updates, 0) AS NarrowerWrites,
                 ISNULL(ps.size_mb, 0) AS NarrowerSizeMB,
@@ -773,7 +800,7 @@ BEGIN
             FROM IndexKeys AS a
             INNER JOIN IndexKeys AS b
                 ON a.object_id = b.object_id AND a.index_id <> b.index_id
-               AND ((a.key_columns = b.key_columns AND a.index_id < b.index_id)
+               AND ((a.key_columns = b.key_columns AND (a.keep_rank < b.keep_rank OR (a.keep_rank = b.keep_rank AND a.index_id < b.index_id)))
                     OR LEFT(a.key_columns, LEN(b.key_columns) + 1) = b.key_columns + N',')
             INNER JOIN sys.objects AS o ON o.object_id = a.object_id
             LEFT JOIN sys.dm_db_index_usage_stats AS us ON us.database_id = DB_ID() AND us.object_id = b.object_id AND us.index_id = b.index_id
@@ -818,6 +845,83 @@ BEGIN
     END TRY
     BEGIN CATCH
         SET @Data += CONCAT(@nl, N'=== PLAN CACHE QUERY STATISTICS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
+    END CATCH;
+
+    /* ===== NON-SARGABLE PREDICATES =====
+       Table columns wrapped in a function, conversion or arithmetic inside a scan or filter
+       predicate of the top 50 plan cache statements by CPU, read from each statement's showplan. No
+       index on the column can be sought for such a predicate, so the statement needs a rewrite.
+       A live run missed YEAR() and DATEDIFF() around Invoices columns, seen only in query text. */
+    BEGIN TRY
+        DROP TABLE IF EXISTS #NonSargable;
+        WITH XMLNAMESPACES (DEFAULT 'http://schemas.microsoft.com/sqlserver/2004/07/showplan'),
+        stmts AS (
+            SELECT TOP (50) ROW_NUMBER() OVER (ORDER BY qs.total_worker_time DESC) AS stmt_id,
+                   qs.query_hash, qs.execution_count, qs.total_worker_time, qs.total_logical_reads,
+                   -- NULL for a plan nested deeper than the xml type allows.
+                   TRY_CONVERT(xml, tqp.query_plan) AS plan_xml
+            FROM sys.dm_exec_query_stats AS qs
+            CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
+            CROSS APPLY (SELECT CAST(pa.value AS int) AS dbid FROM sys.dm_exec_plan_attributes(qs.plan_handle) AS pa WHERE pa.attribute = N'dbid') AS pdb
+            CROSS APPLY sys.dm_exec_text_query_plan(qs.plan_handle, qs.statement_start_offset, qs.statement_end_offset) AS tqp
+            -- The same statements as the plan cache section, without this tool's own.
+            WHERE pdb.dbid = DB_ID()
+              AND (st.objectid IS NULL OR OBJECT_SCHEMA_NAME(st.objectid, st.dbid) IS NULL OR OBJECT_SCHEMA_NAME(st.objectid, st.dbid) NOT LIKE N'AIIndexTuner%')
+              AND st.text NOT LIKE N'%AIIndexTuner%'
+            ORDER BY qs.total_worker_time DESC)
+        -- A column of a table in this database (parameters and variables have no Table) under an
+        -- Intrinsic (YEAR shows as datepart), Convert, Arithmetic or user-defined function. LIKE is an
+        -- Intrinsic too, but it compares the column rather than wrapping it, and PROBE is a bitmap
+        -- filter the optimizer adds to a hash join, not part of the query.
+        SELECT DISTINCT s.stmt_id, s.query_hash, s.execution_count, s.total_worker_time, s.total_logical_reads,
+               PARSENAME(c.n.value('@Schema', 'nvarchar(260)'), 1) AS schema_name,
+               PARSENAME(c.n.value('@Table', 'nvarchar(260)'), 1) AS table_name,
+               c.n.value('@Column', 'sysname') AS column_name,
+               ro.n.value('@NodeId', 'int') AS node_id,
+               ro.n.value('@PhysicalOp', 'nvarchar(60)') AS operator,
+               ro.n.value('(*/Predicate/ScalarOperator/@ScalarString)[1]', 'nvarchar(max)') AS predicate,
+               CASE f.n.value('local-name(.)', 'nvarchar(30)')
+                    WHEN N'Convert' THEN CASE WHEN f.n.value('@Implicit', 'bit') = 1 THEN N'CONVERT_IMPLICIT' ELSE N'CONVERT' END
+                    WHEN N'Arithmetic' THEN CONCAT(N'arithmetic (', f.n.value('@Operation', 'nvarchar(30)'), N')')
+                    ELSE f.n.value('@FunctionName', 'nvarchar(260)') END AS wrapper
+        INTO #NonSargable
+        FROM stmts AS s
+        CROSS APPLY s.plan_xml.nodes('//RelOp[*/Predicate]') AS ro(n)
+        CROSS APPLY ro.n.nodes('*/Predicate//*[self::Intrinsic[@FunctionName != "like" and @FunctionName != "PROBE"] or self::Convert or self::Arithmetic or self::UserDefinedFunction]') AS f(n)
+        CROSS APPLY f.n.nodes('.//ColumnReference[@Table]') AS c(n)
+        WHERE c.n.value('@Database', 'nvarchar(260)') = QUOTENAME(DB_NAME());
+
+        SELECT @j = (
+            SELECT TOP (25)
+                CONVERT(varchar(18), k.query_hash, 1) AS QueryHash,
+                k.schema_name + N'.' + k.table_name AS TableName,
+                k.column_name AS ColumnName,
+                (SELECT STRING_AGG(w.wrapper, N', ') WITHIN GROUP (ORDER BY w.wrapper)
+                 FROM (SELECT DISTINCT n.wrapper FROM #NonSargable AS n
+                       WHERE n.stmt_id = k.stmt_id AND n.schema_name = k.schema_name AND n.table_name = k.table_name AND n.column_name = k.column_name) AS w) AS WrappedBy,
+                p.operator AS Operator,
+                k.execution_count AS ExecutionCount,
+                k.total_worker_time / k.execution_count AS AvgCpuTimeMicroseconds,
+                k.total_logical_reads / k.execution_count AS AvgLogicalReads,
+                -- The predicate can hold literals, so it follows IncludeQueryText.
+                CASE WHEN @IncludeQueryText = 1 THEN LEFT(REPLACE(p.predicate, QUOTENAME(DB_NAME()) + N'.', N''), 400)
+                ELSE N'(predicate omitted by configuration)' END AS Predicate
+            FROM (SELECT DISTINCT stmt_id, query_hash, execution_count, total_worker_time, total_logical_reads, schema_name, table_name, column_name
+                  FROM #NonSargable
+                  WHERE schema_name NOT LIKE N'AIIndexTuner%'
+                    -- User tables only: catalog views resolve to system tables such as sys.sysidxstats.
+                    AND OBJECTPROPERTY(OBJECT_ID(QUOTENAME(schema_name) + N'.' + QUOTENAME(table_name)), 'IsUserTable') = 1
+                    AND (@SchemaName IS NULL OR schema_name = @SchemaName) AND (@TableName IS NULL OR table_name = @TableName)) AS k
+            -- The deepest operator whose predicate wraps the column, usually the scan.
+            CROSS APPLY (SELECT TOP (1) n.operator, n.predicate FROM #NonSargable AS n
+                         WHERE n.stmt_id = k.stmt_id AND n.schema_name = k.schema_name AND n.table_name = k.table_name AND n.column_name = k.column_name
+                         ORDER BY n.node_id DESC) AS p
+            ORDER BY k.total_worker_time DESC, TableName, ColumnName
+            FOR JSON PATH);
+        SET @Data += CONCAT(@nl, N'=== NON-SARGABLE PREDICATES ===', @nl, ISNULL(@j, N'(none)'), @nl);
+    END TRY
+    BEGIN CATCH
+        SET @Data += CONCAT(@nl, N'=== NON-SARGABLE PREDICATES ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
     /* ===== HEAP TABLE ANALYSIS ===== heaps of 10,000 rows or more, physical stats sampled per heap */
@@ -1768,7 +1872,7 @@ BEGIN
     RETURN CONCAT(CAST(N'' AS nvarchar(max)),
         N'You are a SQL Server expert specializing in index and code optimization. ',
         -- Every section of the collected input, by its header, in the order usp_CollectData writes them (test T20).
-        N'Analyze the provided input, whose sections are: server information with its platform capabilities, missing index recommendations (with the types of their included columns), index usage statistics (including key/included columns, index sizes and compression), missing index overlap signals, duplicate and overlapping indexes, plan cache query statistics, heap table analysis, constraints and relationships, untrusted or disabled constraints, index operational hotspots, column cardinality, skewed low-cardinality columns, large tables, database statistics settings, index page density, Query Store workload insights, Query Store write workload mix, Query Store forced plan failures, automatic tuning options, cardinality estimation feedback, degree of parallelism feedback, and optional parameter plan optimization. ',
+        N'Analyze the provided input, whose sections are: server information with its platform capabilities, missing index recommendations (with the types of their included columns), index usage statistics (including key/included columns, index sizes and compression), missing index overlap signals, duplicate and overlapping indexes, plan cache query statistics, non-sargable predicates, heap table analysis, constraints and relationships, untrusted or disabled constraints, index operational hotspots, column cardinality, skewed low-cardinality columns, large tables, database statistics settings, index page density, Query Store workload insights, Query Store write workload mix, Query Store forced plan failures, automatic tuning options, cardinality estimation feedback, degree of parallelism feedback, and optional parameter plan optimization. ',
         N'Carefully consider the additional overhead of adding indexes. Analyze the number of user_updates compared to user_seeks and user_scans for each table when recommending indexes, especially when the index is not included in the missing indexes report. Consider clustered and nonclustered columnstore indexes for tables with more than 1000000 rows. Consider filtered indexes. ',
         N'If HEAP TABLE ANALYSIS reports forwarded records, explain that each forwarded record costs an extra page read for every scan or lookup that reaches it, and that their number grows as rows widen. Recommend a clustered index on a narrow, unique, stable key that the workload filters or joins on, or the table''s primary key, as an Other recommendation (ConsolidateIndex when it replaces existing indexes) whose script creates it. If the table has to stay a heap, recommend ALTER TABLE ... REBUILD (RebuildIndex) instead, noting that it removes the forwarding pointers but that they return as rows widen again. A nonclustered index on a heap does not remove forwarded records. ',
         N'Missing-index suggestions name their included columns without types. IncludedColumnTypes gives each type, and for wide columns an average width sampled from the table. Do not copy an nvarchar(max), varchar(max), varbinary(max), xml, text or other wide column into INCLUDE because a suggestion lists it: for the few rows a selective query returns, a key lookup costs less than storing the value again in every row of the index, and a (max) column can make the index nearly as large as the table. Include a wide column only when the query returns it for many rows, and then give its storage cost in the rationale and in estimated_size_mb. ',
@@ -1784,10 +1888,11 @@ BEGIN
         -- 15707). The statement and the edition limit are spelled out here (test T24 runs the statement).
         N'Review automatic tuning options: if FORCE_LAST_GOOD_PLAN is not enabled, make a Setting recommendation to enable it, to allow SQL Server to automatically revert to the last known good plan when a regression is detected; if it is enabled but the actual state differs from the desired state, make a Setting recommendation that gives the reported reason in its rationale and the corrective action in its script. FORCE_LAST_GOOD_PLAN is an automatic tuning option, not a database scoped configuration: the script that enables it is ALTER DATABASE [db] SET AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = ON); never ALTER DATABASE SCOPED CONFIGURATION, which has no such option. Where AUTOMATIC TUNING OPTIONS says the edition cannot enable it (Standard, Standard Developer and Express), do not recommend enabling it or any change that needs it; you may note in the summary that the edition lacks automatic plan correction. ',
         N'Analyze index page density to identify indexes with low page utilization (below ~75%) which may benefit from rebuild operations, fill factor adjustments, or indicate excessive page splits from random inserts. Give each index to rebuild its own RebuildIndex recommendation. ',
-        N'If duplicate or left-prefix overlapping indexes are reported, recommend consolidation: for exact key duplicates recommend dropping the redundant index (DropIndex, keeping unique indexes and indexes that back constraints); for left-prefix overlaps evaluate whether the narrower index can be dropped (DropIndex) or merged into the wider index by adding included columns (ConsolidateIndex), using the reported reads, writes, and size to justify each recommendation. Never recommend dropping an index that enforces a primary key or unique constraint without replacing the constraint. ',
-        N'Index usage statistics, missing index statistics, index operational statistics and the plan cache accumulate only since the time in the input''s "Database Usage Statistics Since" line, which is the later of the SQL Server start time and the database''s last restore, attach, snapshot revert, ONLINE or AUTO_CLOSE reopen. Before recommending that an index be dropped because it shows no or few reads, check that period: if it is shorter than one week, do not recommend dropping it outright; make it an Other recommendation, as a candidate to confirm after a longer observation period, with the period and its source in the rationale. With at least a week you may recommend dropping it, noting in the rationale that monthly or quarterly work may not have run in that time. If that line says the statistics may cover less than the period, say so in the rationale of any drop you recommend. If the time is unknown, say so and apply the same caution. This caution applies only to drops justified by low use. An exact key duplicate, or an index that another index makes redundant (the same leading keys, its included columns and filter covered, and any uniqueness kept), loses nothing when dropped, so recommend dropping it (DropIndex) whatever the period. ',
+        N'If duplicate or left-prefix overlapping indexes are reported, recommend consolidation: for exact key duplicates recommend dropping the redundant index (DropIndex, keeping unique indexes and indexes that back constraints); for left-prefix overlaps evaluate whether the narrower index can be dropped (DropIndex) or merged into the wider index by adding included columns (ConsolidateIndex), using the reported reads, writes, and size to justify each recommendation. NarrowerIsRedundant true means the narrower index is nonclustered and backs no constraint, its keys are a leading prefix of the wider index''s keys (or the same keys), the wider index covers its included columns and filter, and no uniqueness is lost: every query it serves can use the wider index instead. Recommend dropping each such narrower index now (DropIndex), whatever its reads and whatever the usage period; few or no reads are no reason to defer it, so never file it under Other as a candidate to confirm later or as a low-use drop. When NarrowerIsRedundant is false only because the wider index lacks some of its included columns, prefer adding them to the wider index (ConsolidateIndex) and dropping the narrower one. Never recommend dropping an index that enforces a primary key or unique constraint without replacing the constraint. ',
+        N'Index usage statistics, missing index statistics, index operational statistics and the plan cache accumulate only since the time in the input''s "Database Usage Statistics Since" line, which is the later of the SQL Server start time and the database''s last restore, attach, snapshot revert, ONLINE or AUTO_CLOSE reopen. Before recommending that an index be dropped because it shows no or few reads, check that period: if it is shorter than one week, do not recommend dropping it outright; make it an Other recommendation, as a candidate to confirm after a longer observation period, with the period and its source in the rationale. With at least a week you may recommend dropping it, noting in the rationale that monthly or quarterly work may not have run in that time. If that line says the statistics may cover less than the period, say so in the rationale of any drop you recommend. If the time is unknown, say so and apply the same caution. This caution applies only to drops justified by low use. An exact key duplicate, or an index that another index makes redundant (the same leading keys, its included columns and filter covered, and any uniqueness kept; NarrowerIsRedundant true in DUPLICATE AND OVERLAPPING INDEXES), loses nothing when dropped, so recommend dropping it (DropIndex) whatever the period, even when it also shows no or few reads. ',
         N'If untrusted or disabled foreign keys or check constraints are reported, explain that they block optimizer join elimination and predicate pruning, and recommend re-enabling them WITH CHECK (ALTER TABLE ... WITH CHECK CHECK CONSTRAINT ...) after validating that existing data complies, noting the validation scan cost on large tables in the rationale. Use the Constraint category. In the script, make each re-trust conditional on that validation: wrap every ALTER TABLE ... WITH CHECK CHECK CONSTRAINT in IF NOT EXISTS (a query returning rows that violate that constraint), with an ELSE branch that PRINTs the name of the constraint skipped because violating rows exist. That condition is part of the script, not a separate validation script. ',
         N'Recommend statistics updates, creation, or drops when beneficial (Statistics). Recommend query code changes to improve performance (QueryChange). ',
+        N'NON-SARGABLE PREDICATES lists table columns that a statement''s plan wraps in a function, conversion or arithmetic inside a scan or filter predicate, such as YEAR(col) (shown as datepart), MONTH(col), DATEDIFF(DAY, col, @d), CONVERT or CONVERT_IMPLICIT, ISNULL(col, ...), UPPER, LTRIM or col + 1. No index on the column can be sought for such a predicate, so an index alone does not fix it. Also look for these patterns in the WHERE and JOIN predicates of the costly statements in the plan cache and Query Store sections, but when the input says the analysis is limited to a table or schema, only on that table or schema: the plan cache section stays database-wide, so its other statements are out of scope. For each costly statement that has one, make a QueryChange recommendation on its table that gives the SARGable rewrite of the predicate, comparing the bare column with a range or a value computed from the parameters, for example InvoiceDate >= DATEFROMPARTS(@y, @m, 1) AND InvoiceDate < DATEADD(MONTH, 1, DATEFROMPARTS(@y, @m, 1)) for YEAR(InvoiceDate) = @y AND MONTH(InvoiceDate) = @m, CreatedAt >= @d AND CreatedAt < DATEADD(DAY, 1, @d) for DATEDIFF(DAY, CreatedAt, @d) = 0, or a parameter of the column''s own type for a CONVERT_IMPLICIT, and name the statement in benefiting_queries. Recommend an index on the column only together with that rewrite, saying in its rationale that it helps only once the query is rewritten. ',
         N'Use the CARDINALITY ESTIMATION FEEDBACK section. When it says CE feedback cannot run, report that as one Setting recommendation with its reasons in the rationale, not as several recommendations or a headline of the summary. Treat VERIFICATION_REGRESSED and NO_RECOMMENDATION rows as CE feedback working as designed, not as problems. When you recommend forcing a plan or fixing a forced plan failure, apply the rule below on forced plans. When CE feedback for expressions is ON, its own protection checks only cardinality estimates, not run time; Microsoft points to automatic plan correction (FORCE_LAST_GOOD_PLAN, or sys.dm_db_tuning_recommendations when automatic tuning is off) to catch run-time regressions, so mention this in the rationale of the automatic tuning recommendation. ',
         N'CE feedback (cardinality estimation feedback, SQL Server 2022 and later, Azure SQL Database and Azure SQL Managed Instance) runs only where the input says it can run: CE_FEEDBACK ON, compatibility level 160 or higher and Query Store in READ_WRITE. Microsoft also applies it to a query that has the USE HINT QUERY_OPTIMIZER_COMPATIBILITY_LEVEL_160 hint or a higher one. It does not run for a query that has a plan forced through Query Store, hard-coded query hints (an OPTION clause), or Query Store hints set by a user. So wherever CE feedback can run, any recommendation to force a plan, add a query hint, or set a Query Store hint for a query must say that it stops CE feedback from adjusting that query''s estimates. Recommend raising the compatibility level only together with the usual advice for that change: test the workload at the new level and use Query Store to find and fix regressions. Never recommend it for CE feedback alone. Where CE_FEEDBACK is NOT_AVAILABLE, do not present CE feedback as available, and do not say CE feedback for expressions is on unless CE_FEEDBACK_FOR_EXPRESSIONS is reported ON. ',
         -- DOP feedback and optional parameter plan optimization (issue #17), from AI SQL Tuner's
@@ -1816,7 +1921,7 @@ BEGIN
         N'title: a one-line heading that names the change and the object. ',
         N'For CreateIndex, fill schema_name, table_name, index_name, index_type (NONCLUSTERED for a rowstore index, NONCLUSTERED COLUMNSTORE or CLUSTERED COLUMNSTORE), key_columns (in key order, each with descending), include_columns, filter_predicate (null unless the index is filtered), is_unique, fill_factor (null to use the default), data_compression (NONE, ROW, PAGE, or null to leave it unset) and estimated_size_mb, using object and column names exactly as they appear in the input, without brackets. ',
         N'For a nonclustered columnstore index, list its columns in key_columns with descending false and leave include_columns empty. For a clustered columnstore index, leave key_columns and include_columns empty. A columnstore index takes no is_unique, fill_factor or data_compression: use false and null. ',
-        N'For DropIndex, fill schema_name, table_name and index_name with the index to drop, and estimated_size_mb. Use DropIndex only for a nonclustered index to drop now that does not enforce a primary key or unique constraint; put a change to a clustered index or constraint under ConsolidateIndex, and an index to confirm after a longer observation period under Other. ',
+        N'For DropIndex, fill schema_name, table_name and index_name with the index to drop, and estimated_size_mb. Use DropIndex only for a nonclustered index to drop now that does not enforce a primary key or unique constraint; put a change to a clustered index or constraint under ConsolidateIndex, and an index to confirm after a longer observation period under Other. A redundant index is never one to confirm later: it is a DropIndex. ',
         N'A ConsolidateIndex that widens one existing nonclustered rowstore index, keeping that index''s key columns as its leading keys in the same order and direction, keeping every column it includes, and adding key or included columns, is a widening. For a widening, set replaces_index to the existing index''s name and index_name to the same name, because the index is rebuilt in place under its own name, and fill the other fields as for CreateIndex with the complete new definition: every key column, the existing ones first, and every included column, the existing ones too. Script it as one CREATE INDEX ... WITH (DROP_EXISTING = ON). For every other recommendation, replaces_index is null. ',
         N'schema_name is always a schema that appears in the input, never the database name; it is null for a database or server setting. ',
         N'For the other categories, fill schema_name, table_name and index_name when the recommendation is about one object, fill estimated_size_mb when it changes index storage, use null for index_type and false for is_unique, and use empty arrays and null for the other fields that do not apply. ',
@@ -2746,9 +2851,10 @@ BEGIN
     IF @TableName IS NOT NULL AND OBJECT_ID(QUOTENAME(@SchemaName) + N'.' + QUOTENAME(@TableName), N'U') IS NULL
         THROW 50205, N'The table in @SchemaName.@TableName does not exist in this database.', 1;
 
-    DECLARE @IncludeQueryText bit = 1, @KeepDetail bit = 1, @Endpoint nvarchar(400), @Deployment nvarchar(128), @Effort varchar(10);
+    DECLARE @IncludeQueryText bit = 1, @KeepDetail bit = 1, @Endpoint nvarchar(400), @Deployment nvarchar(128), @Effort varchar(10),
+            @MaxPayloadChars int;
     SELECT @IncludeQueryText = IncludeQueryText, @KeepDetail = KeepRunDetail,
-           @Endpoint = Endpoint, @Deployment = Deployment, @Effort = ReasoningEffort
+           @Endpoint = Endpoint, @Deployment = Deployment, @Effort = ReasoningEffort, @MaxPayloadChars = MaxPayloadChars
     FROM AIIndexTuner.Config WHERE ConfigId = 1;
 
     IF @MaxNewIndexes < 0
@@ -2807,6 +2913,15 @@ BEGIN
         DECLARE @UserPrompt nvarchar(max) = CONCAT(CAST(N'Analyze this SQL Server data:' AS nvarchar(max)), NCHAR(10), NCHAR(10), @Data);
         DECLARE @Text nvarchar(max), @ModelUsed nvarchar(128), @InputTokens int, @OutputTokens int, @Truncated bit, @Raw nvarchar(max),
                 @PollCount int, @ModelStarted datetime2(7) = SYSDATETIME();
+
+        -- Checked only when the model is called: a test response sends nothing.
+        IF @TestResponse IS NULL AND LEN(@Data) > @MaxPayloadChars
+        BEGIN
+            DECLARE @SizeError nvarchar(2000) = CONCAT(N'The collected data is ', FORMAT(LEN(@Data), 'N0', 'en-US'), N' characters, over the payload size limit of ',
+                FORMAT(@MaxPayloadChars, 'N0', 'en-US'), N' (AIIndexTuner.Config.MaxPayloadChars), so it was not sent. Narrow the scope with @SchemaName and @TableName, ',
+                N'or raise MaxPayloadChars if the deployment''s context window and tokens-per-minute quota allow a larger request.');
+            THROW 50211, @SizeError, 1;
+        END;
 
         IF @TestResponse IS NOT NULL
             SELECT @Text = @TestResponse, @Truncated = 0;

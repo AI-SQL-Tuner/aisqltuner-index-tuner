@@ -103,6 +103,17 @@ IF COL_LENGTH(N'AIIndexTuner.Run', N'AllowColumnstore') IS NULL
         MaxNewIndexes    int NULL;   -- at most this many new indexes are recommended and created
 GO
 
+/* The largest collected payload sent to the model, in characters; NULL = no limit. A larger one fails
+   before the request with an error that names its size, rather than with whatever the deployment
+   returns: a context-length error, or a tokens-per-minute rate limit that says nothing about size.
+   500,000 characters is roughly 125,000 to 170,000 tokens. WITH VALUES gives existing installs the
+   default too. */
+IF COL_LENGTH(N'AIIndexTuner.Config', N'MaxPayloadChars') IS NULL
+    ALTER TABLE AIIndexTuner.Config ADD
+        MaxPayloadChars int NULL CONSTRAINT DF_AIIndexTuner_Config_MaxPayload DEFAULT (500000) WITH VALUES
+                                 CONSTRAINT CK_AIIndexTuner_Config_MaxPayload CHECK (MaxPayloadChars > 0);
+GO
+
 /* Apply thresholds (sp_AIIndexTuner @MinPriority, @MinConfidence): High, Medium or Low. Only a
    recommendation whose priority level and confidence are at that level or above is applied; the
    rest stay for review. NULL = no minimum. Unlike the change controls, they do not change the prompt. */

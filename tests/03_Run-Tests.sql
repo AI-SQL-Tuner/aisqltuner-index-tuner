@@ -103,7 +103,8 @@ IF @Data NOT LIKE N'%=== MISSING INDEX RECOMMENDATIONS ===%dbo.Orders%'
    OR @Data NOT LIKE N'%=== MISSING INDEX RECOMMENDATIONS ===%"IncludedColumnTypes":"TotalDue decimal(12, 2)"%=== INDEX USAGE STATISTICS ===%'
    OR @Data NOT LIKE N'%=== MISSING INDEX OVERLAP SIGNALS ===%"IncludedColumnTypes":"%=== DUPLICATE AND OVERLAPPING INDEXES ===%'
    OR @Data NOT LIKE N'%=== SKEWED LOW-CARDINALITY COLUMNS ===%'
-   OR @Data NOT LIKE N'%=== DUPLICATE AND OVERLAPPING INDEXES ===%IX_Customers_Region_Dup%'
+   OR @Data NOT LIKE N'%=== DUPLICATE AND OVERLAPPING INDEXES ===%IX_Customers_Region_Dup%"NarrowerIsRedundant":true%=== PLAN CACHE QUERY STATISTICS ===%'
+   OR @Data NOT LIKE N'%=== PLAN CACHE QUERY STATISTICS ===%=== NON-SARGABLE PREDICATES ===%=== HEAP TABLE ANALYSIS ===%'
    OR @Data NOT LIKE N'%=== UNTRUSTED OR DISABLED CONSTRAINTS ===%FK_Orders_Customers%'
    OR @Data NOT LIKE N'%=== COLUMN CARDINALITY ===%EstimatedDistinctValues%'
    OR @Data NOT LIKE N'%=== PLAN CACHE QUERY STATISTICS ===%dbo.Orders AS o%'
@@ -1086,6 +1087,108 @@ DROP INDEX IX_T25_Order ON dbo.Orders;
 DROP INDEX IX_T25_Filtered ON dbo.Orders;
 DROP INDEX IX_T25_Unique ON dbo.Customers;
 PRINT 'PASS T25: CREATE mode widens an index in place under its own name, with UndoDDL that restores it and a widened tag; non-widenings, unique, filtered, clustered and columnstore cases stay for review, and a widening counts towards @MaxNewIndexes';
+GO
+
+/* ===== T26: redundant overlaps, non-SARGable predicates and the payload size limit (issue #21) ===== */
+-- A left prefix with nothing the wider index lacks is redundant; one whose include the wider index
+-- lacks is not; of two exact duplicates, the unique one is kept and the other is the narrower.
+CREATE INDEX IX_T26_Region_Name ON dbo.Customers (Region, CustomerName);
+CREATE INDEX IX_T26_Email_Inc ON dbo.Customers (Email) INCLUDE (CustomerName);
+CREATE INDEX IX_T26_Email_Region ON dbo.Customers (Email, Region);
+CREATE UNIQUE INDEX IX_T26_Email_Unique ON dbo.Customers (Email);
+GO
+-- A function around a table column (YEAR shows as datepart) and an arithmetic one, as sp_executesql
+-- statements so they stay in the plan cache.
+DECLARE @i int = 0, @c int;
+WHILE @i < 5
+BEGIN
+    EXEC sys.sp_executesql N'SELECT @c = COUNT(*) FROM dbo.Orders AS o INNER JOIN dbo.Customers AS c ON c.CustomerId = o.CustomerId WHERE YEAR(o.OrderDate) = @y;',
+                           N'@y int, @c int OUTPUT', @y = 2025, @c = @c OUTPUT;
+    EXEC sys.sp_executesql N'SELECT @c = COUNT(*) FROM dbo.Orders AS o WHERE o.TotalDue * 2 > @t;',
+                           N'@t decimal(12, 2), @c int OUTPUT', @t = 1900, @c = @c OUTPUT;
+    SET @i += 1;
+END;
+GO
+DECLARE @Data nvarchar(max), @Dup nvarchar(max), @Ns nvarchar(max);
+EXEC AIIndexTuner.usp_CollectData @Data = @Data OUTPUT;
+SET @Dup = SUBSTRING(@Data, CHARINDEX(N'=== DUPLICATE AND OVERLAPPING INDEXES ===', @Data) + 42, LEN(@Data));
+SET @Dup = LEFT(@Dup, CHARINDEX(NCHAR(10) + N'===', @Dup));
+SET @Ns = SUBSTRING(@Data, CHARINDEX(N'=== NON-SARGABLE PREDICATES ===', @Data) + 32, LEN(@Data));
+SET @Ns = LEFT(@Ns, CHARINDEX(NCHAR(10) + N'===', @Ns));
+IF ISJSON(@Dup) = 0 OR ISJSON(@Ns) = 0
+    THROW 50999, N'FAIL T26: a section is not a JSON array.', 1;
+
+DROP TABLE IF EXISTS #T26Dup;
+SELECT WiderIndex, NarrowerIndex, NarrowerIsRedundant INTO #T26Dup
+FROM OPENJSON(@Dup) WITH (WiderIndex sysname, NarrowerIndex sysname, NarrowerIsRedundant bit);
+IF NOT EXISTS (SELECT 1 FROM #T26Dup WHERE WiderIndex = N'IX_T26_Region_Name' AND NarrowerIndex = N'IX_Customers_Region' AND NarrowerIsRedundant = 1)
+   OR NOT EXISTS (SELECT 1 FROM #T26Dup WHERE WiderIndex = N'IX_T26_Email_Region' AND NarrowerIndex = N'IX_T26_Email_Inc' AND NarrowerIsRedundant = 0)
+   OR NOT EXISTS (SELECT 1 FROM #T26Dup WHERE WiderIndex = N'IX_T26_Email_Unique' AND NarrowerIndex = N'IX_T26_Email_Inc' AND NarrowerIsRedundant = 0)
+   OR NOT EXISTS (SELECT 1 FROM #T26Dup WHERE WiderIndex = N'IX_T26_Email_Region' AND NarrowerIndex = N'IX_T26_Email_Unique' AND NarrowerIsRedundant = 0)
+   OR EXISTS (SELECT 1 FROM #T26Dup WHERE NarrowerIndex = N'IX_T26_Email_Unique' AND WiderIndex = N'IX_T26_Email_Inc')
+BEGIN
+    SELECT * FROM #T26Dup;
+    THROW 50999, N'FAIL T26: NarrowerIsRedundant is wrong for an overlap (see the result set above).', 1;
+END;
+
+DROP TABLE IF EXISTS #T26Ns;
+SELECT TableName, ColumnName, WrappedBy, Operator, Predicate INTO #T26Ns
+FROM OPENJSON(@Ns) WITH (TableName nvarchar(300), ColumnName sysname, WrappedBy nvarchar(400), Operator nvarchar(60), Predicate nvarchar(400));
+-- The workload's own DATEADD and arithmetic apply to variables, not columns, so they are not listed.
+IF NOT EXISTS (SELECT 1 FROM #T26Ns WHERE TableName = N'dbo.Orders' AND ColumnName = N'OrderDate' AND WrappedBy LIKE N'%datepart%' AND Predicate LIKE N'datepart(year,%OrderDate%')
+   OR NOT EXISTS (SELECT 1 FROM #T26Ns WHERE TableName = N'dbo.Orders' AND ColumnName = N'TotalDue' AND WrappedBy LIKE N'%arithmetic (MULT)%')
+   OR EXISTS (SELECT 1 FROM #T26Ns WHERE ColumnName = N'CustomerId' OR WrappedBy = N'dateadd')
+   -- Hash join bitmap probes and system tables (catalog views) are not the workload's predicates.
+   OR EXISTS (SELECT 1 FROM #T26Ns WHERE WrappedBy LIKE N'%PROBE%' OR TableName LIKE N'sys.%')
+   -- The database name is stripped from the predicate.
+   OR EXISTS (SELECT 1 FROM #T26Ns WHERE CHARINDEX(QUOTENAME(DB_NAME()), Predicate) > 0)
+BEGIN
+    SELECT * FROM #T26Ns;
+    THROW 50999, N'FAIL T26: NON-SARGABLE PREDICATES is missing a wrapped column or lists an unwrapped one (see the result set above).', 1;
+END;
+GO
+
+-- Over MaxPayloadChars, a live run fails before the request with an error that names the size; a test
+-- response sends nothing, so it is not limited. Needs a Config row of its own, so that the check, not a
+-- real endpoint, stops the run.
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Config)
+BEGIN
+    INSERT AIIndexTuner.Config (ConfigId, Endpoint, Deployment, CredentialName, MaxPayloadChars)
+    VALUES (1, N'https://t26.invalid/', N't26', N'https://t26.invalid', 1000);
+    DECLARE @Big nvarchar(max) = REPLICATE(CAST(N'x' AS nvarchar(max)), 2000), @RunId int;
+    BEGIN TRY
+        EXEC dbo.sp_AIIndexTuner @CollectedData = @Big;
+        DELETE AIIndexTuner.Config;
+        THROW 50999, N'FAIL T26: a payload over MaxPayloadChars did not raise an error.', 1;
+    END TRY
+    BEGIN CATCH
+        IF ERROR_NUMBER() <> 50211 BEGIN DELETE AIIndexTuner.Config; THROW; END;
+    END CATCH;
+    SET @RunId = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
+    IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Run WHERE RunId = @RunId AND Status = 'Failed' AND CollectedChars = 2000 AND ModelMs IS NULL
+                     AND ErrorMessage LIKE N'The collected data is 2,000 characters, over the payload size limit of 1,000 (AIIndexTuner.Config.MaxPayloadChars)%')
+    BEGIN
+        DELETE AIIndexTuner.Config;
+        THROW 50999, N'FAIL T26: the failed run does not record the payload size error.', 1;
+    END;
+
+    EXEC dbo.sp_AIIndexTuner @CollectedData = @Big, @TestResponse = N'{"summary": "s", "recommendations": []}';
+    DELETE AIIndexTuner.Config;
+    IF (SELECT Status FROM AIIndexTuner.Run WHERE RunId = (SELECT MAX(RunId) FROM AIIndexTuner.Run)) <> 'Succeeded'
+        THROW 50999, N'FAIL T26: the payload size limit stopped a test response.', 1;
+END
+ELSE
+    PRINT 'SKIP T26 payload size limit: AIIndexTuner.Config has a row';
+
+-- The default is 500,000 characters.
+IF (SELECT dc.definition FROM sys.default_constraints AS dc WHERE dc.name = N'DF_AIIndexTuner_Config_MaxPayload') <> N'((500000))'
+    THROW 50999, N'FAIL T26: MaxPayloadChars does not default to 500,000.', 1;
+
+DROP INDEX IX_T26_Region_Name ON dbo.Customers;
+DROP INDEX IX_T26_Email_Inc ON dbo.Customers;
+DROP INDEX IX_T26_Email_Region ON dbo.Customers;
+DROP INDEX IX_T26_Email_Unique ON dbo.Customers;
+PRINT 'PASS T26: redundant left prefixes and duplicates are flagged and the unique twin is kept, wrapped columns are listed from the plan with their predicate, and a payload over MaxPayloadChars fails before the request with its size';
 GO
 
 PRINT 'ALL TESTS PASSED';

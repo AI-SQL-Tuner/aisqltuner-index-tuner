@@ -83,9 +83,10 @@ BEGIN
     IF @TableName IS NOT NULL AND OBJECT_ID(QUOTENAME(@SchemaName) + N'.' + QUOTENAME(@TableName), N'U') IS NULL
         THROW 50205, N'The table in @SchemaName.@TableName does not exist in this database.', 1;
 
-    DECLARE @IncludeQueryText bit = 1, @KeepDetail bit = 1, @Endpoint nvarchar(400), @Deployment nvarchar(128), @Effort varchar(10);
+    DECLARE @IncludeQueryText bit = 1, @KeepDetail bit = 1, @Endpoint nvarchar(400), @Deployment nvarchar(128), @Effort varchar(10),
+            @MaxPayloadChars int;
     SELECT @IncludeQueryText = IncludeQueryText, @KeepDetail = KeepRunDetail,
-           @Endpoint = Endpoint, @Deployment = Deployment, @Effort = ReasoningEffort
+           @Endpoint = Endpoint, @Deployment = Deployment, @Effort = ReasoningEffort, @MaxPayloadChars = MaxPayloadChars
     FROM AIIndexTuner.Config WHERE ConfigId = 1;
 
     IF @MaxNewIndexes < 0
@@ -144,6 +145,15 @@ BEGIN
         DECLARE @UserPrompt nvarchar(max) = CONCAT(CAST(N'Analyze this SQL Server data:' AS nvarchar(max)), NCHAR(10), NCHAR(10), @Data);
         DECLARE @Text nvarchar(max), @ModelUsed nvarchar(128), @InputTokens int, @OutputTokens int, @Truncated bit, @Raw nvarchar(max),
                 @PollCount int, @ModelStarted datetime2(7) = SYSDATETIME();
+
+        -- Checked only when the model is called: a test response sends nothing.
+        IF @TestResponse IS NULL AND LEN(@Data) > @MaxPayloadChars
+        BEGIN
+            DECLARE @SizeError nvarchar(2000) = CONCAT(N'The collected data is ', FORMAT(LEN(@Data), 'N0', 'en-US'), N' characters, over the payload size limit of ',
+                FORMAT(@MaxPayloadChars, 'N0', 'en-US'), N' (AIIndexTuner.Config.MaxPayloadChars), so it was not sent. Narrow the scope with @SchemaName and @TableName, ',
+                N'or raise MaxPayloadChars if the deployment''s context window and tokens-per-minute quota allow a larger request.');
+            THROW 50211, @SizeError, 1;
+        END;
 
         IF @TestResponse IS NOT NULL
             SELECT @Text = @TestResponse, @Truncated = 0;

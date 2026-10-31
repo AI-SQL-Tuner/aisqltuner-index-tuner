@@ -168,12 +168,15 @@ INSERT AIIndexTunerBench.RubricCheck (CheckId, CaseId, Kind, Variant, Descriptio
  @R + N'r.ScriptC LIKE N''%ONLINE=ON%'''),
 
 /* ----- P4: huge payload (over 550,000 characters) ----- */
-('P4-R1', 'P4', 'required', 'P4', N'A huge payload either succeeds or fails with an error that names the size or token limit',
+-- A tokens-per-minute rate limit ("exceeded token rate limit", HTTP 429) is the deployment's quota, not
+-- the size limit P4 tests, so it does not pass even though it says "token" (issue #21).
+('P4-R1', 'P4', 'required', 'P4', N'A huge payload either succeeds or fails with an error that names the size or token limit, not a rate limit',
  N'SELECT @Hits = COUNT(*) FROM AIIndexTuner.Run AS run
    WHERE run.RunId = @RunId
      AND (run.Status = ''Succeeded''
-          OR run.ErrorMessage LIKE N''%token%'' OR run.ErrorMessage LIKE N''%context%'' OR run.ErrorMessage LIKE N''%too large%''
-          OR run.ErrorMessage LIKE N''%size%'' OR run.ErrorMessage LIKE N''%length%'')'),
+          OR ((run.ErrorMessage LIKE N''%token%'' OR run.ErrorMessage LIKE N''%context%'' OR run.ErrorMessage LIKE N''%too large%''
+               OR run.ErrorMessage LIKE N''%size%'' OR run.ErrorMessage LIKE N''%length%'')
+              AND run.ErrorMessage NOT LIKE N''%rate limit%'' AND run.ErrorMessage NOT LIKE N''%HTTP 429%''))'),
 ('P4-F1', 'P4', 'forbidden', 'P4', N'A huge payload never leaves partial results: no truncated success, and no rows from a failed run',
  N'SELECT @Hits = COUNT(*) FROM AIIndexTuner.Run AS run
    WHERE run.RunId = @RunId
