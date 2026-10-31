@@ -605,7 +605,8 @@ BEGIN
             ORDER BY qs.total_worker_time DESC)
         -- A column of a table in this database (parameters and variables have no Table) under an
         -- Intrinsic (YEAR shows as datepart), Convert, Arithmetic or user-defined function. LIKE is an
-        -- Intrinsic too, but it compares the column rather than wrapping it.
+        -- Intrinsic too, but it compares the column rather than wrapping it, and PROBE is a bitmap
+        -- filter the optimizer adds to a hash join, not part of the query.
         SELECT DISTINCT s.stmt_id, s.query_hash, s.execution_count, s.total_worker_time, s.total_logical_reads,
                PARSENAME(c.n.value('@Schema', 'nvarchar(260)'), 1) AS schema_name,
                PARSENAME(c.n.value('@Table', 'nvarchar(260)'), 1) AS table_name,
@@ -620,7 +621,7 @@ BEGIN
         INTO #NonSargable
         FROM stmts AS s
         CROSS APPLY s.plan_xml.nodes('//RelOp[*/Predicate]') AS ro(n)
-        CROSS APPLY ro.n.nodes('*/Predicate//*[self::Intrinsic[@FunctionName != "like"] or self::Convert or self::Arithmetic or self::UserDefinedFunction]') AS f(n)
+        CROSS APPLY ro.n.nodes('*/Predicate//*[self::Intrinsic[@FunctionName != "like" and @FunctionName != "PROBE"] or self::Convert or self::Arithmetic or self::UserDefinedFunction]') AS f(n)
         CROSS APPLY f.n.nodes('.//ColumnReference[@Table]') AS c(n)
         WHERE c.n.value('@Database', 'nvarchar(260)') = QUOTENAME(DB_NAME());
 
@@ -642,6 +643,8 @@ BEGIN
             FROM (SELECT DISTINCT stmt_id, query_hash, execution_count, total_worker_time, total_logical_reads, schema_name, table_name, column_name
                   FROM #NonSargable
                   WHERE schema_name NOT LIKE N'AIIndexTuner%'
+                    -- User tables only: catalog views resolve to system tables such as sys.sysidxstats.
+                    AND OBJECTPROPERTY(OBJECT_ID(QUOTENAME(schema_name) + N'.' + QUOTENAME(table_name)), 'IsUserTable') = 1
                     AND (@SchemaName IS NULL OR schema_name = @SchemaName) AND (@TableName IS NULL OR table_name = @TableName)) AS k
             -- The deepest operator whose predicate wraps the column, usually the scan.
             CROSS APPLY (SELECT TOP (1) n.operator, n.predicate FROM #NonSargable AS n

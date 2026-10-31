@@ -1138,6 +1138,8 @@ FROM OPENJSON(@Ns) WITH (TableName nvarchar(300), ColumnName sysname, WrappedBy 
 IF NOT EXISTS (SELECT 1 FROM #T26Ns WHERE TableName = N'dbo.Orders' AND ColumnName = N'OrderDate' AND WrappedBy LIKE N'%datepart%' AND Predicate LIKE N'datepart(year,%OrderDate%')
    OR NOT EXISTS (SELECT 1 FROM #T26Ns WHERE TableName = N'dbo.Orders' AND ColumnName = N'TotalDue' AND WrappedBy LIKE N'%arithmetic (MULT)%')
    OR EXISTS (SELECT 1 FROM #T26Ns WHERE ColumnName = N'CustomerId' OR WrappedBy = N'dateadd')
+   -- Hash join bitmap probes and system tables (catalog views) are not the workload's predicates.
+   OR EXISTS (SELECT 1 FROM #T26Ns WHERE WrappedBy LIKE N'%PROBE%' OR TableName LIKE N'sys.%')
    -- The database name is stripped from the predicate.
    OR EXISTS (SELECT 1 FROM #T26Ns WHERE CHARINDEX(QUOTENAME(DB_NAME()), Predicate) > 0)
 BEGIN
