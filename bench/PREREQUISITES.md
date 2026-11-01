@@ -34,6 +34,17 @@ This needs `ALTER SETTINGS` (sysadmin or serveradmin). It is a server-level chan
 2. Run `setup/Configure-Endpoint.sql`, using **option B, managed identity**, rather than an API key. Give the server's managed identity the *Cognitive Services OpenAI User* role on the Azure OpenAI resource.
 3. The benchmark adds its tables in the `bench` schema and its rubric objects in `AIIndexTunerBench`. To remove both afterwards, run `bench\challenge\09_Drop-ChallengeTables.sql`.
 
+### Statistics settings, before every run
+
+`AUTO_CREATE_STATISTICS` and `AUTO_UPDATE_STATISTICS` must be `ON` in the target database. The workload creates the column statistics that the collector's COLUMN CARDINALITY and SKEWED LOW-CARDINALITY COLUMNS sections read. Without them, both sections come back empty and C2-F1 and C2-P1 fail. `Run-Rubric.ps1` checks this first, before it changes anything.
+
+The impact benchmark turns both off on `IndexTunerChallenge` on `VMEnt` to freeze statistics, so check them after an impact run:
+
+```sql
+ALTER DATABASE IndexTunerChallenge SET AUTO_CREATE_STATISTICS ON;
+ALTER DATABASE IndexTunerChallenge SET AUTO_UPDATE_STATISTICS ON;
+```
+
 ## 4. Permissions
 
 If the benchmark login is not the owner of the database, it needs:

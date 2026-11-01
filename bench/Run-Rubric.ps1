@@ -88,12 +88,14 @@ function Assert-Prerequisite([string]$Item, [bool]$Ok, [string]$Detail) {
 
 Write-Host "Server $Server, database $Database, mode $Mode$(if ($Azure) { ', Azure SQL Database' })"
 
-# ----- Prerequisites 1 and 2 (before changing anything) -----
+# ----- Prerequisites 1 and 2, and the statistics settings of 3 (before changing anything) -----
 if ($Mode -eq 'Live') {
     Write-Host 'Prerequisites:'
     $p = Get-Json @"
 SELECT CAST(SERVERPROPERTY('EngineEdition') AS int) AS EngineEdition,
-       (SELECT CAST(value_in_use AS int) FROM sys.configurations WHERE name = N'external rest endpoint enabled') AS RestEnabled
+       (SELECT CAST(value_in_use AS int) FROM sys.configurations WHERE name = N'external rest endpoint enabled') AS RestEnabled,
+       d.is_auto_create_stats_on AS AutoCreateStats, d.is_auto_update_stats_on AS AutoUpdateStats
+FROM sys.databases AS d WHERE d.database_id = DB_ID()
 FOR JSON PATH, WITHOUT_ARRAY_WRAPPER;
 "@
     if ($Azure) {
@@ -103,6 +105,11 @@ FOR JSON PATH, WITHOUT_ARRAY_WRAPPER;
         Assert-Prerequisite '1. Enterprise-capable edition (EngineEdition 3)' ($p.EngineEdition -eq 3) "EngineEdition is $($p.EngineEdition)"
         Assert-Prerequisite "2. 'external rest endpoint enabled' = 1" ($p.RestEnabled -eq 1) "value_in_use is $($p.RestEnabled)"
     }
+    # The impact benchmark turns these off to freeze statistics. A build then leaves the tables with no
+    # column statistics, the skew and cardinality sections come back empty, and C2-F1 and C2-P1 fail.
+    $off = @(if (-not $p.AutoCreateStats) { 'AUTO_CREATE_STATISTICS' }; if (-not $p.AutoUpdateStats) { 'AUTO_UPDATE_STATISTICS' })
+    Assert-Prerequisite '3. AUTO_CREATE_STATISTICS and AUTO_UPDATE_STATISTICS ON' ($off.Count -eq 0) `
+        "$($off -join ' and ') OFF, so the workload creates no column statistics. Run: $(($off | ForEach-Object { "ALTER DATABASE CURRENT SET $_ ON;" }) -join ' ')"
 }
 
 # ----- Build -----
