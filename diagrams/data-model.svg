@@ -1,0 +1,175 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="1600" height="900" font-family="'Segoe UI', -apple-system, 'Helvetica Neue', Arial, sans-serif" text-rendering="geometricPrecision">
+  <title>aisqltuner-index-tuner data model</title>
+  <desc>Three tables in the AIIndexTuner schema. Config holds one row of settings. Run holds one row per call of sp_AIIndexTuner. Recommendation holds one row per recommendation and references its Run. Indexes the tool creates are tagged with an extended property.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#F1F6FD"/>
+    </linearGradient>
+    <filter id="sh" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#0B2545" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arGray" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 0L10 5L0 10z" fill="#64748B"/>
+    </marker>
+  </defs>
+
+  <rect width="1600" height="900" fill="url(#bg)"/>
+
+  <!-- Header -->
+  <text x="40" y="42" font-size="14" font-weight="700" letter-spacing="2.5" fill="#2563EB">AISQLTUNER-INDEX-TUNER</text>
+  <text x="40" y="88" font-size="46" font-weight="800" fill="#0B2545">Data model</text>
+  <text x="40" y="120" font-size="20" fill="#475569">Three tables in the AIIndexTuner schema: settings, runs and recommendations</text>
+  <rect x="1330" y="46" width="230" height="36" rx="18" fill="#0B2545"/>
+  <text x="1445" y="70" font-size="15" font-weight="600" fill="#FFFFFF" text-anchor="middle">Open source · MIT license</text>
+
+  <!-- ===== Config ===== -->
+  <rect x="40" y="150" width="400" height="350" rx="14" fill="#FFFFFF" stroke="#CBDAF2" filter="url(#sh)"/>
+  <path d="M40 212V164a14 14 0 0 1 14-14h372a14 14 0 0 1 14 14v48z" fill="#0B2545"/>
+  <text x="64" y="180" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="18" font-weight="700" fill="#FFFFFF">AIIndexTuner.Config</text>
+  <text x="64" y="200" font-size="12.5" fill="#BFD3F6">One row: how to call the model</text>
+  <rect x="64" y="223" width="26" height="16" rx="4" fill="#2563EB"/>
+  <text x="77" y="235" font-size="10" font-weight="700" fill="#FFFFFF" text-anchor="middle">PK</text>
+  <text x="100" y="236" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="13.5" font-weight="700" fill="#0B2545">ConfigId</text>
+  <text x="182" y="236" font-size="12" fill="#64748B">always 1</text>
+  <line x1="64" y1="248" x2="416" y2="248" stroke="#E2E8F0"/>
+  <g font-size="11" font-weight="700" letter-spacing="1.4" fill="#64748B">
+    <text x="64" y="268">WHERE TO CALL</text>
+    <text x="64" y="310">MODEL SETTINGS</text>
+    <text x="64" y="352">LIMITS</text>
+    <text x="64" y="413">BEHAVIOR</text>
+    <text x="64" y="455">PRIVACY AND DETAIL</text>
+  </g>
+  <g font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="12.5" fill="#0B2545">
+    <text x="64" y="288">Endpoint · Deployment · CredentialName</text>
+    <text x="64" y="330">ReasoningEffort · MaxOutputTokens</text>
+    <text x="64" y="372">RequestTimeoutSec · MaxWaitSec · PollIntervalSec</text>
+    <text x="64" y="391">MaxPayloadChars</text>
+    <text x="64" y="433">UseBackgroundMode · UseStructuredOutput</text>
+    <text x="64" y="475">IncludeQueryText · KeepRunDetail</text>
+  </g>
+
+  <!-- Legend -->
+  <rect x="40" y="525" width="400" height="145" rx="14" fill="#FFFFFF" stroke="#CBDAF2"/>
+  <text x="64" y="552" font-size="11" font-weight="700" letter-spacing="1.4" fill="#64748B">HOW TO READ</text>
+  <rect x="64" y="563" width="26" height="16" rx="4" fill="#2563EB"/>
+  <text x="77" y="575" font-size="10" font-weight="700" fill="#FFFFFF" text-anchor="middle">PK</text>
+  <text x="108" y="576" font-size="13.5" fill="#334155">Primary key</text>
+  <rect x="64" y="587" width="26" height="16" rx="4" fill="#0E7490"/>
+  <text x="77" y="599" font-size="10" font-weight="700" fill="#FFFFFF" text-anchor="middle">FK</text>
+  <text x="108" y="600" font-size="13.5" fill="#334155">Foreign key, enforced by SQL Server</text>
+  <g stroke="#2563EB" stroke-width="2" fill="none">
+    <line x1="62" y1="619" x2="92" y2="619"/>
+    <path d="M80 619l12-7M80 619l12 0M80 619l12 7"/>
+  </g>
+  <text x="108" y="624" font-size="13.5" fill="#334155">One-to-many</text>
+  <line x1="62" y1="643" x2="92" y2="643" stroke="#64748B" stroke-width="2" stroke-dasharray="5 4"/>
+  <text x="108" y="648" font-size="13.5" fill="#334155">Value copied, no foreign key</text>
+
+  <!-- Config -> Run (logical) -->
+  <path d="M441 278H505V430H567" fill="none" stroke="#64748B" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#arGray)"/>
+  <rect x="457" y="336" width="96" height="40" rx="8" fill="#F5F8FD"/>
+  <text x="505" y="353" font-size="12" fill="#475569" text-anchor="middle">copied into</text>
+  <text x="505" y="369" font-size="12" fill="#475569" text-anchor="middle">each run</text>
+
+  <!-- ===== Run ===== -->
+  <rect x="570" y="150" width="480" height="520" rx="14" fill="#FFFFFF" stroke="#CBDAF2" filter="url(#sh)"/>
+  <path d="M570 212V164a14 14 0 0 1 14-14h452a14 14 0 0 1 14 14v48z" fill="#2563EB"/>
+  <text x="594" y="180" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="18" font-weight="700" fill="#FFFFFF">AIIndexTuner.Run</text>
+  <text x="594" y="200" font-size="12.5" fill="#DCE8FD">One row per call of sp_AIIndexTuner</text>
+  <rect x="594" y="223" width="26" height="16" rx="4" fill="#2563EB"/>
+  <text x="607" y="235" font-size="10" font-weight="700" fill="#FFFFFF" text-anchor="middle">PK</text>
+  <text x="630" y="236" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="13.5" font-weight="700" fill="#0B2545">RunId</text>
+  <text x="684" y="236" font-size="12" fill="#64748B">int identity</text>
+  <line x1="594" y1="248" x2="1026" y2="248" stroke="#E2E8F0"/>
+  <g font-size="11" font-weight="700" letter-spacing="1.4" fill="#64748B">
+    <text x="594" y="268">WHEN AND WHO</text>
+    <text x="594" y="310">SCOPE</text>
+    <text x="594" y="352">CHANGE CONTROLS</text>
+    <text x="594" y="413">MODEL CALL</text>
+    <text x="594" y="474">TIMING</text>
+    <text x="594" y="516">PAYLOAD</text>
+    <text x="594" y="577">OUTCOME</text>
+  </g>
+  <g font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="12.5" fill="#0B2545">
+    <text x="594" y="288">StartedAt · CompletedAt · StartedBy</text>
+    <text x="594" y="330">Mode · SchemaName · TableName</text>
+    <text x="594" y="372">AllowColumnstore · AllowDropIndex · MaxNewIndexes</text>
+    <text x="594" y="391">MinPriority · MinConfidence</text>
+    <text x="594" y="433">Endpoint · Deployment · ReasoningEffort · ModelUsed</text>
+    <text x="594" y="452">InputTokens · OutputTokens · PollCount</text>
+    <text x="594" y="494">CollectMs · ModelMs · ApplyMs</text>
+    <text x="594" y="536">CollectedChars · PayloadHash (SHA-256) · CollectedData</text>
+    <text x="594" y="555">RawResponse</text>
+    <text x="594" y="597">Status · ErrorMessage · Summary</text>
+  </g>
+
+  <!-- Run -> Recommendation (FK, one to many) -->
+  <path d="M1051 229H1100V260H1130" fill="none" stroke="#2563EB" stroke-width="2.2"/>
+  <g stroke="#2563EB" stroke-width="2.2" fill="none">
+    <line x1="1062" y1="222" x2="1062" y2="236"/>
+    <line x1="1068" y1="222" x2="1068" y2="236"/>
+    <path d="M1130 260L1149 248M1130 260L1149 260M1130 260L1149 272"/>
+    <line x1="1126" y1="251" x2="1126" y2="269"/>
+  </g>
+  <text x="1100" y="292" font-size="12" fill="#475569" text-anchor="middle">one run,</text>
+  <text x="1100" y="308" font-size="12" fill="#475569" text-anchor="middle">many recs</text>
+
+  <!-- ===== Recommendation ===== -->
+  <rect x="1150" y="150" width="410" height="520" rx="14" fill="#FFFFFF" stroke="#CBDAF2" filter="url(#sh)"/>
+  <path d="M1150 212V164a14 14 0 0 1 14-14h382a14 14 0 0 1 14 14v48z" fill="#0E7490"/>
+  <text x="1174" y="180" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="18" font-weight="700" fill="#FFFFFF">AIIndexTuner.Recommendation</text>
+  <text x="1174" y="200" font-size="12.5" fill="#CDEFF6">One row per recommendation</text>
+  <rect x="1174" y="223" width="26" height="16" rx="4" fill="#2563EB"/>
+  <text x="1187" y="235" font-size="10" font-weight="700" fill="#FFFFFF" text-anchor="middle">PK</text>
+  <text x="1210" y="236" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="13.5" font-weight="700" fill="#0B2545">RecommendationId</text>
+  <text x="1340" y="236" font-size="12" fill="#64748B">int identity</text>
+  <rect x="1174" y="253" width="26" height="16" rx="4" fill="#0E7490"/>
+  <text x="1187" y="265" font-size="10" font-weight="700" fill="#FFFFFF" text-anchor="middle">FK</text>
+  <text x="1210" y="266" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="13.5" font-weight="700" fill="#0B2545">RunId</text>
+  <text x="1266" y="266" font-size="12" fill="#64748B">references Run</text>
+  <line x1="1174" y1="278" x2="1536" y2="278" stroke="#E2E8F0"/>
+  <g font-size="11" font-weight="700" letter-spacing="1.4" fill="#64748B">
+    <text x="1174" y="298">RANKING</text>
+    <text x="1174" y="340">WHAT AND WHY</text>
+    <text x="1174" y="401">TARGET</text>
+    <text x="1174" y="462">DEFINITION</text>
+    <text x="1174" y="542">FOR REVIEW ONLY</text>
+    <text x="1174" y="584">STATUS</text>
+    <text x="1174" y="626">WHAT WAS DONE</text>
+  </g>
+  <g font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="12.5" fill="#0B2545">
+    <text x="1174" y="318">Priority (rank) · PriorityLevel · Confidence</text>
+    <text x="1174" y="360">Category · Title · IndexType · Rationale</text>
+    <text x="1174" y="379">BenefitingQueries (JSON)</text>
+    <text x="1174" y="421">SchemaName · TableName · IndexName</text>
+    <text x="1174" y="440">ReplacesIndex</text>
+    <text x="1174" y="482">KeyColumns (JSON) · IncludeColumns (JSON)</text>
+    <text x="1174" y="501">FilterPredicate · IsUnique · FillFactor</text>
+    <text x="1174" y="520">DataCompression · EstimatedSizeMB</text>
+    <text x="1174" y="562">Script (the model's T-SQL, never executed)</text>
+    <text x="1174" y="604">Status · StatusReason</text>
+    <text x="1174" y="646">AppliedDDL · AppliedAt · AppliedBy · UndoDDL</text>
+  </g>
+
+  <!-- Recommendation -> your indexes -->
+  <line x1="1355" y1="672" x2="1355" y2="718" stroke="#64748B" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#arGray)"/>
+  <text x="1367" y="700" font-size="12" fill="#475569">applies changes</text>
+
+  <!-- Your indexes strip -->
+  <rect x="40" y="722" width="1520" height="96" rx="14" fill="#EAF1FE" stroke="#9DBBF0" stroke-width="1.5"/>
+  <g transform="translate(66 752)" fill="none" stroke="#2563EB" stroke-width="2.2" stroke-linejoin="round">
+    <rect x="1" y="3" width="26" height="24" rx="3"/>
+    <path d="M1 11h26M1 19h26M10 3v24"/>
+  </g>
+  <text x="112" y="764" font-size="20" font-weight="700" fill="#0B2545">Your indexes</text>
+  <text x="112" y="788" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="13" fill="#2563EB">sys.indexes · extended property AIIndexTuner</text>
+  <text x="620" y="760" font-size="15.5" fill="#334155">Every index the tool creates is tagged with the extended property AIIndexTuner,</text>
+  <text x="620" y="782" font-size="15.5" fill="#334155">naming the run and the recommendation, so you can always find what it built.</text>
+  <text x="620" y="804" font-size="15.5" fill="#334155">A widened index says <tspan font-weight="700">Widened by</tspan>: roll it back with its UndoDDL.</text>
+
+  <!-- Footer -->
+  <line x1="40" y1="858" x2="1560" y2="858" stroke="#D5E0F2"/>
+  <text x="40" y="883" font-size="15" font-weight="600" fill="#0B2545">github.com/AI-SQL-Tuner/aisqltuner-index-tuner</text>
+  <text x="1560" y="883" font-size="15" fill="#64748B" text-anchor="end">Free and open source from AI SQL Tuner · aisqltuner.com</text>
+</svg>

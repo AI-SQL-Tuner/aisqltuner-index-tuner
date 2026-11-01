@@ -1,0 +1,212 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="1600" height="900" font-family="'Segoe UI', -apple-system, 'Helvetica Neue', Arial, sans-serif" text-rendering="geometricPrecision">
+  <title>aisqltuner-index-tuner recommendation types</title>
+  <desc>Nine recommendation categories. CreateIndex, ConsolidateIndex and DropIndex can be applied automatically within the change controls. RebuildIndex, Constraint, Statistics, Setting, QueryChange and Other are always left for review.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#F1F6FD"/>
+    </linearGradient>
+    <filter id="sh" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#0B2545" flood-opacity="0.10"/>
+    </filter>
+  </defs>
+
+  <rect width="1600" height="900" fill="url(#bg)"/>
+
+  <!-- Header -->
+  <text x="40" y="42" font-size="14" font-weight="700" letter-spacing="2.5" fill="#2563EB">AISQLTUNER-INDEX-TUNER</text>
+  <text x="40" y="88" font-size="46" font-weight="800" fill="#0B2545">Recommendation types</text>
+  <text x="40" y="120" font-size="20" fill="#475569">More than indexes: nine categories of advice, and only some can be applied automatically</text>
+  <rect x="1330" y="46" width="230" height="36" rx="18" fill="#0B2545"/>
+  <text x="1445" y="70" font-size="15" font-weight="600" fill="#FFFFFF" text-anchor="middle">Open source · MIT license</text>
+
+  <!-- Section A label -->
+  <rect x="40" y="154" width="6" height="26" rx="3" fill="#16A34A"/>
+  <text x="58" y="173" font-size="15" font-weight="800" letter-spacing="1.6" fill="#0B2545">INDEX CHANGES THE TOOL CAN APPLY</text>
+  <text x="438" y="173" font-size="15" fill="#64748B">in CREATE mode, within your change controls and thresholds</text>
+
+  <!-- A1: CreateIndex -->
+  <rect x="40" y="190" width="490" height="220" rx="16" fill="#FFFFFF" stroke="#CBDAF2" filter="url(#sh)"/>
+  <circle cx="76" cy="228" r="22" fill="#EAF1FE"/>
+  <path transform="translate(64 216)" d="M12 5v14M5 12h14" fill="none" stroke="#2563EB" stroke-width="2.4" stroke-linecap="round"/>
+  <text x="110" y="226" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="20" font-weight="700" fill="#0B2545">CreateIndex</text>
+  <text x="110" y="248" font-size="13.5" fill="#64748B">Add a new index</text>
+  <line x1="64" y1="268" x2="506" y2="268" stroke="#E2E8F0"/>
+  <g font-size="10.5" font-weight="800" letter-spacing="1" fill="#FFFFFF" text-anchor="middle">
+    <rect x="64" y="282" width="104" height="26" rx="13" fill="#16A34A"/><text x="116" y="299">AUTOMATIC</text>
+    <rect x="64" y="324" width="104" height="26" rx="13" fill="#D97706"/><text x="116" y="341">IF ALLOWED</text>
+    <rect x="64" y="366" width="104" height="26" rx="13" fill="#2563EB"/><text x="116" y="383">REVIEW</text>
+  </g>
+  <g font-size="14.5" fill="#334155">
+    <text x="184" y="300">Nonclustered rowstore index</text>
+    <text x="184" y="342">Columnstore: @AllowColumnstore = 1</text>
+    <text x="184" y="384">Filtered index: the predicate is free text</text>
+  </g>
+
+  <!-- A2: ConsolidateIndex -->
+  <rect x="555" y="190" width="490" height="220" rx="16" fill="#FFFFFF" stroke="#CBDAF2" filter="url(#sh)"/>
+  <circle cx="591" cy="228" r="22" fill="#EAF1FE"/>
+  <path transform="translate(579 216)" d="M3 12h18M7 8l-4 4 4 4M17 8l4 4-4 4" fill="none" stroke="#2563EB" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="625" y="226" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="20" font-weight="700" fill="#0B2545">ConsolidateIndex</text>
+  <text x="625" y="248" font-size="13.5" fill="#64748B">Widen or replace an index</text>
+  <line x1="579" y1="268" x2="1021" y2="268" stroke="#E2E8F0"/>
+  <g font-size="10.5" font-weight="800" letter-spacing="1" fill="#FFFFFF" text-anchor="middle">
+    <rect x="579" y="282" width="104" height="26" rx="13" fill="#16A34A"/><text x="631" y="299">AUTOMATIC</text>
+    <rect x="579" y="324" width="104" height="26" rx="13" fill="#2563EB"/><text x="631" y="341">REVIEW</text>
+    <rect x="579" y="366" width="104" height="26" rx="13" fill="#2563EB"/><text x="631" y="383">REVIEW</text>
+  </g>
+  <g font-size="14.5" fill="#334155">
+    <text x="699" y="300">Widen one nonclustered index in place</text>
+    <text x="699" y="342">Merge several indexes into one</text>
+    <text x="699" y="384">Change a clustered index or its keys</text>
+  </g>
+
+  <!-- A3: DropIndex -->
+  <rect x="1070" y="190" width="490" height="220" rx="16" fill="#FFFFFF" stroke="#CBDAF2" filter="url(#sh)"/>
+  <circle cx="1106" cy="228" r="22" fill="#EAF1FE"/>
+  <path transform="translate(1094 216)" d="M5 12h14" fill="none" stroke="#2563EB" stroke-width="2.4" stroke-linecap="round"/>
+  <text x="1140" y="226" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="20" font-weight="700" fill="#0B2545">DropIndex</text>
+  <text x="1140" y="248" font-size="13.5" fill="#64748B">Remove an index</text>
+  <line x1="1094" y1="268" x2="1536" y2="268" stroke="#E2E8F0"/>
+  <g font-size="10.5" font-weight="800" letter-spacing="1" fill="#FFFFFF" text-anchor="middle">
+    <rect x="1094" y="282" width="104" height="26" rx="13" fill="#D97706"/><text x="1146" y="299">IF ALLOWED</text>
+    <rect x="1094" y="324" width="104" height="26" rx="13" fill="#DC2626"/><text x="1146" y="341">REFUSED</text>
+    <rect x="1094" y="366" width="104" height="26" rx="13" fill="#2563EB"/><text x="1146" y="383">REVIEW</text>
+  </g>
+  <g font-size="14.5" fill="#334155">
+    <text x="1214" y="300">Redundant or unused: @AllowDropIndex = 1</text>
+    <text x="1214" y="342">Clustered, unique, FK, hinted, forced-plan</text>
+    <text x="1214" y="384">The default: recommend-only</text>
+  </g>
+
+  <!-- Section B label -->
+  <rect x="40" y="436" width="6" height="26" rx="3" fill="#2563EB"/>
+  <text x="58" y="455" font-size="15" font-weight="800" letter-spacing="1.6" fill="#0B2545">BEYOND NEW INDEXES</text>
+  <text x="296" y="455" font-size="15" fill="#64748B">rebuilds, constraints, statistics, settings and query rewrites: always for your review</text>
+
+  <!-- B1: RebuildIndex -->
+  <rect x="40" y="474" width="235" height="242" rx="16" fill="#FFFFFF" stroke="#CBDAF2" filter="url(#sh)"/>
+  <circle cx="74" cy="512" r="20" fill="#EAF1FE"/>
+  <path transform="translate(62 500)" d="M20 12a8 8 0 1 1-2.5-5.800M20 4v5h-5" fill="none" stroke="#2563EB" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="104" y="518" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="15.5" font-weight="700" fill="#0B2545">RebuildIndex</text>
+  <line x1="60" y1="548" x2="255" y2="548" stroke="#E2E8F0"/>
+  <text x="60" y="580" font-size="17" font-weight="700" fill="#0B2545">Rebuild an index</text>
+  <g font-size="13.5" fill="#475569">
+    <text x="60" y="606">Indexes with low page</text>
+    <text x="60" y="626">density, or a heap with</text>
+    <text x="60" y="646">forwarded records.</text>
+  </g>
+  <rect x="60" y="676" width="76" height="24" rx="12" fill="#2563EB"/>
+  <text x="98" y="692" font-size="10.5" font-weight="800" letter-spacing="1" fill="#FFFFFF" text-anchor="middle">REVIEW</text>
+  <text x="146" y="692" font-size="12" fill="#64748B">script never run</text>
+
+  <!-- B2: Constraint -->
+  <rect x="297" y="474" width="235" height="242" rx="16" fill="#FFFFFF" stroke="#CBDAF2" filter="url(#sh)"/>
+  <circle cx="331" cy="512" r="20" fill="#EAF1FE"/>
+  <g transform="translate(319 500)" fill="none" stroke="#2563EB" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="5" y="11" width="14" height="10" rx="2"/>
+    <path d="M8 11V8a4 4 0 0 1 8 0v3"/>
+  </g>
+  <text x="361" y="518" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="15.5" font-weight="700" fill="#0B2545">Constraint</text>
+  <line x1="317" y1="548" x2="512" y2="548" stroke="#E2E8F0"/>
+  <text x="317" y="580" font-size="17" font-weight="700" fill="#0B2545">Fix a constraint</text>
+  <g font-size="13.5" fill="#475569">
+    <text x="317" y="606">Untrusted foreign key</text>
+    <text x="317" y="626">and check constraints.</text>
+  </g>
+  <rect x="317" y="676" width="76" height="24" rx="12" fill="#2563EB"/>
+  <text x="355" y="692" font-size="10.5" font-weight="800" letter-spacing="1" fill="#FFFFFF" text-anchor="middle">REVIEW</text>
+  <text x="403" y="692" font-size="12" fill="#64748B">script never run</text>
+
+  <!-- B3: Statistics -->
+  <rect x="554" y="474" width="235" height="242" rx="16" fill="#FFFFFF" stroke="#CBDAF2" filter="url(#sh)"/>
+  <circle cx="588" cy="512" r="20" fill="#EAF1FE"/>
+  <path transform="translate(576 500)" d="M5 19v-7M12 19V5M19 19v-10M3 21h18" fill="none" stroke="#2563EB" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="618" y="518" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="15.5" font-weight="700" fill="#0B2545">Statistics</text>
+  <line x1="574" y1="548" x2="769" y2="548" stroke="#E2E8F0"/>
+  <text x="574" y="580" font-size="17" font-weight="700" fill="#0B2545">Refresh statistics</text>
+  <g font-size="13.5" fill="#475569">
+    <text x="574" y="606">Stale or missing</text>
+    <text x="574" y="626">statistics, such as a</text>
+    <text x="574" y="646">full-scan refresh.</text>
+  </g>
+  <rect x="574" y="676" width="76" height="24" rx="12" fill="#2563EB"/>
+  <text x="612" y="692" font-size="10.5" font-weight="800" letter-spacing="1" fill="#FFFFFF" text-anchor="middle">REVIEW</text>
+  <text x="660" y="692" font-size="12" fill="#64748B">script never run</text>
+
+  <!-- B4: Setting -->
+  <rect x="811" y="474" width="235" height="242" rx="16" fill="#FFFFFF" stroke="#CBDAF2" filter="url(#sh)"/>
+  <circle cx="845" cy="512" r="20" fill="#EAF1FE"/>
+  <g transform="translate(833 500)" fill="none" stroke="#2563EB" stroke-width="2.2" stroke-linecap="round">
+    <path d="M4 7h16M4 12h16M4 17h16"/>
+    <circle cx="9" cy="7" r="2.3" fill="#EAF1FE"/>
+    <circle cx="15" cy="12" r="2.3" fill="#EAF1FE"/>
+    <circle cx="8" cy="17" r="2.3" fill="#EAF1FE"/>
+  </g>
+  <text x="875" y="518" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="15.5" font-weight="700" fill="#0B2545">Setting</text>
+  <line x1="831" y1="548" x2="1026" y2="548" stroke="#E2E8F0"/>
+  <text x="831" y="580" font-size="17" font-weight="700" fill="#0B2545">Change a setting</text>
+  <g font-size="13.5" fill="#475569">
+    <text x="831" y="606">Automatic tuning, DOP</text>
+    <text x="831" y="626">feedback and cardinality</text>
+    <text x="831" y="646">estimation feedback.</text>
+  </g>
+  <rect x="831" y="676" width="76" height="24" rx="12" fill="#2563EB"/>
+  <text x="869" y="692" font-size="10.5" font-weight="800" letter-spacing="1" fill="#FFFFFF" text-anchor="middle">REVIEW</text>
+  <text x="917" y="692" font-size="12" fill="#64748B">script never run</text>
+
+  <!-- B5: QueryChange -->
+  <rect x="1068" y="474" width="235" height="242" rx="16" fill="#FFFFFF" stroke="#CBDAF2" filter="url(#sh)"/>
+  <circle cx="1102" cy="512" r="20" fill="#EAF1FE"/>
+  <path transform="translate(1090 500)" d="M9 7l-5 5 5 5M15 7l5 5-5 5" fill="none" stroke="#2563EB" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="1132" y="518" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="15.5" font-weight="700" fill="#0B2545">QueryChange</text>
+  <line x1="1088" y1="548" x2="1283" y2="548" stroke="#E2E8F0"/>
+  <text x="1088" y="580" font-size="17" font-weight="700" fill="#0B2545">Rewrite a query</text>
+  <g font-size="13.5" fill="#475569">
+    <text x="1088" y="606">Non-SARGable predicates</text>
+    <text x="1088" y="626">like YEAR(col), and</text>
+    <text x="1088" y="646">implicit conversions.</text>
+  </g>
+  <rect x="1088" y="676" width="76" height="24" rx="12" fill="#2563EB"/>
+  <text x="1126" y="692" font-size="10.5" font-weight="800" letter-spacing="1" fill="#FFFFFF" text-anchor="middle">REVIEW</text>
+  <text x="1174" y="692" font-size="12" fill="#64748B">script never run</text>
+
+  <!-- B6: Other -->
+  <rect x="1325" y="474" width="235" height="242" rx="16" fill="#FFFFFF" stroke="#CBDAF2" filter="url(#sh)"/>
+  <circle cx="1359" cy="512" r="20" fill="#EAF1FE"/>
+  <g transform="translate(1347 500)" fill="#2563EB">
+    <circle cx="6" cy="12" r="2.2"/><circle cx="12" cy="12" r="2.2"/><circle cx="18" cy="12" r="2.2"/>
+  </g>
+  <text x="1389" y="518" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="15.5" font-weight="700" fill="#0B2545">Other</text>
+  <line x1="1345" y1="548" x2="1540" y2="548" stroke="#E2E8F0"/>
+  <text x="1345" y="580" font-size="17" font-weight="700" fill="#0B2545">Everything else</text>
+  <g font-size="13.5" fill="#475569">
+    <text x="1345" y="606">A drop to confirm after more</text>
+    <text x="1345" y="626">usage data, or a clustered</text>
+    <text x="1345" y="646">index for a heap.</text>
+  </g>
+  <rect x="1345" y="676" width="76" height="24" rx="12" fill="#2563EB"/>
+  <text x="1383" y="692" font-size="10.5" font-weight="800" letter-spacing="1" fill="#FFFFFF" text-anchor="middle">REVIEW</text>
+  <text x="1431" y="692" font-size="12" fill="#64748B">script never run</text>
+
+  <!-- Legend -->
+  <rect x="40" y="736" width="1520" height="86" rx="14" fill="#FFFFFF" stroke="#CBDAF2"/>
+  <g font-size="10.5" font-weight="800" letter-spacing="1" fill="#FFFFFF" text-anchor="middle">
+    <rect x="64" y="752" width="104" height="26" rx="13" fill="#16A34A"/><text x="116" y="769">AUTOMATIC</text>
+    <rect x="434" y="752" width="104" height="26" rx="13" fill="#D97706"/><text x="486" y="769">IF ALLOWED</text>
+    <rect x="804" y="752" width="104" height="26" rx="13" fill="#2563EB"/><text x="856" y="769">REVIEW</text>
+    <rect x="1174" y="752" width="104" height="26" rx="13" fill="#DC2626"/><text x="1226" y="769">REFUSED</text>
+  </g>
+  <g font-size="14" fill="#334155">
+    <text x="180" y="770">applied in CREATE mode</text>
+    <text x="550" y="770">needs the allow flag set to 1</text>
+    <text x="920" y="770">stored with its script, never run</text>
+    <text x="1290" y="770">blocked by a safety check</text>
+  </g>
+  <text x="64" y="804" font-size="14" fill="#64748B">Applied changes still pass @MinPriority, @MinConfidence, @MaxNewIndexes and the catalog checks, and each one stores an UndoDDL.</text>
+
+  <!-- Footer -->
+  <line x1="40" y1="858" x2="1560" y2="858" stroke="#D5E0F2"/>
+  <text x="40" y="883" font-size="15" font-weight="600" fill="#0B2545">github.com/AI-SQL-Tuner/aisqltuner-index-tuner</text>
+  <text x="1560" y="883" font-size="15" fill="#64748B" text-anchor="end">Free and open source from AI SQL Tuner · aisqltuner.com</text>
+</svg>
