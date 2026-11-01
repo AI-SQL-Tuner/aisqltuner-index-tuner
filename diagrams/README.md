@@ -8,9 +8,7 @@ Each comes as an SVG (sharp at any size, editable in a text editor) and a 3200 x
 |---|---|---|
 | **Architecture** | What lives where: the stored procedures and tables inside your database, the diagnostic sources they read, and the one outside service they call | [SVG](architecture.svg), [PNG](architecture.png) |
 | **Data flow** | How data moves through the five steps, from collection to a verified index with an undo script, and where `RECOMMEND` stops and `CREATE` continues | [SVG](data-flow.svg), [PNG](data-flow.png) |
-
 | **Data model** | The three `AIIndexTuner` tables, their columns by purpose, the foreign key from `Recommendation` to `Run`, and the extended property that tags the indexes the tool creates | [SVG](data-model.svg), [PNG](data-model.png) |
-
 | **Recommendation types** | The nine recommendation categories, and which can be applied automatically, which only when you allow it, and which always stay for review. Shows that the output covers more than new indexes | [SVG](recommendation-types.svg), [PNG](recommendation-types.png) |
 
 ![Architecture](architecture.png)
