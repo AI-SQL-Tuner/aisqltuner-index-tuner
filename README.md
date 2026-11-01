@@ -469,6 +469,7 @@ existing install.
 | `setup/Configure-Endpoint.sql` | Credential and configuration template |
 | `tests/` | Test database, workload, tests and runner |
 | `bench/` | Benchmark: challenge database, workload, rubric, runner, cases, prerequisites and results |
+| `diagrams/` | [Architecture](diagrams/architecture.svg), [data flow](diagrams/data-flow.svg) and [data model](diagrams/data-model.svg) and [recommendation types](diagrams/recommendation-types.svg) diagrams, as SVG and PNG |
 | `RELEASE_NOTES.md` | Changes by release, and how to upgrade |
 
 ## License

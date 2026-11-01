@@ -1,0 +1,202 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="1600" height="900" font-family="'Segoe UI', -apple-system, 'Helvetica Neue', Arial, sans-serif" text-rendering="geometricPrecision">
+  <title>aisqltuner-index-tuner architecture</title>
+  <desc>A stored procedure inside your SQL Server database collects index diagnostics, sends them to your own Azure OpenAI deployment, stores the recommendations in tables, and can create the new indexes it is able to verify.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#F1F6FD"/>
+    </linearGradient>
+    <linearGradient id="azure" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#0A5CAD"/>
+      <stop offset="1" stop-color="#0078D4"/>
+    </linearGradient>
+    <filter id="sh" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#0B2545" flood-opacity="0.10"/>
+    </filter>
+    <marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 0L10 5L0 10z" fill="#2563EB"/>
+    </marker>
+    <marker id="arAz" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 0L10 5L0 10z" fill="#0078D4"/>
+    </marker>
+  </defs>
+
+  <rect width="1600" height="900" fill="url(#bg)"/>
+
+  <!-- Header -->
+  <text x="40" y="42" font-size="14" font-weight="700" letter-spacing="2.5" fill="#2563EB">AISQLTUNER-INDEX-TUNER</text>
+  <text x="40" y="88" font-size="46" font-weight="800" fill="#0B2545">Architecture</text>
+  <text x="40" y="120" font-size="20" fill="#475569">AI-assisted index tuning that runs entirely inside SQL Server</text>
+  <rect x="1330" y="46" width="230" height="36" rx="18" fill="#0B2545"/>
+  <text x="1445" y="70" font-size="15" font-weight="600" fill="#FFFFFF" text-anchor="middle">Open source · MIT license</text>
+
+  <!-- Your database -->
+  <rect x="40" y="140" width="1130" height="700" rx="22" fill="#EAF1FE" stroke="#9DBBF0" stroke-width="1.5"/>
+  <text x="70" y="172" font-size="13" font-weight="700" letter-spacing="1.8" fill="#2563EB">YOUR DATABASE</text>
+  <text x="212" y="172" font-size="13" fill="#64748B">SQL Server 2025 · Azure SQL Database · Managed Instance · Fabric SQL Database</text>
+
+  <!-- Entry point -->
+  <rect x="70" y="188" width="1080" height="56" rx="12" fill="#0B2545" filter="url(#sh)"/>
+  <text x="94" y="224" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="20" font-weight="700" fill="#FFFFFF">EXEC dbo.sp_AIIndexTuner</text>
+  <text x="1126" y="222" font-size="15" fill="#BFD3F6" text-anchor="end">Orchestrates every step · @Mode = 'RECOMMEND' (default) or 'CREATE'</text>
+  <line x1="610" y1="246" x2="610" y2="296" stroke="#2563EB" stroke-width="2.5" marker-end="url(#ar)"/>
+
+  <!-- Row A, card 1: Diagnostic sources -->
+  <rect x="70" y="300" width="320" height="180" rx="14" fill="#FFFFFF" stroke="#CBDAF2" filter="url(#sh)"/>
+  <g transform="translate(90 318)" fill="none" stroke="#2563EB" stroke-width="2.2" stroke-linecap="round">
+    <ellipse cx="14" cy="6" rx="12" ry="5"/>
+    <path d="M2 6v18c0 3 5.4 5 12 5s12-2 12-5V6"/>
+    <path d="M2 15c0 3 5.4 5 12 5s12-2 12-5"/>
+  </g>
+  <text x="132" y="334" font-size="20" font-weight="700" fill="#0B2545">Diagnostic sources</text>
+  <text x="132" y="354" font-size="13" fill="#64748B">Read-only: nothing is changed</text>
+  <g font-size="14.5" fill="#334155">
+    <circle cx="98" cy="386" r="3" fill="#2563EB"/><text x="110" y="391">Missing-index and usage DMVs</text>
+    <circle cx="98" cy="410" r="3" fill="#2563EB"/><text x="110" y="415">Plan cache, top statements</text>
+    <circle cx="98" cy="434" r="3" fill="#2563EB"/><text x="110" y="439">Query Store, last 7 days</text>
+    <circle cx="98" cy="458" r="3" fill="#2563EB"/><text x="110" y="463">Catalog, statistics, histograms</text>
+  </g>
+
+  <!-- Row A, card 2: Collect -->
+  <rect x="450" y="300" width="320" height="180" rx="14" fill="#FFFFFF" stroke="#CBDAF2" filter="url(#sh)"/>
+  <circle cx="486" cy="336" r="17" fill="#2563EB"/>
+  <text x="486" y="342" font-size="17" font-weight="700" fill="#FFFFFF" text-anchor="middle">1</text>
+  <text x="512" y="334" font-size="20" font-weight="700" fill="#0B2545">Collect</text>
+  <text x="512" y="354" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="13" fill="#2563EB">usp_CollectData</text>
+  <g font-size="14.5" fill="#334155">
+    <circle cx="478" cy="392" r="3" fill="#2563EB"/><text x="490" y="397">Ported from AI SQL Tuner</text>
+    <circle cx="478" cy="418" r="3" fill="#2563EB"/><text x="490" y="423">Scope by schema or table</text>
+    <circle cx="478" cy="444" r="3" fill="#2563EB"/><text x="490" y="449">Each section in its own TRY…CATCH</text>
+  </g>
+
+  <!-- Row A, card 3: Ask the model -->
+  <rect x="830" y="300" width="320" height="180" rx="14" fill="#FFFFFF" stroke="#CBDAF2" filter="url(#sh)"/>
+  <circle cx="866" cy="336" r="17" fill="#2563EB"/>
+  <text x="866" y="342" font-size="17" font-weight="700" fill="#FFFFFF" text-anchor="middle">2</text>
+  <text x="892" y="334" font-size="20" font-weight="700" fill="#0B2545">Ask the model</text>
+  <text x="892" y="354" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="13" fill="#2563EB">usp_InvokeModel</text>
+  <g font-size="14.5" fill="#334155">
+    <circle cx="858" cy="392" r="3" fill="#2563EB"/><text x="870" y="397">System prompt + response schema</text>
+    <circle cx="858" cy="418" r="3" fill="#2563EB"/><text x="870" y="423">sp_invoke_external_rest_endpoint</text>
+    <circle cx="858" cy="444" r="3" fill="#2563EB"/><text x="870" y="449">Background mode, polled to finish</text>
+  </g>
+
+  <!-- Row A arrows -->
+  <line x1="392" y1="390" x2="446" y2="390" stroke="#2563EB" stroke-width="2.5" marker-end="url(#ar)"/>
+  <text x="419" y="380" font-size="12" fill="#64748B" text-anchor="middle">reads</text>
+  <line x1="772" y1="390" x2="826" y2="390" stroke="#2563EB" stroke-width="2.5" marker-end="url(#ar)"/>
+  <text x="799" y="380" font-size="12" fill="#64748B" text-anchor="middle">payload</text>
+
+  <!-- Ask -> Azure OpenAI -->
+  <text x="1290" y="288" font-size="12" font-weight="700" letter-spacing="1.6" fill="#64748B">OUTSIDE YOUR DATABASE</text>
+  <line x1="1152" y1="368" x2="1286" y2="368" stroke="#0078D4" stroke-width="2.5" marker-end="url(#arAz)"/>
+  <text x="1229" y="358" font-size="12" fill="#64748B" text-anchor="middle">prompt + payload</text>
+  <line x1="1288" y1="410" x2="1154" y2="410" stroke="#0078D4" stroke-width="2.5" marker-end="url(#arAz)"/>
+  <text x="1229" y="430" font-size="12" fill="#64748B" text-anchor="middle">JSON answer</text>
+
+  <!-- Azure OpenAI card -->
+  <rect x="1290" y="300" width="270" height="180" rx="14" fill="#FFFFFF" stroke="#0078D4" stroke-width="2" filter="url(#sh)"/>
+  <path d="M1291 354V314a13 13 0 0 1 13-13h242a13 13 0 0 1 13 13v40z" fill="url(#azure)"/>
+  <g transform="translate(1308 316)" fill="none" stroke="#FFFFFF" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M8 26a7 7 0 0 1 1-13.9A9 9 0 0 1 26.5 14 6 6 0 0 1 26 26z"/>
+  </g>
+  <text x="1356" y="332" font-size="20" font-weight="700" fill="#FFFFFF">Azure OpenAI</text>
+  <text x="1356" y="348" font-size="12.5" fill="#CFE6FA">or Microsoft Foundry</text>
+  <g font-size="14" fill="#334155">
+    <circle cx="1314" cy="384" r="3" fill="#0078D4"/><text x="1326" y="389">Responses API, structured JSON</text>
+    <circle cx="1314" cy="410" r="3" fill="#0078D4"/><text x="1326" y="415">API key or managed identity</text>
+    <circle cx="1314" cy="436" r="3" fill="#0078D4"/><text x="1326" y="441">Your tenant, your deployment</text>
+  </g>
+
+  <!-- Ask -> tables -->
+  <line x1="990" y1="482" x2="990" y2="536" stroke="#2563EB" stroke-width="2.5" marker-end="url(#ar)"/>
+  <text x="1002" y="514" font-size="12" fill="#64748B">stores</text>
+
+  <!-- Row B, card 3: Tables -->
+  <rect x="830" y="540" width="320" height="180" rx="14" fill="#FFFFFF" stroke="#CBDAF2" filter="url(#sh)"/>
+  <g transform="translate(850 558)" fill="none" stroke="#2563EB" stroke-width="2.2" stroke-linecap="round">
+    <ellipse cx="14" cy="6" rx="12" ry="5"/>
+    <path d="M2 6v18c0 3 5.4 5 12 5s12-2 12-5V6"/>
+    <path d="M2 15c0 3 5.4 5 12 5s12-2 12-5"/>
+  </g>
+  <text x="892" y="574" font-size="20" font-weight="700" fill="#0B2545">Results stay with you</text>
+  <text x="892" y="594" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="13" fill="#2563EB">AIIndexTuner schema</text>
+  <g font-size="12.5">
+    <rect x="850" y="612" width="280" height="25" rx="6" fill="#EAF1FE"/>
+    <text x="862" y="629" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-weight="700" fill="#0B2545">Config</text>
+    <text x="972" y="629" fill="#475569">endpoint and credential</text>
+    <rect x="850" y="643" width="280" height="25" rx="6" fill="#EAF1FE"/>
+    <text x="862" y="660" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-weight="700" fill="#0B2545">Run</text>
+    <text x="972" y="660" fill="#475569">status, tokens, timings</text>
+    <rect x="850" y="674" width="280" height="25" rx="6" fill="#EAF1FE"/>
+    <text x="862" y="691" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-weight="700" fill="#0B2545">Recommendation</text>
+    <text x="1000" y="691" fill="#475569">one row per finding</text>
+  </g>
+
+  <!-- Row B arrows -->
+  <line x1="828" y1="630" x2="774" y2="630" stroke="#2563EB" stroke-width="2.5" marker-end="url(#ar)"/>
+  <text x="801" y="620" font-size="12" fill="#64748B" text-anchor="middle">reads</text>
+  <line x1="448" y1="630" x2="394" y2="630" stroke="#2563EB" stroke-width="2.5" marker-end="url(#ar)"/>
+  <text x="421" y="620" font-size="12" fill="#64748B" text-anchor="middle">DDL</text>
+
+  <!-- Row B, card 2: Validate and apply -->
+  <rect x="450" y="540" width="320" height="180" rx="14" fill="#FFFFFF" stroke="#CBDAF2" filter="url(#sh)"/>
+  <circle cx="486" cy="576" r="17" fill="#2563EB"/>
+  <text x="486" y="582" font-size="17" font-weight="700" fill="#FFFFFF" text-anchor="middle">3</text>
+  <text x="512" y="574" font-size="20" font-weight="700" fill="#0B2545">Validate and apply</text>
+  <text x="512" y="594" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="13" fill="#2563EB">usp_ApplyRecommendation</text>
+  <g font-size="14.5" fill="#334155">
+    <circle cx="478" cy="632" r="3" fill="#2563EB"/><text x="490" y="637">Builds the DDL from fields</text>
+    <circle cx="478" cy="658" r="3" fill="#2563EB"/><text x="490" y="663">Catalog-checked, QUOTENAME-quoted</text>
+    <circle cx="478" cy="684" r="3" fill="#2563EB"/><text x="490" y="689">Later: sp_AIIndexTuner_Apply</text>
+  </g>
+
+  <!-- Row B, card 1: Your tables and indexes -->
+  <rect x="70" y="540" width="320" height="180" rx="14" fill="#FFFFFF" stroke="#CBDAF2" filter="url(#sh)"/>
+  <g transform="translate(90 558)" fill="none" stroke="#2563EB" stroke-width="2.2" stroke-linejoin="round">
+    <rect x="1" y="3" width="26" height="24" rx="3"/>
+    <path d="M1 11h26M1 19h26M10 3v24"/>
+  </g>
+  <text x="132" y="574" font-size="20" font-weight="700" fill="#0B2545">Your tables and indexes</text>
+  <text x="132" y="594" font-size="13" fill="#64748B">Changed only where you allow it</text>
+  <g font-size="14.5" fill="#334155">
+    <circle cx="98" cy="632" r="3" fill="#2563EB"/><text x="110" y="637">CREATE INDEX, ONLINE if supported</text>
+    <circle cx="98" cy="658" r="3" fill="#2563EB"/><text x="110" y="663">Widen in place, DROP_EXISTING</text>
+    <circle cx="98" cy="684" r="3" fill="#2563EB"/><text x="110" y="689">DROP INDEX, only when allowed</text>
+  </g>
+
+  <!-- Guardrails -->
+  <rect x="70" y="746" width="1080" height="74" rx="14" fill="#ECFDF3" stroke="#86D9A5"/>
+  <g transform="translate(90 754)" fill="none" stroke="#15803D" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M12 2l10 3.6v7.4c0 6-4.4 10.2-10 12C6.4 23.2 2 19 2 13V5.6z"/>
+    <path d="M7.5 13l3.5 3.5 6-7"/>
+  </g>
+  <text x="124" y="772" font-size="13" font-weight="700" letter-spacing="1.8" fill="#15803D">BUILT-IN GUARDRAILS</text>
+  <g font-size="13.5" fill="#14532D">
+    <rect x="90" y="782" width="246" height="28" rx="14" fill="#FFFFFF" stroke="#86D9A5"/>
+    <path d="M104 796l3.5 3.5 6.5-7" fill="none" stroke="#15803D" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="122" y="801">Model script is never executed</text>
+    <rect x="352" y="782" width="246" height="28" rx="14" fill="#FFFFFF" stroke="#86D9A5"/>
+    <path d="M366 796l3.5 3.5 6.5-7" fill="none" stroke="#15803D" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="384" y="801">Names checked against catalog</text>
+    <rect x="614" y="782" width="246" height="28" rx="14" fill="#FFFFFF" stroke="#86D9A5"/>
+    <path d="M628 796l3.5 3.5 6.5-7" fill="none" stroke="#15803D" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="646" y="801">Change controls and thresholds</text>
+    <rect x="876" y="782" width="246" height="28" rx="14" fill="#FFFFFF" stroke="#86D9A5"/>
+    <path d="M890 796l3.5 3.5 6.5-7" fill="none" stroke="#15803D" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="908" y="801">UndoDDL for every change</text>
+  </g>
+
+  <!-- Benchmark panel -->
+  <rect x="1290" y="540" width="270" height="180" rx="14" fill="#0B2545" filter="url(#sh)"/>
+  <text x="1314" y="572" font-size="12" font-weight="700" letter-spacing="1.6" fill="#7FB0FF">BENCHMARKED</text>
+  <text x="1314" y="632" font-size="52" font-weight="800" fill="#FFFFFF">−86%</text>
+  <text x="1314" y="660" font-size="14.5" font-weight="600" fill="#FFFFFF">logical reads in CREATE mode</text>
+  <text x="1314" y="682" font-size="12.5" fill="#BFD3F6">10 GB TPC-H-derived workload,</text>
+  <text x="1314" y="700" font-size="12.5" fill="#BFD3F6">SQL Server 2025 Enterprise</text>
+
+  <!-- Footer -->
+  <line x1="40" y1="858" x2="1560" y2="858" stroke="#D5E0F2"/>
+  <text x="40" y="883" font-size="15" font-weight="600" fill="#0B2545">github.com/AI-SQL-Tuner/aisqltuner-index-tuner</text>
+  <text x="1560" y="883" font-size="15" fill="#64748B" text-anchor="end">Free and open source from AI SQL Tuner · aisqltuner.com</text>
+</svg>
