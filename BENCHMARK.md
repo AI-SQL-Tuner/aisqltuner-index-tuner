@@ -91,7 +91,7 @@ Each scenario's **noise floor** comes from untuned trials, measured the same way
 | `proc-create` with widenings (#27) | | −79% / −60% / 42 MB | |
 | `proc-reviewed` | −93% / −81% / 206 MB | −79% / −54% / 37 MB | −86% / −17% / 5.2 GB |
 | `desktop` | −83% / −74% / 465 MB | −78% / −53% / 34 MB | −85% / −13% / 3.6 GB |
-| `desktop`, rerun after its script fixes (aisqltuner#253, #254) | | | −86% / −23% / 5.3 GB |
+| `desktop`, rerun after its script fixes (AI-SQL-Tuner/aisqltuner#253, AI-SQL-Tuner/aisqltuner#254) | | | −86% / −23% / 5.3 GB |
 | `naive-missing-index` | −90% / −72% / 2,075 MB | −1% / −19% / 13 MB | −86% / −23% / 5.8 GB |
 | `stats-only` | −0.3% / 0% / none | +0.3% / −2% / none | −59% / −13% / none |
 | *Noise floor (reads / CPU)* | *0.002% / 11.6%* | *0.04% / 15.8%* | *0.03% / 4.3%* |
