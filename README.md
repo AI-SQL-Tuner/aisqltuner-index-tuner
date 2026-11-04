@@ -435,6 +435,7 @@ All three ran on SQL Server 2025 Enterprise Developer, with `gpt-5.6-luna` at `m
 | `@Mode = 'CREATE'`: the proc applies its validated indexes on its own | −79% / −66% / 328 MB | −32% / −34% / 26 MB | −86% / −23% / 6.4 GB |
 | Every recommendation reviewed and applied | −93% / −81% / 206 MB | −79% / −54% / 37 MB | −86% / −17% / 5.2 GB |
 | For comparison: the AI SQL Tuner desktop app's IndexTuning goal, every script applied | −83% / −74% / 465 MB | −78% / −53% / 34 MB | −85% / −13% / 3.6 GB |
+| The desktop app rerun after its script fixes (AI-SQL-Tuner/aisqltuner#253, AI-SQL-Tuner/aisqltuner#254) | | | −86% / −23% / 5.3 GB |
 | Baseline: one index per missing-index DMV suggestion, as suggested | −90% / −72% / 2,075 MB | −1% / −19% / 13 MB | −86% / −23% / 5.8 GB |
 | Control: a full-scan statistics refresh, and no index | −0.3% / 0% / none | +0.3% / −2% / none | −59% / −13% / none |
 

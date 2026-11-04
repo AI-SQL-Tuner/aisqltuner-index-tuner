@@ -91,6 +91,7 @@ Each scenario's **noise floor** comes from untuned trials, measured the same way
 | `proc-create` with widenings (#27) | | −79% / −60% / 42 MB | |
 | `proc-reviewed` | −93% / −81% / 206 MB | −79% / −54% / 37 MB | −86% / −17% / 5.2 GB |
 | `desktop` | −83% / −74% / 465 MB | −78% / −53% / 34 MB | −85% / −13% / 3.6 GB |
+| `desktop`, rerun after its script fixes (AI-SQL-Tuner/aisqltuner#253, AI-SQL-Tuner/aisqltuner#254) | | | −86% / −23% / 5.3 GB |
 | `naive-missing-index` | −90% / −72% / 2,075 MB | −1% / −19% / 13 MB | −86% / −23% / 5.8 GB |
 | `stats-only` | −0.3% / 0% / none | +0.3% / −2% / none | −59% / −13% / none |
 | *Noise floor (reads / CPU)* | *0.002% / 11.6%* | *0.04% / 15.8%* | *0.03% / 4.3%* |
@@ -103,6 +104,7 @@ Each scenario's **noise floor** comes from untuned trials, measured the same way
 | `proc-create` with widenings (#27) | | **−43.1%** | |
 | `proc-reviewed` | **−76.6%** | **−39.2%** | −14.9% |
 | `desktop` | **−72.4%** | **−38.0%** | −21.1% |
+| `desktop`, rerun after its script fixes | | | −7.9% |
 | `naive-missing-index` | **−70.7%** | **−13.9%** | −14.1% |
 | `stats-only` | 0.0% | −12.9%, or −1.8% without one outlier trial | −16.5% |
 | *Noise floor* | *10.6%* | *8.1%* | *22.2%* |
@@ -112,7 +114,7 @@ Bold changes are beyond the scenario's noise floor:
 - **sqlstorm-oltp:** it cut it by about 40%.
 - **tpch10-realistic:** every arm's change is inside the 22.2% floor, so this scenario supports no claim about execution time. Its reads and CPU are tight and are the measures to read there.
 
-**No query returned different results** in any of the 75 arm trials, and no trial was flagged as suspect.
+**No query returned different results** in any of the 80 arm trials, the desktop rerun included, and no trial was flagged as suspect.
 
 ### What it shows
 
