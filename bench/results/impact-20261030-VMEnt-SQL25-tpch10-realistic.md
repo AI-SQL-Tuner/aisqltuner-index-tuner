@@ -7,7 +7,7 @@
 
 The desktop benchmark had left this scenario out, because its writes made indexing look like no net gain. Here the writes got cheaper, for a reason given below.
 
-- **Date:** 2026-10-30
+- **Date:** 2026-10-30. The desktop arm was rerun on 2026-11-04 with a later desktop build, as matrix 25: see [Rerun](#rerun-the-desktop-arm-after-the-script-fixes).
 - **Server:** `VMEnt\SQL25`, SQL Server 17.0.1000.7 Enterprise Developer Edition, 4 vCPU, 31 GB, MAXDOP 4. The database's data and log files are on a 64 GB Premium SSD (P30).
 - **Database:** `tpch10`, 22.3 GB allocated: TPC-H scale factor 10, with a 60M-row `lineitem`.
   - **Source:** the desktop benchmark's copy in its "realistic" posture. Its existing indexes are left as they are: 8 clustered and 6 nonclustered on the workload tables.
@@ -26,6 +26,7 @@ The desktop benchmark had left this scenario out, because its writes made indexi
   | 22 | `naive-missing-index` | 5 | `69fdebb1d3618d92`: the missing-index DMV's 4 suggestions | none: no model |
   | 23 | `stats-only` | 5 | `b26759586f085151`: the scenario's 8 tables | none: no model |
   | 24 | `desktop` | 5 | `6e3a9ec7c936a7b2` (the desktop app's collector) | `3df11a761fb32f72` |
+  | 25 | `desktop`, rerun on a later build (2026-11-04) | 5 | `60224e49f7270ff0` (the later collector) | `6e9934e483fb04f1` |
 
 The arms are the ones described in the [challenge report](impact-20261028-VMEnt-SQL25-challenge.md#arms), plus one control:
 
@@ -146,7 +147,66 @@ Total time is inside its 22.2% floor for every arm, so it is shown for completen
    - **proc-reviewed:** all 81 applicable scripts succeeded. The proc's plan-correction script used the valid `ALTER DATABASE ... SET AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = ON)`.
    - **desktop:** 5 of 30 attempted scripts failed, one per trial, all for plan correction. Reps 1, 2 and 4 failed on `FORCE_LAST_GOOD_PLAN`, written in reps 1 and 2 as `ALTER DATABASE SCOPED CONFIGURATION SET FORCE_LAST_GOOD_PLAN = ON`. Reps 3 and 5 used a new wording, `ALTER DATABASE SCOPED CONFIGURATION SET AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = ON)`. Neither is valid.
    - **Blocked:** reps 1 and 5 each had a statistics-settings script starting with `USE [master]`, which the harness blocked.
-   - Both desktop defects are in [AI-SQL-Tuner/aisqltuner#248](https://github.com/AI-SQL-Tuner/aisqltuner/issues/248). Neither failure changed any measurement.
+   - Both desktop defects are in [AI-SQL-Tuner/aisqltuner#248](https://github.com/AI-SQL-Tuner/aisqltuner/issues/248). Neither failure changed any measurement. Both are fixed in the desktop build the [rerun](#rerun-the-desktop-arm-after-the-script-fixes) used.
+
+## Rerun: the desktop arm after the script fixes
+
+Matrix 25 reran the desktop arm on 2026-11-04 with AI SQL Tuner `main` at `6701935`. That build includes these changes since matrix 24:
+- the valid `FORCE_LAST_GOOD_PLAN` statement ([AI-SQL-Tuner/aisqltuner#253](https://github.com/AI-SQL-Tuner/aisqltuner/pull/253));
+- the [#248](https://github.com/AI-SQL-Tuner/aisqltuner/issues/248) script fixes ([AI-SQL-Tuner/aisqltuner#254](https://github.com/AI-SQL-Tuner/aisqltuner/pull/254)): no `USE [master]`, one database setting per script, and the wide-INCLUDE and overlapping-suggestion rules;
+- the collector and prompt additions in [#251](https://github.com/AI-SQL-Tuner/aisqltuner/pull/251), [#252](https://github.com/AI-SQL-Tuner/aisqltuner/pull/252) and [#255](https://github.com/AI-SQL-Tuner/aisqltuner/pull/255).
+
+Everything else is as in matrix 24:
+- the same image, server, model and effort;
+- the same `bench` harness: nothing under `bench/` changed between the two builds, so the scenario hash and the matrix 20 noise floor still apply.
+
+The payload is different, because the later collector adds sections: 22,957 input tokens against 21,405. Model order seed `20261104`.
+
+### Per trial
+
+| Rep | Trial | Read reads | Read CPU | Write CPU | Total time | Scripts | Applied | Indexes added | Net index MB |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|
+| 1 | 129 | −86.0% | −26.3% | −79.0% | −14.6% | 19 | 19 / 19 | 4 | 6,158 |
+| 2 | 130 | −85.9% | −19.7% | −75.4% | −7.1% | 11 | 11 / 11 | 4, return-flag index filtered | 4,118 |
+| 3 | 131 | −85.6% | −22.5% | −75.7% | −0.3% | 7 | 7 / 7 | 4 | 6,158 |
+| 4 | 132 | −86.0% | −23.9% | −80.9% | −14.4% | 9 | 9 / 9 | 4 | 6,158 |
+| 5 | 133 | −85.8% | −23.9% | −81.7% | −3.0% | 9 | 9 / 9 | 4, return-flag index filtered | 4,118 |
+
+### Against matrix 24 (mean of 5)
+
+| Desktop run | Read reads | Read CPU | Write reads | Write CPU | Total time | Net index MB | Read points per GB | Scripts applied |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Matrix 24 (2026-10-30) | −84.8% (−78.7 to −87.9) | −12.6% (−23.6 to +16.8) | −54.8% | −80.9% | −21.1% | 3,736 | 28.9 | 25 of 30 attempted, 2 blocked |
+| **Matrix 25 (2026-11-04)** | **−85.9%** (−85.6 to −86.0) | **−23.3%** (−19.7 to −26.3) | −53.1% | −78.5% | −7.9% | 5,342 | 17.1 | **55 of 55** |
+
+Per query, matrix 25 lands where the four-index arms do: `q05` −97.4% reads, `q07` −83.3%, `q10` −93.5%, `q17` −8.8%, `q19` 0%, and `q03` −55.3% reads with +42% CPU. The writes still got cheaper: `rf1` −80% CPU, `rf2` −85%.
+
+**No result hash changed** in the 30 hashed query comparisons, and **no trial was flagged as suspect**.
+
+### What changed
+
+1. **Every script ran: 55 of 55, none blocked.**
+   - All 5 plan-correction scripts used the valid `ALTER DATABASE [tpch10] SET AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = ON)`.
+   - No script switched to `master`.
+   - Each statistics setting was its own script.
+
+   In matrix 24, 5 scripts failed on `FORCE_LAST_GOOD_PLAN` and 2 were blocked for `USE [master]`.
+2. **Every trial found all four indexes, uncompressed.**
+   - Read reads varied by 0.4 points across the 5 trials, against 9.2 in matrix 24.
+   - Rep 4 wrote `DATA_COMPRESSION = NONE` explicitly, and no trial compressed an index.
+   - Matrix 24's weak run doesn't recur. Its rep 2 left out the return-flag index and page-compressed the rest, and read CPU rose 16.8%.
+3. **Read CPU now matches the best arms.** The mean is −23.3%, level with `proc-create` (−22.9%) and `naive-missing-index` (−22.6%), and better than `proc-reviewed` (−17.2%). The gain over matrix 24 comes from the missing bad run, not from a better typical run: the medians are −23.9% against −21.8%, inside the 4.3% read CPU floor.
+4. **It costs more index space.**
+   - 3 of 5 trials built the unfiltered return-flag index (2.7 GB) instead of the version filtered on `l_returnflag = 'R'` (0.6 GB).
+   - None compressed, so the mean is 5.3 GB against 3.7 GB.
+   - Read points per GB fell from 28.9 to 17.1, between `proc-create` (13.5) and `proc-reviewed` (20.7).
+5. **More of the secondary advice was applied, and it still moved nothing measurable.**
+   - Every trial re-trusted the foreign keys, rebuilt the two low-density summary-table primary keys and enabled automatic statistics creation and update. Two also enabled asynchronous statistics updates.
+   - The per-query results match the arms that built only the four indexes.
+6. **Total time** went from −21.1% to −7.9%. Both are inside the 22.2% floor, so neither supports a claim.
+7. **Run cost:**
+   - Tuning took 74–81 s per run, with 9,591–11,555 output tokens.
+   - The matrix took 90 minutes against 67. Most of the extra time was applying more scripts: rep 1's 19 scripts made it a 25-minute trial.
 
 ## Limits
 
@@ -174,6 +234,7 @@ Total time is inside its 22.2% floor for every arm, so it is shown for completen
   | proc-create | 22,035 | 6,700–7,800 | 367–457 s, including building 6.4 GB of indexes |
   | proc-reviewed | 22,035 | 5,900–7,100 | 39–46 s, before the harness applies the scripts |
   | desktop | 21,405 | 9,200–11,100 | 70–81 s, before the harness applies the scripts |
+  | desktop rerun (matrix 25) | 22,957 | 9,600–11,600 | 74–81 s, before the harness applies the scripts |
 
 ## Reproduce
 
@@ -188,8 +249,9 @@ bench matrix      --scenario bench/scenarios/tpch10-realistic.json --server tcp:
 bench matrix      ... --models naive-missing-index
 bench matrix      ... --models stats-only
 bench matrix      ... --models gpt-5.6-luna
+bench matrix      ... --models gpt-5.6-luna --seed 20261104   # matrix 25, built from AI-SQL-Tuner/aisqltuner 6701935
 ```
 
 The data volume needs at least 64 GB for the 22 GB database, its snapshot's sparse files and the index builds.
 
-All of the results are in the harness's `TunerBench` database on SQL25, in matrices 20 to 24.
+All of the results are in the harness's `TunerBench` database on SQL25, in matrices 20 to 25.
