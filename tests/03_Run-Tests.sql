@@ -1191,5 +1191,56 @@ DROP INDEX IX_T26_Email_Unique ON dbo.Customers;
 PRINT 'PASS T26: redundant left prefixes and duplicates are flagged and the unique twin is kept, wrapped columns are listed from the plan with their predicate, and a payload over MaxPayloadChars fails before the request with its size';
 GO
 
+/* ===== T27: setup errors stop a live run before collecting (issue #38) =====
+   A credential name that does not match the endpoint (50213), or a credential that does not exist
+   (50214), fails before any data is collected and before a run row is written. 50212 comes first
+   when the REST endpoint feature is off on this instance, and is accepted in their place. */
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Config)
+BEGIN
+    DECLARE @RunsBefore int = (SELECT COUNT(*) FROM AIIndexTuner.Run), @Err int;
+
+    INSERT AIIndexTuner.Config (ConfigId, Endpoint, Deployment, CredentialName)
+    VALUES (1, N'https://t27.invalid/', N't27', N'https://t27-other.invalid');
+    BEGIN TRY
+        EXEC dbo.sp_AIIndexTuner;
+        SET @Err = 0;
+    END TRY
+    BEGIN CATCH
+        SET @Err = ERROR_NUMBER();
+    END CATCH;
+    IF @Err NOT IN (50212, 50213)
+    BEGIN
+        DELETE AIIndexTuner.Config;
+        THROW 50999, N'FAIL T27: a credential name that does not match the endpoint did not stop the run with 50213.', 1;
+    END;
+
+    -- A matching name for a credential that does not exist; visible only with CONTROL on the database.
+    UPDATE AIIndexTuner.Config SET CredentialName = N'https://t27.invalid';
+    IF HAS_PERMS_BY_NAME(DB_NAME(), N'DATABASE', N'CONTROL') = 1
+       AND NOT EXISTS (SELECT 1 FROM sys.database_scoped_credentials WHERE name = N'https://t27.invalid')
+    BEGIN
+        BEGIN TRY
+            EXEC dbo.sp_AIIndexTuner;
+            SET @Err = 0;
+        END TRY
+        BEGIN CATCH
+            SET @Err = ERROR_NUMBER();
+        END CATCH;
+        IF @Err NOT IN (50212, 50214)
+        BEGIN
+            DELETE AIIndexTuner.Config;
+            THROW 50999, N'FAIL T27: a missing credential did not stop the run with 50214.', 1;
+        END;
+    END;
+    DELETE AIIndexTuner.Config;
+
+    IF (SELECT COUNT(*) FROM AIIndexTuner.Run) <> @RunsBefore
+        THROW 50999, N'FAIL T27: a setup error wrote a run row, so it was not caught before collecting.', 1;
+    PRINT 'PASS T27: setup errors stop a live run before collecting';
+END
+ELSE
+    PRINT 'SKIP T27: AIIndexTuner.Config has a row';
+GO
+
 PRINT 'ALL TESTS PASSED';
 GO

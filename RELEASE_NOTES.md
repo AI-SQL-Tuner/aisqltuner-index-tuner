@@ -9,7 +9,28 @@ recommendations are kept, and it replaces the procedures and functions.
 
 ## 2026-11-06
 
+### Added
+
+- **Setup errors stop a live run before collecting**
+  ([#39](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/39), issue #38). Before, a
+  setup mistake surfaced only at the AI call, after a collection that took almost 7 minutes on a
+  Managed Instance. Now a run that collects first checks, and fails in under a second with:
+  50212 if the REST endpoint feature is off (SQL Server and Managed Instance); 50213 if
+  `Config.CredentialName` is not the start of the request URL; 50214 if that credential does not
+  exist, listing the credentials that do (checked only for a caller with `CONTROL` on the
+  database, who can see them all). A run with `@CollectedData` or `@TestResponse` is not checked.
+- **`setup/Configure-Endpoint.sql` takes each value once and refuses placeholders.** Step 0 holds
+  the endpoint, deployment, API key or managed-identity choice, and master key password; the
+  credential name and the configuration row are derived from them, so they cannot disagree. If a
+  `<placeholder>` is left, the script stops before changing anything. Before, a credential created
+  under the placeholder name `https://<your-resource>.openai.azure.com` raised no error. The script
+  ends with a check of the credential and the REST endpoint feature.
+
 ### Fixed
+
+- **Setup instructions left the REST endpoint feature off on Managed Instance.** The script and
+  README said `sp_configure 'external rest endpoint enabled'` was for SQL Server 2025 only; it is
+  off by default on Azure SQL Managed Instance too.
 
 - **COLUMN CARDINALITY could run for many minutes before reading any statistics**
   ([#39](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/39), issue #38). On a Managed

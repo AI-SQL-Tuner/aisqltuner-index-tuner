@@ -2889,9 +2889,10 @@ BEGIN
         THROW 50205, N'The table in @SchemaName.@TableName does not exist in this database.', 1;
 
     DECLARE @IncludeQueryText bit = 1, @KeepDetail bit = 1, @Endpoint nvarchar(400), @Deployment nvarchar(128), @Effort varchar(10),
-            @MaxPayloadChars int;
+            @MaxPayloadChars int, @CredentialName sysname;
     SELECT @IncludeQueryText = IncludeQueryText, @KeepDetail = KeepRunDetail,
-           @Endpoint = Endpoint, @Deployment = Deployment, @Effort = ReasoningEffort, @MaxPayloadChars = MaxPayloadChars
+           @Endpoint = Endpoint, @Deployment = Deployment, @Effort = ReasoningEffort, @MaxPayloadChars = MaxPayloadChars,
+           @CredentialName = CredentialName
     FROM AIIndexTuner.Config WHERE ConfigId = 1;
 
     IF @MaxNewIndexes < 0
@@ -2918,6 +2919,42 @@ BEGIN
 
     IF @TestResponse IS NULL AND @Endpoint IS NULL
         THROW 50206, N'AIIndexTuner.Config has no row. Run setup/Configure-Endpoint.sql first.', 1;
+
+    /* Before collecting, which can take minutes, stop on a setup error that would fail the AI call
+       anyway. With @CollectedData nothing is collected, so the call reports these itself. */
+    IF @TestResponse IS NULL AND @CollectedData IS NULL
+    BEGIN
+        DECLARE @SetupError nvarchar(2000);
+
+        -- Off by default on SQL Server 2025 and Managed Instance (EngineEdition 8); on in Azure SQL Database and Fabric.
+        IF CAST(SERVERPROPERTY('EngineEdition') AS int) IN (1, 2, 3, 4, 8)
+           AND EXISTS (SELECT 1 FROM sys.configurations WHERE name = N'external rest endpoint enabled' AND value_in_use = 0)
+            THROW 50212, N'sp_invoke_external_rest_endpoint is disabled on this instance. Run EXEC sp_configure ''external rest endpoint enabled'', 1; RECONFIGURE WITH OVERRIDE; (step 1 of setup/Configure-Endpoint.sql; needs ALTER SETTINGS).', 1;
+
+        -- The credential name must be the request URL or a more general prefix of it, ending at a path
+        -- boundary. Compared case-insensitively, so this fails only on a definite mismatch.
+        DECLARE @RequestUrl nvarchar(4000) = CONCAT(
+            CASE WHEN RIGHT(@Endpoint, 1) = N'/' THEN LEFT(@Endpoint, LEN(@Endpoint) - 1) ELSE @Endpoint END, N'/openai/v1/responses');
+        IF NOT (LOWER(@RequestUrl) = LOWER(@CredentialName)
+                OR LOWER(@RequestUrl) LIKE LOWER(AIIndexTuner.fn_EscapeLike(@CredentialName)) + CASE WHEN RIGHT(@CredentialName, 1) = N'/' THEN N'%' ELSE N'/%' END ESCAPE N'\')
+        BEGIN
+            SET @SetupError = CONCAT(N'AIIndexTuner.Config.CredentialName (', @CredentialName, N') does not match the endpoint: it must be the start of the request URL ',
+                                     @RequestUrl, N', normally the endpoint''s root URL with no trailing slash.');
+            THROW 50213, @SetupError, 1;
+        END;
+
+        -- sys.database_scoped_credentials shows every credential only to a caller with CONTROL on the
+        -- database, so the check is made only then.
+        IF HAS_PERMS_BY_NAME(DB_NAME(), N'DATABASE', N'CONTROL') = 1
+           AND NOT EXISTS (SELECT 1 FROM sys.database_scoped_credentials WHERE name = @CredentialName)
+        BEGIN
+            SET @SetupError = CONCAT(N'The database scoped credential ', @CredentialName, N' (AIIndexTuner.Config.CredentialName) does not exist in this database. ',
+                                     N'Credentials here: ', ISNULL((SELECT STRING_AGG(CAST(name AS nvarchar(max)), N', ') WITHIN GROUP (ORDER BY name)
+                                                                    FROM sys.database_scoped_credentials), N'(none)'),
+                                     N'. Create it as in step 3 of setup/Configure-Endpoint.sql.');
+            THROW 50214, @SetupError, 1;
+        END;
+    END;
 
     DECLARE @RunId int;
     INSERT AIIndexTuner.Run (Mode, SchemaName, TableName, Endpoint, Deployment, ApiShape, ReasoningEffort, SystemPromptHash,
