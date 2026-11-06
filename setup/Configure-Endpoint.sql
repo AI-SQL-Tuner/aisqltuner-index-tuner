@@ -28,6 +28,9 @@ DECLARE @Problems nvarchar(2000) = (
         (CASE WHEN s.Endpoint LIKE N'%<%>%' THEN N'Endpoint' END),
         (CASE WHEN s.Endpoint NOT LIKE N'https://%' THEN N'Endpoint must start with https://' END),
         (CASE WHEN s.Endpoint LIKE N'https://%/%_%' THEN N'Endpoint must be the root URL, with no path' END),
+        -- The credential name is the endpoint without its trailing slash, and a name is a sysname: at most 128 characters.
+        (CASE WHEN LEN(CASE WHEN RIGHT(s.Endpoint, 1) = N'/' THEN LEFT(s.Endpoint, LEN(s.Endpoint) - 1) ELSE s.Endpoint END) > 128
+              THEN N'Endpoint without its trailing slash must be at most 128 characters, the limit for a credential name' END),
         (CASE WHEN s.Deployment LIKE N'%<%>%' THEN N'Deployment' END),
         (CASE WHEN s.UseManagedIdentity = 0 AND (s.ApiKey IS NULL OR s.ApiKey LIKE N'%<%>%') THEN N'ApiKey' END),
         (CASE WHEN NOT EXISTS (SELECT 1 FROM sys.symmetric_keys WHERE name = N'##MS_DatabaseMasterKey##')
