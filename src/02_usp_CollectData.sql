@@ -109,7 +109,9 @@ CREATE OR ALTER PROCEDURE AIIndexTuner.usp_CollectData
     @SchemaName       sysname = NULL,
     @TableName        sysname = NULL,
     @IncludeQueryText bit = 1,
-    @Data             nvarchar(max) OUTPUT
+    @Data             nvarchar(max) OUTPUT,
+    @RunId            int = NULL,   -- for AIIndexTuner.RunLog
+    @Logging          bit = 0       -- 1 = log each section to AIIndexTuner.RunLog (issue #38)
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -123,7 +125,9 @@ BEGIN
             @RestartCleared nvarchar(200) = N'Index usage statistics, missing index statistics, index operational statistics and the plan cache';
 
     SET @Data = N'';
+    DECLARE @LogId int, @LogChars int;   -- the open RunLog step
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'SERVER INFORMATION', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== Server information ===== */
     SELECT @MajorVersion = MAX(compatibility_level) / 10 FROM sys.databases;
 
@@ -146,6 +150,7 @@ BEGIN
         N'Major Version: ', CASE WHEN @MajorVersion >= 17 THEN N'SQL Server 2025' WHEN @MajorVersion = 16 THEN N'SQL Server 2022' ELSE CONCAT(N'Version ', @MajorVersion) END, @nl,
         N'Full Version: ', @@VERSION, @nl);
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'USAGE PERIOD AND PLATFORM CAPABILITIES', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* Start time and the period the usage DMVs cover (GetUsageStatisticsSinceAsync); see usp_UsageSince. */
     DECLARE @StartTime datetime2(0), @Now datetime2(0) = SYSDATETIME(), @AutoClose bit, @RestoreHistoryRead bit,
             @LastStartup datetime2(0), @ErrorLogsSearched int, @Since datetime2(0), @SinceSource nvarchar(400), @HasInstanceLogs bit;
@@ -209,6 +214,7 @@ BEGIN
     ELSE IF @SchemaName IS NOT NULL
         SET @Data += CONCAT(N'Object-scoped analysis is limited to schema: ', QUOTENAME(@SchemaName), N'. Query Store sections are filtered to queries that reference that schema; the Query Store section below states how that scope was resolved. Other database-level sections remain database-scoped.', @nl);
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'FILL FACTOR AND INCLUDED COLUMN TYPES', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* sys.indexes.fill_factor is 0 for an index created without FILLFACTOR, meaning the server's
        'fill factor (%)' applies. Printed as 0, models copy it into WITH (FILLFACTOR = 0), which
        SQL Server rejects, so the payload shows the value that actually applies. */
@@ -283,6 +289,7 @@ BEGIN
         -- The two sections below still run, without IncludedColumnTypes.
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'MISSING INDEX RECOMMENDATIONS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== MISSING INDEX RECOMMENDATIONS ===== */
     BEGIN TRY
         SET @j = (
@@ -314,6 +321,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== MISSING INDEX RECOMMENDATIONS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'INDEX USAGE STATISTICS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== INDEX USAGE STATISTICS =====
        Half the rows are reserved for drop candidates (unread nonclustered indexes that enforce no
        constraint) and half for indexes that are read; a group with fewer rows leaves its share to
@@ -383,6 +391,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== INDEX USAGE STATISTICS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'MISSING INDEX OVERLAP SIGNALS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== MISSING INDEX OVERLAP SIGNALS =====
        For the top missing-index candidates, the best-matching existing index and a redundancy score,
        with row counts, estimated storage and write penalty. */
@@ -480,6 +489,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== MISSING INDEX OVERLAP SIGNALS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'DUPLICATE AND OVERLAPPING INDEXES', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== DUPLICATE AND OVERLAPPING INDEXES =====
        Exact key duplicates and strict left-prefix overlaps within a table, compared as exact strings.
        NarrowerIsRedundant is the apply step's test for a drop at any usage window: the narrower index
@@ -548,6 +558,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== DUPLICATE AND OVERLAPPING INDEXES ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'PLAN CACHE QUERY STATISTICS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== PLAN CACHE QUERY STATISTICS ===== database-wide, top 25 by CPU */
     BEGIN TRY
         SET @j = (
@@ -581,6 +592,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== PLAN CACHE QUERY STATISTICS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'NON-SARGABLE PREDICATES', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== NON-SARGABLE PREDICATES =====
        Table columns wrapped in a function, conversion or arithmetic inside a scan or filter
        predicate of the top 50 plan cache statements by CPU, read from each statement's showplan. No
@@ -658,6 +670,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== NON-SARGABLE PREDICATES ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'HEAP TABLE ANALYSIS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== HEAP TABLE ANALYSIS ===== heaps of 10,000 rows or more, physical stats sampled per heap */
     BEGIN TRY
         DECLARE @Heaps TABLE (object_id int PRIMARY KEY, TableName nvarchar(300), TotalRows bigint, ReservedMB decimal(18, 1));
@@ -688,6 +701,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== HEAP TABLE ANALYSIS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'CONSTRAINTS AND RELATIONSHIPS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== CONSTRAINTS AND RELATIONSHIPS ===== PK, UQ and FK, with the referenced table for FKs */
     BEGIN TRY
         SET @j = (
@@ -717,6 +731,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== CONSTRAINTS AND RELATIONSHIPS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'UNTRUSTED OR DISABLED CONSTRAINTS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== UNTRUSTED OR DISABLED CONSTRAINTS ===== */
     BEGIN TRY
         SET @j = (
@@ -744,6 +759,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== UNTRUSTED OR DISABLED CONSTRAINTS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'INDEX OPERATIONAL HOTSPOTS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== INDEX OPERATIONAL HOTSPOTS ===== per-index lock, latch and leaf-operation pressure, top 15 */
     BEGIN TRY
         SET @j = (
@@ -776,6 +792,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== INDEX OPERATIONAL HOTSPOTS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'COLUMN CARDINALITY', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== COLUMN CARDINALITY =====
        Density vectors for the tables behind the top 20 high-impact missing indexes and the 20 largest
        tables over 10,000 rows (plus the scoped table), via DBCC SHOW_STATISTICS ... WITH DENSITY_VECTOR. */
@@ -869,6 +886,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== COLUMN CARDINALITY ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'SKEWED LOW-CARDINALITY COLUMNS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== SKEWED LOW-CARDINALITY COLUMNS =====
        For the tables in COLUMN CARDINALITY: columns that lead a statistics object whose histogram has
        2 to 10 values, one value per step, where one value holds 80% or more of the rows or one holds
@@ -917,6 +935,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== SKEWED LOW-CARDINALITY COLUMNS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'LARGE TABLES', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== LARGE TABLES ===== over 1,000,000 rows */
     BEGIN TRY
         WITH LargeTables AS (
@@ -940,6 +959,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== LARGE TABLES ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'DATABASE STATISTICS SETTINGS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== DATABASE STATISTICS SETTINGS ===== */
     BEGIN TRY
         SET @j = (
@@ -969,6 +989,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== DATABASE STATISTICS SETTINGS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'INDEX PAGE DENSITY', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== INDEX PAGE DENSITY =====
        sys.dm_db_index_physical_stats (SAMPLED) once per candidate table, never with a NULL object_id,
        which would scan every object in the database. Candidates: the scoped table; otherwise the top
@@ -1046,6 +1067,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== INDEX PAGE DENSITY ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'QUERY STORE STATE AND SCOPE', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== Query Store ===== */
     DECLARE @QsActualState int, @QsDesiredState int, @QsStateDesc nvarchar(60), @QsUsable bit = 0;
     SELECT TOP (1) @QsActualState = actual_state, @QsDesiredState = desired_state, @QsStateDesc = actual_state_desc
@@ -1213,6 +1235,7 @@ BEGIN
         DROP TABLE #qs_plan_hit;
     END;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'QUERY STORE WORKLOAD INSIGHTS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== QUERY STORE WORKLOAD INSIGHTS ===== top 50 queries by total duration over the last 7 days */
     SET @Data += CONCAT(@nl, N'=== QUERY STORE WORKLOAD INSIGHTS ===', @nl, CASE WHEN @QsScopeNote <> N'' THEN @QsScopeNote + @nl ELSE N'' END);
     IF @QsActualState IS NULL
@@ -1309,6 +1332,7 @@ BEGIN
     END CATCH;
     END;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'QUERY STORE WRITE WORKLOAD MIX', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== QUERY STORE WRITE WORKLOAD MIX =====
        INSERT/UPDATE/DELETE/MERGE executions by type and UTC hour. The type comes from the leading
        keyword of the statement. Auto-parameterized and sp_executesql statements start with their
@@ -1392,6 +1416,7 @@ BEGIN
     END CATCH;
     END;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'QUERY STORE FORCED PLAN FAILURES', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== QUERY STORE FORCED PLAN FAILURES ===== */
     SET @Data += CONCAT(@nl, N'=== QUERY STORE FORCED PLAN FAILURES ===', @nl);
     IF @QsUsable = 0
@@ -1435,6 +1460,7 @@ BEGIN
     END CATCH;
     END;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'AUTOMATIC TUNING OPTIONS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== AUTOMATIC TUNING OPTIONS ===== FORCE_LAST_GOOD_PLAN */
     BEGIN TRY
         SET @j = (
@@ -1454,6 +1480,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== AUTOMATIC TUNING OPTIONS ===', @nl, N'Automatic tuning options unavailable: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'CARDINALITY ESTIMATION FEEDBACK', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== CARDINALITY ESTIMATION FEEDBACK ===== (AppendCeFeedbackSummaryAsync)
        Next to automatic tuning: a forced plan turns CE feedback off for its query, and automatic plan
        correction can roll CE feedback back (ROLLEDBACK_BY_APRC). */
@@ -1519,6 +1546,7 @@ BEGIN
         SET @Data += CONCAT(N'The CE feedback settings could not be read: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'DEGREE OF PARALLELISM FEEDBACK', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== DEGREE OF PARALLELISM FEEDBACK ===== (AppendDopFeedbackSummaryAsync, issue #17)
        DOP feedback lowers the DOP of repeating parallel queries whose parallelism is inefficient. It is
        ON by default on SQL Server 2025. Unlike CE feedback, a plan forced through Query Store does not
@@ -1584,6 +1612,7 @@ BEGIN
         SET @Data += CONCAT(N'The DOP feedback settings could not be read: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'OPTIONAL PARAMETER PLAN OPTIMIZATION', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== OPTIONAL PARAMETER PLAN OPTIMIZATION ===== (DescribeOptionalParameterOptimization, issue #17)
        OPPO gives a catch-all predicate such as (@p IS NULL OR col = @p) a query variant for each NULL state
        of the parameter, so the variant for a non-NULL value can seek an index the single scan plan could
@@ -1616,5 +1645,7 @@ BEGIN
     BEGIN CATCH
         SET @Data += CONCAT(N'The optional parameter plan optimization settings could not be read: ', ERROR_MESSAGE(), @nl);
     END CATCH;
+
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, NULL, @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
 END;
 GO

@@ -11,6 +11,17 @@ recommendations are kept, and it replaces the procedures and functions.
 
 ### Added
 
+- **Step log, `AIIndexTuner.RunLog`**
+  ([#39](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/39), issue #38). Each step of
+  a run gets a row when it starts and is completed when it ends: every collector section, named as
+  in the payload, the AI request, the wait for the AI response, and each recommendation applied in
+  CREATE mode. Columns: `Collector`, `StartTime`, `EndTime`, `ElapsedMs`, `Chars` (characters the
+  section added to the payload; for the AI steps, of the request and of the answer) and `Message`
+  (polls so far while waiting for the answer; the status of an applied recommendation; the error
+  of a failed step). The row with no `EndTime` is the step running now, visible from another
+  session. On by default through the new `AIIndexTuner.Config.EnableLogging`; `sp_AIIndexTuner
+  @Logging = 0 | 1` overrides it for one call. A Managed Instance run had spent 11 minutes with no
+  way to tell which part was slow.
 - **Setup errors stop a live run before collecting**
   ([#39](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/39), issue #38). Before, a
   setup mistake surfaced only at the AI call, after a collection that took almost 7 minutes on a

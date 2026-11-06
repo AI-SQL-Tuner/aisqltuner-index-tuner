@@ -1242,5 +1242,30 @@ ELSE
     PRINT 'SKIP T27: AIIndexTuner.Config has a row';
 GO
 
+/* ===== T28: step logging to AIIndexTuner.RunLog (issue #38) =====
+   With @Logging = 1, every collector section gets a closed row, and the characters of the rows add
+   up to the run's CollectedChars, since the steps are contiguous. With @Logging = 0, none. */
+DECLARE @RunId int;
+EXEC dbo.sp_AIIndexTuner @TestResponse = N'{"summary": "s", "recommendations": []}', @Logging = 1;
+SET @RunId = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
+IF (SELECT COUNT(*) FROM AIIndexTuner.RunLog WHERE RunId = @RunId) < 20
+    THROW 50999, N'FAIL T28: a logged run did not write a row per collector section.', 1;
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.RunLog WHERE RunId = @RunId AND Collector = N'COLUMN CARDINALITY')
+   OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.RunLog WHERE RunId = @RunId AND Collector = N'INDEX PAGE DENSITY')
+    THROW 50999, N'FAIL T28: section rows are not named after the payload sections.', 1;
+IF EXISTS (SELECT 1 FROM AIIndexTuner.RunLog WHERE RunId = @RunId AND (EndTime IS NULL OR ElapsedMs IS NULL OR Chars IS NULL))
+    THROW 50999, N'FAIL T28: a step of a finished run was left open.', 1;
+IF (SELECT SUM(Chars) FROM AIIndexTuner.RunLog WHERE RunId = @RunId) <> (SELECT CollectedChars FROM AIIndexTuner.Run WHERE RunId = @RunId)
+    THROW 50999, N'FAIL T28: the characters of the steps do not add up to CollectedChars.', 1;
+
+EXEC dbo.sp_AIIndexTuner @TestResponse = N'{"summary": "s", "recommendations": []}', @Logging = 0;
+IF EXISTS (SELECT 1 FROM AIIndexTuner.RunLog WHERE RunId = (SELECT MAX(RunId) FROM AIIndexTuner.Run))
+    THROW 50999, N'FAIL T28: @Logging = 0 wrote RunLog rows.', 1;
+
+IF (SELECT dc.definition FROM sys.default_constraints AS dc WHERE dc.name = N'DF_AIIndexTuner_Config_Logging') <> N'((1))'
+    THROW 50999, N'FAIL T28: EnableLogging does not default to 1.', 1;
+PRINT 'PASS T28: each step is logged with its time and characters, and @Logging = 0 logs nothing';
+GO
+
 PRINT 'ALL TESTS PASSED';
 GO

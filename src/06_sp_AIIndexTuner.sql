@@ -47,6 +47,9 @@ GO
                             uses this text as the collected diagnostics instead of collecting them,
                             for example a run's AIIndexTuner.Run.CollectedData. Benchmarks use it to
                             give every run the same input. Nothing is collected.
+        @Logging            1 = write each step (collector section, AI request, AI response, each
+                            recommendation applied) to AIIndexTuner.RunLog as it starts and ends;
+                            0 = do not; NULL (default) = AIIndexTuner.Config.EnableLogging.
 
     Requires SQL Server 2025, Azure SQL Database, Azure SQL Managed Instance or Fabric SQL
     Database (sp_invoke_external_rest_endpoint). Only OpenAI models are supported for now.
@@ -62,7 +65,8 @@ CREATE OR ALTER PROCEDURE dbo.sp_AIIndexTuner
     @AllowDropIndex   bit = NULL,
     @MaxNewIndexes    int = NULL,
     @MinPriority      varchar(10) = NULL,
-    @MinConfidence    varchar(10) = NULL
+    @MinConfidence    varchar(10) = NULL,
+    @Logging          bit = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -84,11 +88,12 @@ BEGIN
         THROW 50205, N'The table in @SchemaName.@TableName does not exist in this database.', 1;
 
     DECLARE @IncludeQueryText bit = 1, @KeepDetail bit = 1, @Endpoint nvarchar(400), @Deployment nvarchar(128), @Effort varchar(10),
-            @MaxPayloadChars int, @CredentialName sysname;
+            @MaxPayloadChars int, @CredentialName sysname, @ConfigLogging bit;
     SELECT @IncludeQueryText = IncludeQueryText, @KeepDetail = KeepRunDetail,
            @Endpoint = Endpoint, @Deployment = Deployment, @Effort = ReasoningEffort, @MaxPayloadChars = MaxPayloadChars,
-           @CredentialName = CredentialName
+           @CredentialName = CredentialName, @ConfigLogging = EnableLogging
     FROM AIIndexTuner.Config WHERE ConfigId = 1;
+    SET @Logging = COALESCE(@Logging, @ConfigLogging, 1);
 
     IF @MaxNewIndexes < 0
         THROW 50209, N'@MaxNewIndexes must be 0 or more, or NULL for no limit.', 1;
@@ -107,7 +112,7 @@ BEGIN
     IF @CollectOnly = 1
     BEGIN
         EXEC AIIndexTuner.usp_CollectData @SchemaName = @SchemaName, @TableName = @TableName,
-                                          @IncludeQueryText = @IncludeQueryText, @Data = @Data OUTPUT;
+                                          @IncludeQueryText = @IncludeQueryText, @Data = @Data OUTPUT, @Logging = @Logging;
         SELECT LEN(@Data) AS CollectedChars, @Data AS CollectedData, @SystemPrompt AS SystemPrompt;
         RETURN;
     END;
@@ -170,7 +175,8 @@ BEGIN
             SET @Data = @CollectedData;
         ELSE
             EXEC AIIndexTuner.usp_CollectData @SchemaName = @SchemaName, @TableName = @TableName,
-                                              @IncludeQueryText = @IncludeQueryText, @Data = @Data OUTPUT;
+                                              @IncludeQueryText = @IncludeQueryText, @Data = @Data OUTPUT,
+                                              @RunId = @RunId, @Logging = @Logging;
 
         UPDATE AIIndexTuner.Run
         SET CollectedChars = LEN(@Data), CollectedData = CASE WHEN @KeepDetail = 1 THEN @Data END,
@@ -199,7 +205,7 @@ BEGIN
                 @SystemPrompt = @SystemPrompt, @UserPrompt = @UserPrompt,
                 @Text = @Text OUTPUT, @ModelUsed = @ModelUsed OUTPUT, @InputTokens = @InputTokens OUTPUT,
                 @OutputTokens = @OutputTokens OUTPUT, @Truncated = @Truncated OUTPUT, @RawResponse = @Raw OUTPUT,
-                @PollCount = @PollCount OUTPUT;
+                @PollCount = @PollCount OUTPUT, @RunId = @RunId, @Logging = @Logging;
 
         UPDATE AIIndexTuner.Run
         SET ModelUsed = @ModelUsed, InputTokens = @InputTokens, OutputTokens = @OutputTokens, Truncated = @Truncated,
@@ -260,12 +266,16 @@ BEGIN
     BEGIN CATCH
         DECLARE @Err nvarchar(4000) = ERROR_MESSAGE();
         UPDATE AIIndexTuner.Run SET Status = 'Failed', ErrorMessage = @Err, CompletedAt = SYSDATETIME() WHERE RunId = @RunId;
+        -- The step that failed is still open; close it with the error.
+        UPDATE AIIndexTuner.RunLog
+        SET EndTime = SYSDATETIME(), ElapsedMs = DATEDIFF(MILLISECOND, StartTime, SYSDATETIME()), Message = LEFT(CONCAT(N'Failed: ', @Err), 4000)
+        WHERE RunId = @RunId AND EndTime IS NULL;
         THROW;
     END CATCH;
 
     IF @Mode = 'CREATE'
     BEGIN
-        DECLARE @RecId int, @ApplyStarted datetime2(7) = SYSDATETIME();
+        DECLARE @RecId int, @ApplyStarted datetime2(7) = SYSDATETIME(), @ApplyStep nvarchar(128), @ApplyLogId int, @ApplyLogChars int, @ApplyLogRow int;
         -- New rowstore indexes and widenings of existing ones, plus the columnstore indexes and drops
         -- this run has a setting for. Recommend-only ones (setting NULL) stay Recommended, for review.
         -- A change the run does not allow (0) is still passed, so that it is marked Skipped if the model
@@ -282,7 +292,16 @@ BEGIN
         FETCH NEXT FROM apply_cur INTO @RecId;
         WHILE @@FETCH_STATUS = 0
         BEGIN
+            SET @ApplyStep = (SELECT LEFT(CONCAT(N'Apply ', Category, N' ', IndexName, N' (recommendation ', RecommendationId, N')'), 128)
+                              FROM AIIndexTuner.Recommendation WHERE RecommendationId = @RecId);
+            EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, @ApplyStep, @LogId = @ApplyLogId OUTPUT, @CharsAtStart = @ApplyLogChars OUTPUT;
+            SET @ApplyLogRow = @ApplyLogId;
             EXEC AIIndexTuner.usp_ApplyRecommendation @RecommendationId = @RecId;
+            EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, NULL, @LogId = @ApplyLogId OUTPUT, @CharsAtStart = @ApplyLogChars OUTPUT;
+            IF @Logging = 1
+                UPDATE AIIndexTuner.RunLog
+                SET Message = (SELECT LEFT(CONCAT(Status, N': ', StatusReason), 4000) FROM AIIndexTuner.Recommendation WHERE RecommendationId = @RecId)
+                WHERE RunLogId = @ApplyLogRow;
             FETCH NEXT FROM apply_cur INTO @RecId;
         END;
         CLOSE apply_cur;

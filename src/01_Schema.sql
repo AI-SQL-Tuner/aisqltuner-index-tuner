@@ -123,6 +123,35 @@ IF COL_LENGTH(N'AIIndexTuner.Run', N'MinPriority') IS NULL
         MinConfidence varchar(10) NULL;
 GO
 
+/* Step logging (issue #38): sp_AIIndexTuner @Logging, NULL = this default. On by default, since a
+   run writes only about 30 small rows. WITH VALUES gives existing installs the default too. */
+IF COL_LENGTH(N'AIIndexTuner.Config', N'EnableLogging') IS NULL
+    ALTER TABLE AIIndexTuner.Config ADD
+        EnableLogging bit NOT NULL CONSTRAINT DF_AIIndexTuner_Config_Logging DEFAULT (1) WITH VALUES;
+GO
+
+/* One row per step of a run: each collector section, the AI request and the wait for its answer,
+   and each recommendation applied. A row is written when its step starts and completed when it
+   ends, each in its own autocommit statement, so another session can see the step running now:
+   the row with EndTime NULL. RunId is NULL for @CollectOnly = 1, which creates no run. */
+IF OBJECT_ID(N'AIIndexTuner.RunLog', N'U') IS NULL
+BEGIN
+    CREATE TABLE AIIndexTuner.RunLog
+    (
+        RunLogId    int IDENTITY(1, 1) NOT NULL CONSTRAINT PK_AIIndexTuner_RunLog PRIMARY KEY,
+        RunId       int             NULL CONSTRAINT FK_AIIndexTuner_RunLog_Run REFERENCES AIIndexTuner.Run (RunId),
+        Collector   nvarchar(128)   NOT NULL,   -- the section name as in the payload, or AI request, AI response, Apply ...
+        StartTime   datetime2(3)    NOT NULL,
+        EndTime     datetime2(3)    NULL,       -- NULL while the step runs
+        ElapsedMs   int             NULL,
+        Chars       int             NULL,       -- characters the section added to the payload; for the AI steps, of the request and of the answer
+        Message     nvarchar(4000)  NULL        -- AI response: polls and status so far; a failed step: the error
+    );
+
+    CREATE INDEX IX_AIIndexTuner_RunLog_Run ON AIIndexTuner.RunLog (RunId, RunLogId);
+END;
+GO
+
 IF OBJECT_ID(N'AIIndexTuner.Recommendation', N'U') IS NULL
 BEGIN
     CREATE TABLE AIIndexTuner.Recommendation
@@ -175,6 +204,38 @@ IF COL_LENGTH(N'AIIndexTuner.Recommendation', N'ReplacesIndex') IS NULL
 GO
 
 /* ===== Helpers ===== */
+
+/* Ends the open step, if any, and starts @Step, if given; @Step NULL only ends. Chars is the growth
+   of @Data (or @Chars when no @Data) over the step, so contiguous steps add up to the payload length.
+   The caller keeps @LogId and @CharsAtStart between calls. Does nothing when @Logging is not 1. */
+CREATE OR ALTER PROCEDURE AIIndexTuner.usp_LogStep
+    @Logging      bit,
+    @RunId        int,
+    @Step         nvarchar(128),
+    @Data         nvarchar(max) = NULL,
+    @Chars        int = NULL,
+    @LogId        int = NULL OUTPUT,
+    @CharsAtStart int = NULL OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    IF ISNULL(@Logging, 0) = 0 RETURN;
+
+    DECLARE @Now datetime2(3) = SYSDATETIME(), @Len int = COALESCE(LEN(@Data), @Chars);
+
+    IF @LogId IS NOT NULL
+        UPDATE AIIndexTuner.RunLog
+        SET EndTime = @Now, ElapsedMs = DATEDIFF(MILLISECOND, StartTime, @Now), Chars = @Len - @CharsAtStart
+        WHERE RunLogId = @LogId;
+    SET @LogId = NULL;
+
+    IF @Step IS NOT NULL
+    BEGIN
+        INSERT AIIndexTuner.RunLog (RunId, Collector, StartTime) VALUES (@RunId, @Step, @Now);
+        SELECT @LogId = SCOPE_IDENTITY(), @CharsAtStart = @Len;
+    END;
+END;
+GO
 
 /* A High, Medium or Low level as a number to compare: 3, 2 or 1. NULL for anything else. */
 CREATE OR ALTER FUNCTION AIIndexTuner.fn_LevelRank(@Level varchar(10))
