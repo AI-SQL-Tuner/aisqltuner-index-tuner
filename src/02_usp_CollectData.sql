@@ -787,27 +787,47 @@ BEGIN
 
         DECLARE @StatsTable nvarchar(300), @StatsName sysname, @sql nvarchar(max), @CardinalityErrors int = 0;
 
+        /* The candidate tables, each list built once, then joined to sys.stats. The two lists used to be
+           IN (SELECT TOP ...) subqueries joined by OR in the sys.stats query, and on a Managed Instance
+           that one statement ran on CPU, with no wait, for over 14 minutes. */
+        CREATE TABLE #CardCandidates (object_id int NOT NULL PRIMARY KEY);
+
+        IF @SchemaName IS NOT NULL AND @TableName IS NOT NULL
+            INSERT #CardCandidates (object_id)
+            SELECT o.object_id FROM (SELECT OBJECT_ID(QUOTENAME(@SchemaName) + N'.' + QUOTENAME(@TableName)) AS object_id) AS o
+            WHERE o.object_id IS NOT NULL;
+        ELSE
+        BEGIN
+            INSERT #CardCandidates (object_id)
+            SELECT DISTINCT m.object_id
+            FROM (SELECT TOP (20) d.object_id
+                  FROM sys.dm_db_missing_index_details AS d
+                  INNER JOIN sys.dm_db_missing_index_groups AS g ON d.index_handle = g.index_handle
+                  INNER JOIN sys.dm_db_missing_index_group_stats AS st ON g.index_group_handle = st.group_handle
+                  WHERE d.database_id = DB_ID()
+                    AND st.avg_total_user_cost * st.avg_user_impact * (st.user_seeks + st.user_scans) > 100000
+                  ORDER BY st.avg_total_user_cost * st.avg_user_impact * (st.user_seeks + st.user_scans) DESC) AS m;
+
+            INSERT #CardCandidates (object_id)
+            SELECT l.object_id
+            FROM (SELECT TOP (20) ps.object_id
+                  FROM sys.dm_db_partition_stats AS ps
+                  WHERE ps.index_id IN (0, 1)
+                  GROUP BY ps.object_id
+                  HAVING SUM(ps.row_count) > 10000
+                  ORDER BY SUM(ps.row_count) DESC) AS l
+            WHERE l.object_id NOT IN (SELECT object_id FROM #CardCandidates);
+        END;
+
         INSERT #CardStats (object_id, stats_id, StatsTable, StatsName)
-            SELECT DISTINCT s.object_id, s.stats_id, QUOTENAME(OBJECT_SCHEMA_NAME(s.object_id)) + N'.' + QUOTENAME(OBJECT_NAME(s.object_id)), s.name
-            FROM sys.stats AS s
+            SELECT DISTINCT s.object_id, s.stats_id, QUOTENAME(sc.name) + N'.' + QUOTENAME(o.name), s.name
+            FROM #CardCandidates AS c
+            INNER JOIN sys.stats AS s ON s.object_id = c.object_id
             INNER JOIN sys.objects AS o ON s.object_id = o.object_id
+            INNER JOIN sys.schemas AS sc ON o.schema_id = sc.schema_id
             WHERE o.type = 'U'
-              AND OBJECT_SCHEMA_NAME(s.object_id) NOT LIKE N'AIIndexTuner%' AND (@SchemaName IS NULL OR OBJECT_SCHEMA_NAME(s.object_id) = @SchemaName)
-              AND (@TableName IS NULL OR OBJECT_NAME(s.object_id) = @TableName)
-              AND (   s.object_id IN (SELECT TOP (20) d.object_id
-                                      FROM sys.dm_db_missing_index_details AS d
-                                      INNER JOIN sys.dm_db_missing_index_groups AS g ON d.index_handle = g.index_handle
-                                      INNER JOIN sys.dm_db_missing_index_group_stats AS st ON g.index_group_handle = st.group_handle
-                                      WHERE d.database_id = DB_ID()
-                                        AND st.avg_total_user_cost * st.avg_user_impact * (st.user_seeks + st.user_scans) > 100000
-                                      ORDER BY st.avg_total_user_cost * st.avg_user_impact * (st.user_seeks + st.user_scans) DESC)
-                   OR s.object_id IN (SELECT TOP (20) ps.object_id
-                                      FROM sys.dm_db_partition_stats AS ps
-                                      WHERE ps.index_id IN (0, 1)
-                                      GROUP BY ps.object_id
-                                      HAVING SUM(ps.row_count) > 10000
-                                      ORDER BY SUM(ps.row_count) DESC)
-                   OR (@SchemaName IS NOT NULL AND @TableName IS NOT NULL));
+              AND sc.name NOT LIKE N'AIIndexTuner%' AND (@SchemaName IS NULL OR sc.name = @SchemaName)
+              AND (@TableName IS NULL OR o.name = @TableName);
 
         DECLARE stats_cur CURSOR LOCAL FAST_FORWARD FOR
             SELECT StatsTable, StatsName FROM #CardStats;
@@ -842,6 +862,7 @@ BEGIN
 
         DROP TABLE #RawDensity;
         DROP TABLE #Density;
+        DROP TABLE #CardCandidates;
     END TRY
     BEGIN CATCH
         IF CURSOR_STATUS('local', 'stats_cur') >= -1 BEGIN CLOSE stats_cur; DEALLOCATE stats_cur; END;
