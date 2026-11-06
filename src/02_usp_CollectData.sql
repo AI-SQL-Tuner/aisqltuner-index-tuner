@@ -54,9 +54,29 @@ BEGIN
         -- 'Sales' from matching 'Sales2'.
         IF ISNULL(IS_SRVROLEMEMBER(N'securityadmin'), 0) = 1 OR ISNULL(IS_SRVROLEMEMBER(N'sysadmin'), 0) = 1
         BEGIN
-            DECLARE @Log int = 0, @Search nvarchar(4000) = CONCAT(N'Starting up database ''', DB_NAME(), N'''.');
+            /* Only logs that exist are read (issue #40). sp_readerrorlog on a log number past the
+               oldest archive fails with error 22004 from xp_readerrorlog, which the TRY...CATCH here
+               did not catch: the failed reads were counted as searched. On a Managed Instance keeping
+               logs 0 to 3, this proc alone reproduced SSMS's "A severe error occurred on the current
+               command". sp_enumerrorlogs lists the logs that exist; if it cannot be read, only the
+               current log (0), which always exists, is searched. */
+            DECLARE @Log int, @Search nvarchar(4000) = CONCAT(N'Starting up database ''', DB_NAME(), N'''.');
+            CREATE TABLE #ErrorLogs (ArchiveNo int, LogDate nvarchar(100), SizeBytes bigint);
             CREATE TABLE #ErrorLog (LogDate datetime, ProcessInfo nvarchar(100), [Text] nvarchar(max));
-            WHILE @Log < 7 AND @LastStartup IS NULL
+            BEGIN TRY
+                INSERT #ErrorLogs (ArchiveNo, LogDate, SizeBytes) EXEC sys.sp_enumerrorlogs;
+            END TRY
+            BEGIN CATCH
+                TRUNCATE TABLE #ErrorLogs;
+            END CATCH;
+            IF NOT EXISTS (SELECT 1 FROM #ErrorLogs WHERE ArchiveNo = 0)
+                INSERT #ErrorLogs (ArchiveNo) VALUES (0);
+
+            DECLARE log_cur CURSOR LOCAL FAST_FORWARD FOR
+                SELECT ArchiveNo FROM #ErrorLogs WHERE ArchiveNo BETWEEN 0 AND 6 ORDER BY ArchiveNo;
+            OPEN log_cur;
+            FETCH NEXT FROM log_cur INTO @Log;
+            WHILE @@FETCH_STATUS = 0 AND @LastStartup IS NULL
             BEGIN
                 BEGIN TRY
                     TRUNCATE TABLE #ErrorLog;
@@ -65,11 +85,14 @@ BEGIN
                     SET @ErrorLogsSearched += 1;
                 END TRY
                 BEGIN CATCH
-                    BREAK;   -- past the oldest archive the log does not exist; any other error also ends the search
+                    BREAK;   -- any error that is caught ends the search
                 END CATCH;
-                SET @Log += 1;
+                FETCH NEXT FROM log_cur INTO @Log;
             END;
+            CLOSE log_cur;
+            DEALLOCATE log_cur;
             DROP TABLE #ErrorLog;
+            DROP TABLE #ErrorLogs;
         END;
     END;
 

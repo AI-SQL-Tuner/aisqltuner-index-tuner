@@ -50,6 +50,14 @@ recommendations are kept, and it replaces the procedures and functions.
   joined by `OR`. The two candidate lists, the top 20 high-impact missing-index tables and the top
   20 largest tables, are now built once into a temp table and joined, as INDEX PAGE DENSITY already
   did. The tables chosen are the same.
+- **"A severe error occurred on the current command" on Managed Instance**
+  ([#39](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/39), issue #40). For a
+  sysadmin or securityadmin caller, the usage-period lookup read error logs 0 to 6 with
+  `sp_readerrorlog`. A Managed Instance kept logs 0 to 3, and reading 4 to 6 fails with error 22004
+  from `xp_readerrorlog`, which the lookup's `TRY...CATCH` did not catch. The lookup alone
+  reproduced the client error, so every call that collected ended with it, though the run itself
+  completed. The lookup now lists the logs that exist with `sp_enumerrorlogs` and reads only those;
+  if they cannot be listed, it reads only the current log.
 - **NON-SARGABLE PREDICATES could read every cached plan to keep 50**
   ([#39](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/39), issue #38). The step log
   of a Managed Instance run showed this section taking 229 of the 279 seconds of collection, while
