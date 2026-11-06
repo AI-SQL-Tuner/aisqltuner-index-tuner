@@ -1587,52 +1587,68 @@ BEGIN
         SET @Data += N'Query Store write workload mix is not available on this database.' + @nl;
     ELSE BEGIN
     BEGIN TRY
-        WITH typed AS (
-            SELECT CASE WHEN stmt.s LIKE 'INSERT %' THEN 'INSERT'
-                        WHEN stmt.s LIKE 'UPDATE %' THEN 'UPDATE'
-                        WHEN stmt.s LIKE 'DELETE %' THEN 'DELETE'
-                        WHEN stmt.s LIKE 'MERGE %' THEN 'MERGE'
-                   END AS StatementType,
-                   DATEPART(HOUR, rsi.start_time) AS HourOfDayUtc,
-                   CAST(rs.count_executions AS bigint) AS count_executions
-            FROM sys.query_store_query_text AS qt
-            INNER JOIN sys.query_store_query AS q ON qt.query_text_id = q.query_text_id
-            INNER JOIN sys.query_store_plan AS qp ON q.query_id = qp.query_id
-            INNER JOIN sys.query_store_runtime_stats AS rs ON qp.plan_id = rs.plan_id
-            INNER JOIN sys.query_store_runtime_stats_interval AS rsi ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
-            -- A query variant's module is its parent's (see the workload section).
-            LEFT JOIN sys.query_store_query_variant AS qv ON qv.query_variant_query_id = q.query_id
-            LEFT JOIN sys.query_store_query AS pq ON pq.query_id = qv.parent_query_id
-            CROSS APPLY (SELECT COALESCE(pq.object_id, q.object_id) AS object_id) AS m
-            -- Upper-cased head of the text, with line breaks and tabs as spaces.
-            CROSS APPLY (SELECT UPPER(LTRIM(REPLACE(REPLACE(REPLACE(LEFT(qt.query_sql_text, 4000), NCHAR(13), N' '), NCHAR(10), N' '), NCHAR(9), N' '))) AS t) AS head
-            -- Where the statement starts after a "(@...)" parameter-declaration prefix: the first ')'
-            -- followed by a write keyword. Searching for the keyword, not the first ')', copes with
-            -- types such as decimal(18,2) inside the declarations.
-            CROSS APPLY (SELECT CASE WHEN head.t LIKE N'(@%'
-                                     THEN (SELECT MIN(v.pos) FROM (VALUES (CHARINDEX(N')INSERT ', head.t)), (CHARINDEX(N')UPDATE ', head.t)),
-                                                                          (CHARINDEX(N')DELETE ', head.t)), (CHARINDEX(N')MERGE ', head.t))) AS v(pos)
-                                           WHERE v.pos > 0)
-                                END AS p) AS prefix
-            CROSS APPLY (SELECT LEFT(CASE WHEN prefix.p IS NOT NULL THEN SUBSTRING(head.t, prefix.p + 1, 4000) ELSE head.t END, 200) AS s) AS stmt
-            WHERE rs.runtime_stats_interval_id >= @QsMinInterval
-              AND (@QsScoped = 0 OR EXISTS (SELECT 1 FROM #qs_scope AS sc WHERE sc.query_id = q.query_id))
-              AND q.is_internal_query = 0
-              -- Leave out this tool's own writes, as in the workload section: its temp-table writes in
-              -- usp_CollectData and usp_UsageSince, whose text does not name the schema, by module,
-              -- and its runs and recommendations by text.
-              AND (m.object_id = 0 OR OBJECT_SCHEMA_NAME(m.object_id) IS NULL OR OBJECT_SCHEMA_NAME(m.object_id) NOT LIKE N'AIIndexTuner%')
-              AND (m.object_id = 0 OR OBJECT_NAME(m.object_id) IS NULL OR OBJECT_NAME(m.object_id) NOT LIKE N'sp[_]AIIndexTuner%')
-              AND qt.query_sql_text NOT LIKE N'%AIIndexTuner%'
-        )
-        SELECT @j = (
-            SELECT TOP (12) StatementType, HourOfDayUtc, SUM(count_executions) AS Executions
-            FROM typed
-            WHERE StatementType IS NOT NULL
-            GROUP BY StatementType, HourOfDayUtc
-            ORDER BY SUM(count_executions) DESC, StatementType
-            FOR JSON PATH)
+        /* In three steps, so that each query's text is read and parsed once rather than once per
+           runtime-stats row (one per plan per interval: up to 168 per plan at the default 60-minute
+           interval over 7 days). The result is the same. */
+        -- 1. Executions per query and UTC hour, from runtime stats alone.
+        DROP TABLE IF EXISTS #qs_write_exec;
+        SELECT qp.query_id, DATEPART(HOUR, rsi.start_time) AS HourOfDayUtc, SUM(CAST(rs.count_executions AS bigint)) AS Executions
+        INTO #qs_write_exec
+        FROM sys.query_store_runtime_stats AS rs
+        INNER JOIN sys.query_store_runtime_stats_interval AS rsi ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
+        INNER JOIN sys.query_store_plan AS qp ON qp.plan_id = rs.plan_id
+        WHERE rs.runtime_stats_interval_id >= @QsMinInterval
+        GROUP BY qp.query_id, DATEPART(HOUR, rsi.start_time)
         OPTION (RECOMPILE);
+
+        -- 2. The statement type of each of those queries, from its text, once per query.
+        DROP TABLE IF EXISTS #qs_write_type;
+        SELECT q.query_id,
+               CASE WHEN stmt.s LIKE 'INSERT %' THEN 'INSERT'
+                    WHEN stmt.s LIKE 'UPDATE %' THEN 'UPDATE'
+                    WHEN stmt.s LIKE 'DELETE %' THEN 'DELETE'
+                    WHEN stmt.s LIKE 'MERGE %' THEN 'MERGE'
+               END AS StatementType
+        INTO #qs_write_type
+        FROM (SELECT DISTINCT query_id FROM #qs_write_exec) AS e
+        INNER JOIN sys.query_store_query AS q ON q.query_id = e.query_id
+        INNER JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
+        -- A query variant's module is its parent's (see the workload section).
+        LEFT JOIN sys.query_store_query_variant AS qv ON qv.query_variant_query_id = q.query_id
+        LEFT JOIN sys.query_store_query AS pq ON pq.query_id = qv.parent_query_id
+        CROSS APPLY (SELECT COALESCE(pq.object_id, q.object_id) AS object_id) AS m
+        -- Upper-cased head of the text, with line breaks and tabs as spaces.
+        CROSS APPLY (SELECT UPPER(LTRIM(REPLACE(REPLACE(REPLACE(LEFT(qt.query_sql_text, 4000), NCHAR(13), N' '), NCHAR(10), N' '), NCHAR(9), N' '))) AS t) AS head
+        -- Where the statement starts after a "(@...)" parameter-declaration prefix: the first ')'
+        -- followed by a write keyword. Searching for the keyword, not the first ')', copes with
+        -- types such as decimal(18,2) inside the declarations.
+        CROSS APPLY (SELECT CASE WHEN head.t LIKE N'(@%'
+                                 THEN (SELECT MIN(v.pos) FROM (VALUES (CHARINDEX(N')INSERT ', head.t)), (CHARINDEX(N')UPDATE ', head.t)),
+                                                                      (CHARINDEX(N')DELETE ', head.t)), (CHARINDEX(N')MERGE ', head.t))) AS v(pos)
+                                       WHERE v.pos > 0)
+                            END AS p) AS prefix
+        CROSS APPLY (SELECT LEFT(CASE WHEN prefix.p IS NOT NULL THEN SUBSTRING(head.t, prefix.p + 1, 4000) ELSE head.t END, 200) AS s) AS stmt
+        WHERE (@QsScoped = 0 OR EXISTS (SELECT 1 FROM #qs_scope AS sc WHERE sc.query_id = q.query_id))
+          AND q.is_internal_query = 0
+          -- Leave out this tool's own writes, as in the workload section: its temp-table writes in
+          -- usp_CollectData and usp_UsageSince, whose text does not name the schema, by module,
+          -- and its runs and recommendations by text.
+          AND (m.object_id = 0 OR OBJECT_SCHEMA_NAME(m.object_id) IS NULL OR OBJECT_SCHEMA_NAME(m.object_id) NOT LIKE N'AIIndexTuner%')
+          AND (m.object_id = 0 OR OBJECT_NAME(m.object_id) IS NULL OR OBJECT_NAME(m.object_id) NOT LIKE N'sp[_]AIIndexTuner%')
+          AND qt.query_sql_text NOT LIKE N'%AIIndexTuner%'
+        OPTION (RECOMPILE);
+
+        -- 3. Executions per statement type and hour.
+        SELECT @j = (
+            SELECT TOP (12) t.StatementType, e.HourOfDayUtc, SUM(e.Executions) AS Executions
+            FROM #qs_write_type AS t
+            INNER JOIN #qs_write_exec AS e ON e.query_id = t.query_id
+            WHERE t.StatementType IS NOT NULL
+            GROUP BY t.StatementType, e.HourOfDayUtc
+            ORDER BY SUM(e.Executions) DESC, t.StatementType
+            FOR JSON PATH);
+        DROP TABLE #qs_write_exec;
+        DROP TABLE #qs_write_type;
         SET @Data += CASE WHEN @j IS NULL THEN N'No recent write workload mix found in Query Store.'
                           ELSE N'Executions over the last 7 days per statement type and UTC hour of day (0-23), the 12 largest buckets; a statement type can appear in several rows.' + @nl + @j
                      END + @nl;
