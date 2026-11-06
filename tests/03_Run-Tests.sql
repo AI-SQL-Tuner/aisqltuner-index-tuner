@@ -1253,8 +1253,11 @@ IF (SELECT COUNT(*) FROM AIIndexTuner.RunLog WHERE RunId = @RunId) < 20
 IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.RunLog WHERE RunId = @RunId AND Collector = N'COLUMN CARDINALITY')
    OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.RunLog WHERE RunId = @RunId AND Collector = N'INDEX PAGE DENSITY')
     THROW 50999, N'FAIL T28: section rows are not named after the payload sections.', 1;
-IF EXISTS (SELECT 1 FROM AIIndexTuner.RunLog WHERE RunId = @RunId AND (EndTime IS NULL OR ElapsedMs IS NULL OR Chars IS NULL))
+IF EXISTS (SELECT 1 FROM AIIndexTuner.RunLog WHERE RunId = @RunId
+                                                 AND (EndTime IS NULL OR ElapsedMs IS NULL OR (Chars IS NULL AND Collector <> N'Return results')))
     THROW 50999, N'FAIL T28: a step of a finished run was left open.', 1;
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.RunLog WHERE RunId = @RunId AND Collector = N'Return results' AND Message = N'2 of 2 result sets done')
+    THROW 50999, N'FAIL T28: the result sets were not logged as done.', 1;
 IF (SELECT SUM(Chars) FROM AIIndexTuner.RunLog WHERE RunId = @RunId) <> (SELECT CollectedChars FROM AIIndexTuner.Run WHERE RunId = @RunId)
     THROW 50999, N'FAIL T28: the characters of the steps do not add up to CollectedChars.', 1;
 

@@ -309,16 +309,30 @@ BEGIN
         UPDATE AIIndexTuner.Run SET ApplyMs = DATEDIFF(MILLISECOND, @ApplyStarted, SYSDATETIME()) WHERE RunId = @RunId;
     END;
 
+    /* Return results, logged around the two result sets (issue #40: on a Managed Instance the client
+       reported "A severe error occurred" in place of these results). A closed row means the server
+       finished both result sets; Message counts how many it finished. */
+    DECLARE @ResultsLogId int, @ResultsLogChars int, @ResultsLogRow int;
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'Return results', @LogId = @ResultsLogId OUTPUT, @CharsAtStart = @ResultsLogChars OUTPUT;
+    SET @ResultsLogRow = @ResultsLogId;
+
     SELECT r.RunId, r.Status AS RunStatus, r.ModelUsed, r.InputTokens, r.OutputTokens, r.Summary,
            r.CollectedChars, r.StartedAt, r.CompletedAt,
            N'Free and open source from AI SQL Tuner. For query tuning, deadlock analysis, server health checks, code review, HTML reports or SQL Server 2022 and earlier, see AI SQL Tuner Studio: https://aisqltuner.com or https://apps.microsoft.com/detail/9P68072ZM3N5' AS MoreFrom
     FROM AIIndexTuner.Run AS r WHERE r.RunId = @RunId;
+
+    IF @Logging = 1
+        UPDATE AIIndexTuner.RunLog SET Message = N'1 of 2 result sets done' WHERE RunLogId = @ResultsLogRow;
 
     SELECT RecommendationId, Priority, PriorityLevel, Category, Title, SchemaName, TableName, IndexName, IndexType, ReplacesIndex, Confidence, EstimatedSizeMB,
            Status, StatusReason, Rationale, Script, AppliedDDL, UndoDDL
     FROM AIIndexTuner.Recommendation
     WHERE RunId = @RunId
     ORDER BY Priority, RecommendationId;
+
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, NULL, @LogId = @ResultsLogId OUTPUT, @CharsAtStart = @ResultsLogChars OUTPUT;
+    IF @Logging = 1
+        UPDATE AIIndexTuner.RunLog SET Message = N'2 of 2 result sets done' WHERE RunLogId = @ResultsLogRow;
 END;
 GO
 

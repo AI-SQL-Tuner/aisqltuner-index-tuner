@@ -14,8 +14,8 @@ recommendations are kept, and it replaces the procedures and functions.
 - **Step log, `AIIndexTuner.RunLog`**
   ([#39](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/39), issue #38). Each step of
   a run gets a row when it starts and is completed when it ends: every collector section, named as
-  in the payload, the AI request, the wait for the AI response, and each recommendation applied in
-  CREATE mode. Columns: `Collector`, `StartTime`, `EndTime`, `ElapsedMs`, `Chars` (characters the
+  in the payload, the AI request, the wait for the AI response, each recommendation applied in
+  CREATE mode, and the two final result sets (`Return results`, for issue #40). Columns: `Collector`, `StartTime`, `EndTime`, `ElapsedMs`, `Chars` (characters the
   section added to the payload; for the AI steps, of the request and of the answer) and `Message`
   (polls so far while waiting for the answer; the status of an applied recommendation; the error
   of a failed step). The row with no `EndTime` is the step running now, visible from another

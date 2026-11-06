@@ -291,7 +291,8 @@ WHERE ep.name = N'AIIndexTuner';
 
 With logging on, each step of a run is written to `AIIndexTuner.RunLog` when it starts and again
 when it ends: every collector section (named as in the payload), the AI request, the wait for the
-AI response, and each recommendation applied in CREATE mode. `Chars` is the number of characters
+AI response, each recommendation applied in CREATE mode, and the return of the two result sets
+(`Return results`). `Chars` is the number of characters
 a section added to the payload; for the AI steps, the length of the request and of the answer.
 Each write commits on its own, so from another session you can see where a running call is: the
 row with no `EndTime` is the step running now, and the AI response row's `Message` shows the polls
