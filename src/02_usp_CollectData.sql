@@ -54,9 +54,29 @@ BEGIN
         -- 'Sales' from matching 'Sales2'.
         IF ISNULL(IS_SRVROLEMEMBER(N'securityadmin'), 0) = 1 OR ISNULL(IS_SRVROLEMEMBER(N'sysadmin'), 0) = 1
         BEGIN
-            DECLARE @Log int = 0, @Search nvarchar(4000) = CONCAT(N'Starting up database ''', DB_NAME(), N'''.');
+            /* Only logs that exist are read (issue #40). sp_readerrorlog on a log number past the
+               oldest archive fails with error 22004 from xp_readerrorlog, which the TRY...CATCH here
+               did not catch: the failed reads were counted as searched. On a Managed Instance keeping
+               logs 0 to 3, this proc alone reproduced SSMS's "A severe error occurred on the current
+               command". sp_enumerrorlogs lists the logs that exist; if it cannot be read, only the
+               current log (0), which always exists, is searched. */
+            DECLARE @Log int, @Search nvarchar(4000) = CONCAT(N'Starting up database ''', DB_NAME(), N'''.');
+            CREATE TABLE #ErrorLogs (ArchiveNo int, LogDate nvarchar(100), SizeBytes bigint);
             CREATE TABLE #ErrorLog (LogDate datetime, ProcessInfo nvarchar(100), [Text] nvarchar(max));
-            WHILE @Log < 7 AND @LastStartup IS NULL
+            BEGIN TRY
+                INSERT #ErrorLogs (ArchiveNo, LogDate, SizeBytes) EXEC sys.sp_enumerrorlogs;
+            END TRY
+            BEGIN CATCH
+                TRUNCATE TABLE #ErrorLogs;
+            END CATCH;
+            IF NOT EXISTS (SELECT 1 FROM #ErrorLogs WHERE ArchiveNo = 0)
+                INSERT #ErrorLogs (ArchiveNo) VALUES (0);
+
+            DECLARE log_cur CURSOR LOCAL FAST_FORWARD FOR
+                SELECT ArchiveNo FROM #ErrorLogs WHERE ArchiveNo BETWEEN 0 AND 6 ORDER BY ArchiveNo;
+            OPEN log_cur;
+            FETCH NEXT FROM log_cur INTO @Log;
+            WHILE @@FETCH_STATUS = 0 AND @LastStartup IS NULL
             BEGIN
                 BEGIN TRY
                     TRUNCATE TABLE #ErrorLog;
@@ -65,11 +85,14 @@ BEGIN
                     SET @ErrorLogsSearched += 1;
                 END TRY
                 BEGIN CATCH
-                    BREAK;   -- past the oldest archive the log does not exist; any other error also ends the search
+                    BREAK;   -- any error that is caught ends the search
                 END CATCH;
-                SET @Log += 1;
+                FETCH NEXT FROM log_cur INTO @Log;
             END;
+            CLOSE log_cur;
+            DEALLOCATE log_cur;
             DROP TABLE #ErrorLog;
+            DROP TABLE #ErrorLogs;
         END;
     END;
 
@@ -109,7 +132,9 @@ CREATE OR ALTER PROCEDURE AIIndexTuner.usp_CollectData
     @SchemaName       sysname = NULL,
     @TableName        sysname = NULL,
     @IncludeQueryText bit = 1,
-    @Data             nvarchar(max) OUTPUT
+    @Data             nvarchar(max) OUTPUT,
+    @RunId            int = NULL,   -- for AIIndexTuner.RunLog
+    @Logging          bit = 0       -- 1 = log each section to AIIndexTuner.RunLog (issue #38)
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -123,7 +148,9 @@ BEGIN
             @RestartCleared nvarchar(200) = N'Index usage statistics, missing index statistics, index operational statistics and the plan cache';
 
     SET @Data = N'';
+    DECLARE @LogId int, @LogChars int;   -- the open RunLog step
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'SERVER INFORMATION', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== Server information ===== */
     SELECT @MajorVersion = MAX(compatibility_level) / 10 FROM sys.databases;
 
@@ -146,6 +173,7 @@ BEGIN
         N'Major Version: ', CASE WHEN @MajorVersion >= 17 THEN N'SQL Server 2025' WHEN @MajorVersion = 16 THEN N'SQL Server 2022' ELSE CONCAT(N'Version ', @MajorVersion) END, @nl,
         N'Full Version: ', @@VERSION, @nl);
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'USAGE PERIOD AND PLATFORM CAPABILITIES', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* Start time and the period the usage DMVs cover (GetUsageStatisticsSinceAsync); see usp_UsageSince. */
     DECLARE @StartTime datetime2(0), @Now datetime2(0) = SYSDATETIME(), @AutoClose bit, @RestoreHistoryRead bit,
             @LastStartup datetime2(0), @ErrorLogsSearched int, @Since datetime2(0), @SinceSource nvarchar(400), @HasInstanceLogs bit;
@@ -209,6 +237,7 @@ BEGIN
     ELSE IF @SchemaName IS NOT NULL
         SET @Data += CONCAT(N'Object-scoped analysis is limited to schema: ', QUOTENAME(@SchemaName), N'. Query Store sections are filtered to queries that reference that schema; the Query Store section below states how that scope was resolved. Other database-level sections remain database-scoped.', @nl);
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'FILL FACTOR AND INCLUDED COLUMN TYPES', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* sys.indexes.fill_factor is 0 for an index created without FILLFACTOR, meaning the server's
        'fill factor (%)' applies. Printed as 0, models copy it into WITH (FILLFACTOR = 0), which
        SQL Server rejects, so the payload shows the value that actually applies. */
@@ -283,6 +312,7 @@ BEGIN
         -- The two sections below still run, without IncludedColumnTypes.
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'MISSING INDEX RECOMMENDATIONS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== MISSING INDEX RECOMMENDATIONS ===== */
     BEGIN TRY
         SET @j = (
@@ -314,6 +344,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== MISSING INDEX RECOMMENDATIONS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'INDEX USAGE STATISTICS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== INDEX USAGE STATISTICS =====
        Half the rows are reserved for drop candidates (unread nonclustered indexes that enforce no
        constraint) and half for indexes that are read; a group with fewer rows leaves its share to
@@ -383,6 +414,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== INDEX USAGE STATISTICS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'MISSING INDEX OVERLAP SIGNALS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== MISSING INDEX OVERLAP SIGNALS =====
        For the top missing-index candidates, the best-matching existing index and a redundancy score,
        with row counts, estimated storage and write penalty. */
@@ -480,6 +512,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== MISSING INDEX OVERLAP SIGNALS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'DUPLICATE AND OVERLAPPING INDEXES', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== DUPLICATE AND OVERLAPPING INDEXES =====
        Exact key duplicates and strict left-prefix overlaps within a table, compared as exact strings.
        NarrowerIsRedundant is the apply step's test for a drop at any usage window: the narrower index
@@ -548,6 +581,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== DUPLICATE AND OVERLAPPING INDEXES ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'PLAN CACHE QUERY STATISTICS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== PLAN CACHE QUERY STATISTICS ===== database-wide, top 25 by CPU */
     BEGIN TRY
         SET @j = (
@@ -581,6 +615,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== PLAN CACHE QUERY STATISTICS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'NON-SARGABLE PREDICATES', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== NON-SARGABLE PREDICATES =====
        Table columns wrapped in a function, conversion or arithmetic inside a scan or filter
        predicate of the top 50 plan cache statements by CPU, read from each statement's showplan. No
@@ -588,21 +623,35 @@ BEGIN
        A live run missed YEAR() and DATEDIFF() around Invoices columns, seen only in query text. */
     BEGIN TRY
         DROP TABLE IF EXISTS #NonSargable;
+        /* The top 50 statements first, then the plans of those 50 only. As one statement, with
+           sys.dm_exec_text_query_plan applied before TOP (50), the plan text could be read for
+           every cached statement of this database before 50 were kept: on a Managed Instance this
+           section took 229 seconds, while PLAN CACHE QUERY STATISTICS, which picks the same
+           statements without reading plans, took 47 ms. */
+        DROP TABLE IF EXISTS #NsStmts;
+        SELECT TOP (50) ROW_NUMBER() OVER (ORDER BY qs.total_worker_time DESC) AS stmt_id,
+               qs.query_hash, qs.execution_count, qs.total_worker_time, qs.total_logical_reads,
+               qs.plan_handle, qs.statement_start_offset, qs.statement_end_offset
+        INTO #NsStmts
+        FROM sys.dm_exec_query_stats AS qs
+        CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
+        CROSS APPLY (SELECT CAST(pa.value AS int) AS dbid FROM sys.dm_exec_plan_attributes(qs.plan_handle) AS pa WHERE pa.attribute = N'dbid') AS pdb
+        -- The same statements as the plan cache section, without this tool's own.
+        WHERE pdb.dbid = DB_ID()
+          AND (st.objectid IS NULL OR OBJECT_SCHEMA_NAME(st.objectid, st.dbid) IS NULL OR OBJECT_SCHEMA_NAME(st.objectid, st.dbid) NOT LIKE N'AIIndexTuner%')
+          AND st.text NOT LIKE N'%AIIndexTuner%'
+        ORDER BY qs.total_worker_time DESC;
+
+        DROP TABLE IF EXISTS #NsPlans;
+        SELECT n.stmt_id, n.query_hash, n.execution_count, n.total_worker_time, n.total_logical_reads,
+               -- NULL for a plan nested deeper than the xml type allows.
+               TRY_CONVERT(xml, tqp.query_plan) AS plan_xml
+        INTO #NsPlans
+        FROM #NsStmts AS n
+        CROSS APPLY sys.dm_exec_text_query_plan(n.plan_handle, n.statement_start_offset, n.statement_end_offset) AS tqp;
+
         WITH XMLNAMESPACES (DEFAULT 'http://schemas.microsoft.com/sqlserver/2004/07/showplan'),
-        stmts AS (
-            SELECT TOP (50) ROW_NUMBER() OVER (ORDER BY qs.total_worker_time DESC) AS stmt_id,
-                   qs.query_hash, qs.execution_count, qs.total_worker_time, qs.total_logical_reads,
-                   -- NULL for a plan nested deeper than the xml type allows.
-                   TRY_CONVERT(xml, tqp.query_plan) AS plan_xml
-            FROM sys.dm_exec_query_stats AS qs
-            CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
-            CROSS APPLY (SELECT CAST(pa.value AS int) AS dbid FROM sys.dm_exec_plan_attributes(qs.plan_handle) AS pa WHERE pa.attribute = N'dbid') AS pdb
-            CROSS APPLY sys.dm_exec_text_query_plan(qs.plan_handle, qs.statement_start_offset, qs.statement_end_offset) AS tqp
-            -- The same statements as the plan cache section, without this tool's own.
-            WHERE pdb.dbid = DB_ID()
-              AND (st.objectid IS NULL OR OBJECT_SCHEMA_NAME(st.objectid, st.dbid) IS NULL OR OBJECT_SCHEMA_NAME(st.objectid, st.dbid) NOT LIKE N'AIIndexTuner%')
-              AND st.text NOT LIKE N'%AIIndexTuner%'
-            ORDER BY qs.total_worker_time DESC)
+        stmts AS (SELECT stmt_id, query_hash, execution_count, total_worker_time, total_logical_reads, plan_xml FROM #NsPlans)
         -- A column of a table in this database (parameters and variables have no Table) under an
         -- Intrinsic (YEAR shows as datepart), Convert, Arithmetic or user-defined function. LIKE is an
         -- Intrinsic too, but it compares the column rather than wrapping it, and PROBE is a bitmap
@@ -658,6 +707,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== NON-SARGABLE PREDICATES ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'HEAP TABLE ANALYSIS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== HEAP TABLE ANALYSIS ===== heaps of 10,000 rows or more, physical stats sampled per heap */
     BEGIN TRY
         DECLARE @Heaps TABLE (object_id int PRIMARY KEY, TableName nvarchar(300), TotalRows bigint, ReservedMB decimal(18, 1));
@@ -688,6 +738,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== HEAP TABLE ANALYSIS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'CONSTRAINTS AND RELATIONSHIPS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== CONSTRAINTS AND RELATIONSHIPS ===== PK, UQ and FK, with the referenced table for FKs */
     BEGIN TRY
         SET @j = (
@@ -717,6 +768,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== CONSTRAINTS AND RELATIONSHIPS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'UNTRUSTED OR DISABLED CONSTRAINTS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== UNTRUSTED OR DISABLED CONSTRAINTS ===== */
     BEGIN TRY
         SET @j = (
@@ -744,6 +796,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== UNTRUSTED OR DISABLED CONSTRAINTS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'INDEX OPERATIONAL HOTSPOTS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== INDEX OPERATIONAL HOTSPOTS ===== per-index lock, latch and leaf-operation pressure, top 15 */
     BEGIN TRY
         SET @j = (
@@ -776,38 +829,59 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== INDEX OPERATIONAL HOTSPOTS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'COLUMN CARDINALITY', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== COLUMN CARDINALITY =====
        Density vectors for the tables behind the top 20 high-impact missing indexes and the 20 largest
        tables over 10,000 rows (plus the scoped table), via DBCC SHOW_STATISTICS ... WITH DENSITY_VECTOR. */
     -- The candidate statistics, kept for SKEWED LOW-CARDINALITY COLUMNS.
-    CREATE TABLE #CardStats (object_id int, stats_id int, StatsTable nvarchar(300), StatsName sysname);
+    CREATE TABLE #CardStats (object_id int, stats_id int, StatsTable nvarchar(520), StatsName sysname);   -- QUOTENAME(schema) + '.' + QUOTENAME(table): up to 517
     BEGIN TRY
         CREATE TABLE #RawDensity (AllDensity float, AvgLength float, Columns nvarchar(4000));
-        CREATE TABLE #Density (TableName nvarchar(300), AllDensity float, AvgLength float, Columns nvarchar(4000));
+        CREATE TABLE #Density (TableName nvarchar(520), AllDensity float, AvgLength float, Columns nvarchar(4000));
 
-        DECLARE @StatsTable nvarchar(300), @StatsName sysname, @sql nvarchar(max), @CardinalityErrors int = 0;
+        DECLARE @StatsTable nvarchar(520), @StatsName sysname, @sql nvarchar(max), @CardinalityErrors int = 0;
+
+        /* The candidate tables, each list built once, then joined to sys.stats. The two lists used to be
+           IN (SELECT TOP ...) subqueries joined by OR in the sys.stats query, and on a Managed Instance
+           that one statement ran on CPU, with no wait, for over 14 minutes. */
+        CREATE TABLE #CardCandidates (object_id int NOT NULL PRIMARY KEY);
+
+        IF @SchemaName IS NOT NULL AND @TableName IS NOT NULL
+            INSERT #CardCandidates (object_id)
+            SELECT o.object_id FROM (SELECT OBJECT_ID(QUOTENAME(@SchemaName) + N'.' + QUOTENAME(@TableName)) AS object_id) AS o
+            WHERE o.object_id IS NOT NULL;
+        ELSE
+        BEGIN
+            INSERT #CardCandidates (object_id)
+            SELECT DISTINCT m.object_id
+            FROM (SELECT TOP (20) d.object_id
+                  FROM sys.dm_db_missing_index_details AS d
+                  INNER JOIN sys.dm_db_missing_index_groups AS g ON d.index_handle = g.index_handle
+                  INNER JOIN sys.dm_db_missing_index_group_stats AS st ON g.index_group_handle = st.group_handle
+                  WHERE d.database_id = DB_ID()
+                    AND st.avg_total_user_cost * st.avg_user_impact * (st.user_seeks + st.user_scans) > 100000
+                  ORDER BY st.avg_total_user_cost * st.avg_user_impact * (st.user_seeks + st.user_scans) DESC) AS m;
+
+            INSERT #CardCandidates (object_id)
+            SELECT l.object_id
+            FROM (SELECT TOP (20) ps.object_id
+                  FROM sys.dm_db_partition_stats AS ps
+                  WHERE ps.index_id IN (0, 1)
+                  GROUP BY ps.object_id
+                  HAVING SUM(ps.row_count) > 10000
+                  ORDER BY SUM(ps.row_count) DESC) AS l
+            WHERE l.object_id NOT IN (SELECT object_id FROM #CardCandidates);
+        END;
 
         INSERT #CardStats (object_id, stats_id, StatsTable, StatsName)
-            SELECT DISTINCT s.object_id, s.stats_id, QUOTENAME(OBJECT_SCHEMA_NAME(s.object_id)) + N'.' + QUOTENAME(OBJECT_NAME(s.object_id)), s.name
-            FROM sys.stats AS s
+            SELECT DISTINCT s.object_id, s.stats_id, QUOTENAME(sc.name) + N'.' + QUOTENAME(o.name), s.name
+            FROM #CardCandidates AS c
+            INNER JOIN sys.stats AS s ON s.object_id = c.object_id
             INNER JOIN sys.objects AS o ON s.object_id = o.object_id
+            INNER JOIN sys.schemas AS sc ON o.schema_id = sc.schema_id
             WHERE o.type = 'U'
-              AND OBJECT_SCHEMA_NAME(s.object_id) NOT LIKE N'AIIndexTuner%' AND (@SchemaName IS NULL OR OBJECT_SCHEMA_NAME(s.object_id) = @SchemaName)
-              AND (@TableName IS NULL OR OBJECT_NAME(s.object_id) = @TableName)
-              AND (   s.object_id IN (SELECT TOP (20) d.object_id
-                                      FROM sys.dm_db_missing_index_details AS d
-                                      INNER JOIN sys.dm_db_missing_index_groups AS g ON d.index_handle = g.index_handle
-                                      INNER JOIN sys.dm_db_missing_index_group_stats AS st ON g.index_group_handle = st.group_handle
-                                      WHERE d.database_id = DB_ID()
-                                        AND st.avg_total_user_cost * st.avg_user_impact * (st.user_seeks + st.user_scans) > 100000
-                                      ORDER BY st.avg_total_user_cost * st.avg_user_impact * (st.user_seeks + st.user_scans) DESC)
-                   OR s.object_id IN (SELECT TOP (20) ps.object_id
-                                      FROM sys.dm_db_partition_stats AS ps
-                                      WHERE ps.index_id IN (0, 1)
-                                      GROUP BY ps.object_id
-                                      HAVING SUM(ps.row_count) > 10000
-                                      ORDER BY SUM(ps.row_count) DESC)
-                   OR (@SchemaName IS NOT NULL AND @TableName IS NOT NULL));
+              AND sc.name NOT LIKE N'AIIndexTuner%' AND (@SchemaName IS NULL OR sc.name = @SchemaName)
+              AND (@TableName IS NULL OR o.name = @TableName);
 
         DECLARE stats_cur CURSOR LOCAL FAST_FORWARD FOR
             SELECT StatsTable, StatsName FROM #CardStats;
@@ -842,12 +916,14 @@ BEGIN
 
         DROP TABLE #RawDensity;
         DROP TABLE #Density;
+        DROP TABLE #CardCandidates;
     END TRY
     BEGIN CATCH
         IF CURSOR_STATUS('local', 'stats_cur') >= -1 BEGIN CLOSE stats_cur; DEALLOCATE stats_cur; END;
         SET @Data += CONCAT(@nl, N'=== COLUMN CARDINALITY ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'SKEWED LOW-CARDINALITY COLUMNS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== SKEWED LOW-CARDINALITY COLUMNS =====
        For the tables in COLUMN CARDINALITY: columns that lead a statistics object whose histogram has
        2 to 10 values, one value per step, where one value holds 80% or more of the rows or one holds
@@ -896,6 +972,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== SKEWED LOW-CARDINALITY COLUMNS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'LARGE TABLES', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== LARGE TABLES ===== over 1,000,000 rows */
     BEGIN TRY
         WITH LargeTables AS (
@@ -919,6 +996,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== LARGE TABLES ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'DATABASE STATISTICS SETTINGS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== DATABASE STATISTICS SETTINGS ===== */
     BEGIN TRY
         SET @j = (
@@ -948,6 +1026,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== DATABASE STATISTICS SETTINGS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'INDEX PAGE DENSITY', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== INDEX PAGE DENSITY =====
        sys.dm_db_index_physical_stats (SAMPLED) once per candidate table, never with a NULL object_id,
        which would scan every object in the database. Candidates: the scoped table; otherwise the top
@@ -1025,6 +1104,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== INDEX PAGE DENSITY ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'QUERY STORE STATE AND SCOPE', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== Query Store ===== */
     DECLARE @QsActualState int, @QsDesiredState int, @QsStateDesc nvarchar(60), @QsUsable bit = 0;
     SELECT TOP (1) @QsActualState = actual_state, @QsDesiredState = desired_state, @QsStateDesc = actual_state_desc
@@ -1192,6 +1272,7 @@ BEGIN
         DROP TABLE #qs_plan_hit;
     END;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'QUERY STORE WORKLOAD INSIGHTS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== QUERY STORE WORKLOAD INSIGHTS ===== top 50 queries by total duration over the last 7 days */
     SET @Data += CONCAT(@nl, N'=== QUERY STORE WORKLOAD INSIGHTS ===', @nl, CASE WHEN @QsScopeNote <> N'' THEN @QsScopeNote + @nl ELSE N'' END);
     IF @QsActualState IS NULL
@@ -1288,6 +1369,7 @@ BEGIN
     END CATCH;
     END;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'QUERY STORE WRITE WORKLOAD MIX', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== QUERY STORE WRITE WORKLOAD MIX =====
        INSERT/UPDATE/DELETE/MERGE executions by type and UTC hour. The type comes from the leading
        keyword of the statement. Auto-parameterized and sp_executesql statements start with their
@@ -1300,52 +1382,68 @@ BEGIN
         SET @Data += N'Query Store write workload mix is not available on this database.' + @nl;
     ELSE BEGIN
     BEGIN TRY
-        WITH typed AS (
-            SELECT CASE WHEN stmt.s LIKE 'INSERT %' THEN 'INSERT'
-                        WHEN stmt.s LIKE 'UPDATE %' THEN 'UPDATE'
-                        WHEN stmt.s LIKE 'DELETE %' THEN 'DELETE'
-                        WHEN stmt.s LIKE 'MERGE %' THEN 'MERGE'
-                   END AS StatementType,
-                   DATEPART(HOUR, rsi.start_time) AS HourOfDayUtc,
-                   CAST(rs.count_executions AS bigint) AS count_executions
-            FROM sys.query_store_query_text AS qt
-            INNER JOIN sys.query_store_query AS q ON qt.query_text_id = q.query_text_id
-            INNER JOIN sys.query_store_plan AS qp ON q.query_id = qp.query_id
-            INNER JOIN sys.query_store_runtime_stats AS rs ON qp.plan_id = rs.plan_id
-            INNER JOIN sys.query_store_runtime_stats_interval AS rsi ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
-            -- A query variant's module is its parent's (see the workload section).
-            LEFT JOIN sys.query_store_query_variant AS qv ON qv.query_variant_query_id = q.query_id
-            LEFT JOIN sys.query_store_query AS pq ON pq.query_id = qv.parent_query_id
-            CROSS APPLY (SELECT COALESCE(pq.object_id, q.object_id) AS object_id) AS m
-            -- Upper-cased head of the text, with line breaks and tabs as spaces.
-            CROSS APPLY (SELECT UPPER(LTRIM(REPLACE(REPLACE(REPLACE(LEFT(qt.query_sql_text, 4000), NCHAR(13), N' '), NCHAR(10), N' '), NCHAR(9), N' '))) AS t) AS head
-            -- Where the statement starts after a "(@...)" parameter-declaration prefix: the first ')'
-            -- followed by a write keyword. Searching for the keyword, not the first ')', copes with
-            -- types such as decimal(18,2) inside the declarations.
-            CROSS APPLY (SELECT CASE WHEN head.t LIKE N'(@%'
-                                     THEN (SELECT MIN(v.pos) FROM (VALUES (CHARINDEX(N')INSERT ', head.t)), (CHARINDEX(N')UPDATE ', head.t)),
-                                                                          (CHARINDEX(N')DELETE ', head.t)), (CHARINDEX(N')MERGE ', head.t))) AS v(pos)
-                                           WHERE v.pos > 0)
-                                END AS p) AS prefix
-            CROSS APPLY (SELECT LEFT(CASE WHEN prefix.p IS NOT NULL THEN SUBSTRING(head.t, prefix.p + 1, 4000) ELSE head.t END, 200) AS s) AS stmt
-            WHERE rs.runtime_stats_interval_id >= @QsMinInterval
-              AND (@QsScoped = 0 OR EXISTS (SELECT 1 FROM #qs_scope AS sc WHERE sc.query_id = q.query_id))
-              AND q.is_internal_query = 0
-              -- Leave out this tool's own writes, as in the workload section: its temp-table writes in
-              -- usp_CollectData and usp_UsageSince, whose text does not name the schema, by module,
-              -- and its runs and recommendations by text.
-              AND (m.object_id = 0 OR OBJECT_SCHEMA_NAME(m.object_id) IS NULL OR OBJECT_SCHEMA_NAME(m.object_id) NOT LIKE N'AIIndexTuner%')
-              AND (m.object_id = 0 OR OBJECT_NAME(m.object_id) IS NULL OR OBJECT_NAME(m.object_id) NOT LIKE N'sp[_]AIIndexTuner%')
-              AND qt.query_sql_text NOT LIKE N'%AIIndexTuner%'
-        )
-        SELECT @j = (
-            SELECT TOP (12) StatementType, HourOfDayUtc, SUM(count_executions) AS Executions
-            FROM typed
-            WHERE StatementType IS NOT NULL
-            GROUP BY StatementType, HourOfDayUtc
-            ORDER BY SUM(count_executions) DESC, StatementType
-            FOR JSON PATH)
+        /* In three steps, so that each query's text is read and parsed once rather than once per
+           runtime-stats row (one per plan per interval: up to 168 per plan at the default 60-minute
+           interval over 7 days). The result is the same. */
+        -- 1. Executions per query and UTC hour, from runtime stats alone.
+        DROP TABLE IF EXISTS #qs_write_exec;
+        SELECT qp.query_id, DATEPART(HOUR, rsi.start_time) AS HourOfDayUtc, SUM(CAST(rs.count_executions AS bigint)) AS Executions
+        INTO #qs_write_exec
+        FROM sys.query_store_runtime_stats AS rs
+        INNER JOIN sys.query_store_runtime_stats_interval AS rsi ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
+        INNER JOIN sys.query_store_plan AS qp ON qp.plan_id = rs.plan_id
+        WHERE rs.runtime_stats_interval_id >= @QsMinInterval
+        GROUP BY qp.query_id, DATEPART(HOUR, rsi.start_time)
         OPTION (RECOMPILE);
+
+        -- 2. The statement type of each of those queries, from its text, once per query.
+        DROP TABLE IF EXISTS #qs_write_type;
+        SELECT q.query_id,
+               CASE WHEN stmt.s LIKE 'INSERT %' THEN 'INSERT'
+                    WHEN stmt.s LIKE 'UPDATE %' THEN 'UPDATE'
+                    WHEN stmt.s LIKE 'DELETE %' THEN 'DELETE'
+                    WHEN stmt.s LIKE 'MERGE %' THEN 'MERGE'
+               END AS StatementType
+        INTO #qs_write_type
+        FROM (SELECT DISTINCT query_id FROM #qs_write_exec) AS e
+        INNER JOIN sys.query_store_query AS q ON q.query_id = e.query_id
+        INNER JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
+        -- A query variant's module is its parent's (see the workload section).
+        LEFT JOIN sys.query_store_query_variant AS qv ON qv.query_variant_query_id = q.query_id
+        LEFT JOIN sys.query_store_query AS pq ON pq.query_id = qv.parent_query_id
+        CROSS APPLY (SELECT COALESCE(pq.object_id, q.object_id) AS object_id) AS m
+        -- Upper-cased head of the text, with line breaks and tabs as spaces.
+        CROSS APPLY (SELECT UPPER(LTRIM(REPLACE(REPLACE(REPLACE(LEFT(qt.query_sql_text, 4000), NCHAR(13), N' '), NCHAR(10), N' '), NCHAR(9), N' '))) AS t) AS head
+        -- Where the statement starts after a "(@...)" parameter-declaration prefix: the first ')'
+        -- followed by a write keyword. Searching for the keyword, not the first ')', copes with
+        -- types such as decimal(18,2) inside the declarations.
+        CROSS APPLY (SELECT CASE WHEN head.t LIKE N'(@%'
+                                 THEN (SELECT MIN(v.pos) FROM (VALUES (CHARINDEX(N')INSERT ', head.t)), (CHARINDEX(N')UPDATE ', head.t)),
+                                                                      (CHARINDEX(N')DELETE ', head.t)), (CHARINDEX(N')MERGE ', head.t))) AS v(pos)
+                                       WHERE v.pos > 0)
+                            END AS p) AS prefix
+        CROSS APPLY (SELECT LEFT(CASE WHEN prefix.p IS NOT NULL THEN SUBSTRING(head.t, prefix.p + 1, 4000) ELSE head.t END, 200) AS s) AS stmt
+        WHERE (@QsScoped = 0 OR EXISTS (SELECT 1 FROM #qs_scope AS sc WHERE sc.query_id = q.query_id))
+          AND q.is_internal_query = 0
+          -- Leave out this tool's own writes, as in the workload section: its temp-table writes in
+          -- usp_CollectData and usp_UsageSince, whose text does not name the schema, by module,
+          -- and its runs and recommendations by text.
+          AND (m.object_id = 0 OR OBJECT_SCHEMA_NAME(m.object_id) IS NULL OR OBJECT_SCHEMA_NAME(m.object_id) NOT LIKE N'AIIndexTuner%')
+          AND (m.object_id = 0 OR OBJECT_NAME(m.object_id) IS NULL OR OBJECT_NAME(m.object_id) NOT LIKE N'sp[_]AIIndexTuner%')
+          AND qt.query_sql_text NOT LIKE N'%AIIndexTuner%'
+        OPTION (RECOMPILE);
+
+        -- 3. Executions per statement type and hour.
+        SELECT @j = (
+            SELECT TOP (12) t.StatementType, e.HourOfDayUtc, SUM(e.Executions) AS Executions
+            FROM #qs_write_type AS t
+            INNER JOIN #qs_write_exec AS e ON e.query_id = t.query_id
+            WHERE t.StatementType IS NOT NULL
+            GROUP BY t.StatementType, e.HourOfDayUtc
+            ORDER BY SUM(e.Executions) DESC, t.StatementType
+            FOR JSON PATH);
+        DROP TABLE #qs_write_exec;
+        DROP TABLE #qs_write_type;
         SET @Data += CASE WHEN @j IS NULL THEN N'No recent write workload mix found in Query Store.'
                           ELSE N'Executions over the last 7 days per statement type and UTC hour of day (0-23), the 12 largest buckets; a statement type can appear in several rows.' + @nl + @j
                      END + @nl;
@@ -1355,6 +1453,7 @@ BEGIN
     END CATCH;
     END;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'QUERY STORE FORCED PLAN FAILURES', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== QUERY STORE FORCED PLAN FAILURES ===== */
     SET @Data += CONCAT(@nl, N'=== QUERY STORE FORCED PLAN FAILURES ===', @nl);
     IF @QsUsable = 0
@@ -1398,6 +1497,7 @@ BEGIN
     END CATCH;
     END;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'AUTOMATIC TUNING OPTIONS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== AUTOMATIC TUNING OPTIONS ===== FORCE_LAST_GOOD_PLAN */
     BEGIN TRY
         SET @j = (
@@ -1417,6 +1517,7 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== AUTOMATIC TUNING OPTIONS ===', @nl, N'Automatic tuning options unavailable: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'CARDINALITY ESTIMATION FEEDBACK', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== CARDINALITY ESTIMATION FEEDBACK ===== (AppendCeFeedbackSummaryAsync)
        Next to automatic tuning: a forced plan turns CE feedback off for its query, and automatic plan
        correction can roll CE feedback back (ROLLEDBACK_BY_APRC). */
@@ -1482,6 +1583,7 @@ BEGIN
         SET @Data += CONCAT(N'The CE feedback settings could not be read: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'DEGREE OF PARALLELISM FEEDBACK', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== DEGREE OF PARALLELISM FEEDBACK ===== (AppendDopFeedbackSummaryAsync, issue #17)
        DOP feedback lowers the DOP of repeating parallel queries whose parallelism is inefficient. It is
        ON by default on SQL Server 2025. Unlike CE feedback, a plan forced through Query Store does not
@@ -1547,6 +1649,7 @@ BEGIN
         SET @Data += CONCAT(N'The DOP feedback settings could not be read: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'OPTIONAL PARAMETER PLAN OPTIMIZATION', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== OPTIONAL PARAMETER PLAN OPTIMIZATION ===== (DescribeOptionalParameterOptimization, issue #17)
        OPPO gives a catch-all predicate such as (@p IS NULL OR col = @p) a query variant for each NULL state
        of the parameter, so the variant for a non-NULL value can seek an index the single scan plan could
@@ -1579,5 +1682,7 @@ BEGIN
     BEGIN CATCH
         SET @Data += CONCAT(N'The optional parameter plan optimization settings could not be read: ', ERROR_MESSAGE(), @nl);
     END CATCH;
+
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, NULL, @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
 END;
 GO

@@ -47,6 +47,9 @@ GO
                             uses this text as the collected diagnostics instead of collecting them,
                             for example a run's AIIndexTuner.Run.CollectedData. Benchmarks use it to
                             give every run the same input. Nothing is collected.
+        @Logging            1 = write each step (collector section, AI request, AI response, each
+                            recommendation applied) to AIIndexTuner.RunLog as it starts and ends;
+                            0 = do not; NULL (default) = AIIndexTuner.Config.EnableLogging.
 
     Requires SQL Server 2025, Azure SQL Database, Azure SQL Managed Instance or Fabric SQL
     Database (sp_invoke_external_rest_endpoint). Only OpenAI models are supported for now.
@@ -62,7 +65,8 @@ CREATE OR ALTER PROCEDURE dbo.sp_AIIndexTuner
     @AllowDropIndex   bit = NULL,
     @MaxNewIndexes    int = NULL,
     @MinPriority      varchar(10) = NULL,
-    @MinConfidence    varchar(10) = NULL
+    @MinConfidence    varchar(10) = NULL,
+    @Logging          bit = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -84,10 +88,12 @@ BEGIN
         THROW 50205, N'The table in @SchemaName.@TableName does not exist in this database.', 1;
 
     DECLARE @IncludeQueryText bit = 1, @KeepDetail bit = 1, @Endpoint nvarchar(400), @Deployment nvarchar(128), @Effort varchar(10),
-            @MaxPayloadChars int;
+            @MaxPayloadChars int, @CredentialName sysname, @ConfigLogging bit;
     SELECT @IncludeQueryText = IncludeQueryText, @KeepDetail = KeepRunDetail,
-           @Endpoint = Endpoint, @Deployment = Deployment, @Effort = ReasoningEffort, @MaxPayloadChars = MaxPayloadChars
+           @Endpoint = Endpoint, @Deployment = Deployment, @Effort = ReasoningEffort, @MaxPayloadChars = MaxPayloadChars,
+           @CredentialName = CredentialName, @ConfigLogging = EnableLogging
     FROM AIIndexTuner.Config WHERE ConfigId = 1;
+    SET @Logging = COALESCE(@Logging, @ConfigLogging, 1);
 
     IF @MaxNewIndexes < 0
         THROW 50209, N'@MaxNewIndexes must be 0 or more, or NULL for no limit.', 1;
@@ -106,13 +112,49 @@ BEGIN
     IF @CollectOnly = 1
     BEGIN
         EXEC AIIndexTuner.usp_CollectData @SchemaName = @SchemaName, @TableName = @TableName,
-                                          @IncludeQueryText = @IncludeQueryText, @Data = @Data OUTPUT;
+                                          @IncludeQueryText = @IncludeQueryText, @Data = @Data OUTPUT, @Logging = @Logging;
         SELECT LEN(@Data) AS CollectedChars, @Data AS CollectedData, @SystemPrompt AS SystemPrompt;
         RETURN;
     END;
 
     IF @TestResponse IS NULL AND @Endpoint IS NULL
         THROW 50206, N'AIIndexTuner.Config has no row. Run setup/Configure-Endpoint.sql first.', 1;
+
+    /* Before collecting, which can take minutes, stop on a setup error that would fail the AI call
+       anyway. With @CollectedData nothing is collected, so the call reports these itself. */
+    IF @TestResponse IS NULL AND @CollectedData IS NULL
+    BEGIN
+        DECLARE @SetupError nvarchar(2000);
+
+        -- Off by default on SQL Server 2025 and Managed Instance (EngineEdition 8); on in Azure SQL Database and Fabric.
+        IF CAST(SERVERPROPERTY('EngineEdition') AS int) IN (1, 2, 3, 4, 8)
+           AND EXISTS (SELECT 1 FROM sys.configurations WHERE name = N'external rest endpoint enabled' AND value_in_use = 0)
+            THROW 50212, N'sp_invoke_external_rest_endpoint is disabled on this instance. Run EXEC sp_configure ''external rest endpoint enabled'', 1; RECONFIGURE WITH OVERRIDE; (step 1 of setup/Configure-Endpoint.sql; needs ALTER SETTINGS).', 1;
+
+        -- The credential name must be the request URL or a more general prefix of it, ending at a path
+        -- boundary. Compared case-insensitively, so this fails only on a definite mismatch.
+        DECLARE @RequestUrl nvarchar(4000) = CONCAT(
+            CASE WHEN RIGHT(@Endpoint, 1) = N'/' THEN LEFT(@Endpoint, LEN(@Endpoint) - 1) ELSE @Endpoint END, N'/openai/v1/responses');
+        IF NOT (LOWER(@RequestUrl) = LOWER(@CredentialName)
+                OR LOWER(@RequestUrl) LIKE LOWER(AIIndexTuner.fn_EscapeLike(@CredentialName)) + CASE WHEN RIGHT(@CredentialName, 1) = N'/' THEN N'%' ELSE N'/%' END ESCAPE N'\')
+        BEGIN
+            SET @SetupError = CONCAT(N'AIIndexTuner.Config.CredentialName (', @CredentialName, N') does not match the endpoint: it must be the start of the request URL ',
+                                     @RequestUrl, N', normally the endpoint''s root URL with no trailing slash.');
+            THROW 50213, @SetupError, 1;
+        END;
+
+        -- sys.database_scoped_credentials shows every credential only to a caller with CONTROL on the
+        -- database, so the check is made only then.
+        IF HAS_PERMS_BY_NAME(DB_NAME(), N'DATABASE', N'CONTROL') = 1
+           AND NOT EXISTS (SELECT 1 FROM sys.database_scoped_credentials WHERE name = @CredentialName)
+        BEGIN
+            SET @SetupError = CONCAT(N'The database scoped credential ', @CredentialName, N' (AIIndexTuner.Config.CredentialName) does not exist in this database. ',
+                                     N'Credentials here: ', ISNULL((SELECT STRING_AGG(CAST(name AS nvarchar(max)), N', ') WITHIN GROUP (ORDER BY name)
+                                                                    FROM sys.database_scoped_credentials), N'(none)'),
+                                     N'. Create it as in step 3 of setup/Configure-Endpoint.sql.');
+            THROW 50214, @SetupError, 1;
+        END;
+    END;
 
     DECLARE @RunId int;
     INSERT AIIndexTuner.Run (Mode, SchemaName, TableName, Endpoint, Deployment, ApiShape, ReasoningEffort, SystemPromptHash,
@@ -133,7 +175,8 @@ BEGIN
             SET @Data = @CollectedData;
         ELSE
             EXEC AIIndexTuner.usp_CollectData @SchemaName = @SchemaName, @TableName = @TableName,
-                                              @IncludeQueryText = @IncludeQueryText, @Data = @Data OUTPUT;
+                                              @IncludeQueryText = @IncludeQueryText, @Data = @Data OUTPUT,
+                                              @RunId = @RunId, @Logging = @Logging;
 
         UPDATE AIIndexTuner.Run
         SET CollectedChars = LEN(@Data), CollectedData = CASE WHEN @KeepDetail = 1 THEN @Data END,
@@ -162,7 +205,7 @@ BEGIN
                 @SystemPrompt = @SystemPrompt, @UserPrompt = @UserPrompt,
                 @Text = @Text OUTPUT, @ModelUsed = @ModelUsed OUTPUT, @InputTokens = @InputTokens OUTPUT,
                 @OutputTokens = @OutputTokens OUTPUT, @Truncated = @Truncated OUTPUT, @RawResponse = @Raw OUTPUT,
-                @PollCount = @PollCount OUTPUT;
+                @PollCount = @PollCount OUTPUT, @RunId = @RunId, @Logging = @Logging;
 
         UPDATE AIIndexTuner.Run
         SET ModelUsed = @ModelUsed, InputTokens = @InputTokens, OutputTokens = @OutputTokens, Truncated = @Truncated,
@@ -223,12 +266,16 @@ BEGIN
     BEGIN CATCH
         DECLARE @Err nvarchar(4000) = ERROR_MESSAGE();
         UPDATE AIIndexTuner.Run SET Status = 'Failed', ErrorMessage = @Err, CompletedAt = SYSDATETIME() WHERE RunId = @RunId;
+        -- The step that failed is still open; close it with the error.
+        UPDATE AIIndexTuner.RunLog
+        SET EndTime = SYSDATETIME(), ElapsedMs = DATEDIFF(MILLISECOND, StartTime, SYSDATETIME()), Message = LEFT(CONCAT(N'Failed: ', @Err), 4000)
+        WHERE RunId = @RunId AND EndTime IS NULL;
         THROW;
     END CATCH;
 
     IF @Mode = 'CREATE'
     BEGIN
-        DECLARE @RecId int, @ApplyStarted datetime2(7) = SYSDATETIME();
+        DECLARE @RecId int, @ApplyStarted datetime2(7) = SYSDATETIME(), @ApplyStep nvarchar(128), @ApplyLogId int, @ApplyLogChars int, @ApplyLogRow int;
         -- New rowstore indexes and widenings of existing ones, plus the columnstore indexes and drops
         -- this run has a setting for. Recommend-only ones (setting NULL) stay Recommended, for review.
         -- A change the run does not allow (0) is still passed, so that it is marked Skipped if the model
@@ -245,7 +292,16 @@ BEGIN
         FETCH NEXT FROM apply_cur INTO @RecId;
         WHILE @@FETCH_STATUS = 0
         BEGIN
+            SET @ApplyStep = (SELECT LEFT(CONCAT(N'Apply ', Category, N' ', IndexName, N' (recommendation ', RecommendationId, N')'), 128)
+                              FROM AIIndexTuner.Recommendation WHERE RecommendationId = @RecId);
+            EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, @ApplyStep, @LogId = @ApplyLogId OUTPUT, @CharsAtStart = @ApplyLogChars OUTPUT;
+            SET @ApplyLogRow = @ApplyLogId;
             EXEC AIIndexTuner.usp_ApplyRecommendation @RecommendationId = @RecId;
+            EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, NULL, @LogId = @ApplyLogId OUTPUT, @CharsAtStart = @ApplyLogChars OUTPUT;
+            IF @Logging = 1
+                UPDATE AIIndexTuner.RunLog
+                SET Message = (SELECT LEFT(CONCAT(Status, N': ' + StatusReason), 4000) FROM AIIndexTuner.Recommendation WHERE RecommendationId = @RecId)
+                WHERE RunLogId = @ApplyLogRow;
             FETCH NEXT FROM apply_cur INTO @RecId;
         END;
         CLOSE apply_cur;
@@ -253,16 +309,30 @@ BEGIN
         UPDATE AIIndexTuner.Run SET ApplyMs = DATEDIFF(MILLISECOND, @ApplyStarted, SYSDATETIME()) WHERE RunId = @RunId;
     END;
 
+    /* Return results, logged around the two result sets (issue #40: on a Managed Instance the client
+       reported "A severe error occurred" in place of these results). A closed row means the server
+       finished both result sets; Message counts how many it finished. */
+    DECLARE @ResultsLogId int, @ResultsLogChars int, @ResultsLogRow int;
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'Return results', @LogId = @ResultsLogId OUTPUT, @CharsAtStart = @ResultsLogChars OUTPUT;
+    SET @ResultsLogRow = @ResultsLogId;
+
     SELECT r.RunId, r.Status AS RunStatus, r.ModelUsed, r.InputTokens, r.OutputTokens, r.Summary,
            r.CollectedChars, r.StartedAt, r.CompletedAt,
            N'Free and open source from AI SQL Tuner. For query tuning, deadlock analysis, server health checks, code review, HTML reports or SQL Server 2022 and earlier, see AI SQL Tuner Studio: https://aisqltuner.com or https://apps.microsoft.com/detail/9P68072ZM3N5' AS MoreFrom
     FROM AIIndexTuner.Run AS r WHERE r.RunId = @RunId;
+
+    IF @Logging = 1
+        UPDATE AIIndexTuner.RunLog SET Message = N'1 of 2 result sets done' WHERE RunLogId = @ResultsLogRow;
 
     SELECT RecommendationId, Priority, PriorityLevel, Category, Title, SchemaName, TableName, IndexName, IndexType, ReplacesIndex, Confidence, EstimatedSizeMB,
            Status, StatusReason, Rationale, Script, AppliedDDL, UndoDDL
     FROM AIIndexTuner.Recommendation
     WHERE RunId = @RunId
     ORDER BY Priority, RecommendationId;
+
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, NULL, @LogId = @ResultsLogId OUTPUT, @CharsAtStart = @ResultsLogChars OUTPUT;
+    IF @Logging = 1
+        UPDATE AIIndexTuner.RunLog SET Message = N'2 of 2 result sets done' WHERE RunLogId = @ResultsLogRow;
 END;
 GO
 

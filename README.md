@@ -68,9 +68,11 @@ can apply what it finds.
    tune. It creates the `AIIndexTuner` schema with its tables and procedures, plus
    `dbo.sp_AIIndexTuner` and `dbo.sp_AIIndexTuner_Apply`. Install it in each database you tune,
    because the endpoint credential is a database scoped credential.
-2. Fill in and run [setup/Configure-Endpoint.sql](setup/Configure-Endpoint.sql). It enables the
-   REST endpoint feature (SQL Server 2025 only), creates the database master key and credential,
-   and writes the configuration row. To keep a filled-in copy with your key, save it as
+2. Fill in step 0 of [setup/Configure-Endpoint.sql](setup/Configure-Endpoint.sql) and run the
+   whole script. It creates the database master key and the credential, named from the endpoint
+   you entered, and writes the configuration row; it stops before changing anything if a
+   `<placeholder>` is left. On SQL Server 2025 and Azure SQL Managed Instance, also run its step 1,
+   which enables the REST endpoint feature and needs `ALTER SETTINGS`. To keep a filled-in copy with your key, save it as
    `setup/Configure-Endpoint-DEV.sql`, which `.gitignore` excludes.
 3. Smoke test: `EXEC dbo.sp_AIIndexTuner;`, then check that the latest `AIIndexTuner.Run` row has
    `Status = 'Succeeded'`. If it failed, `ErrorMessage` names the part to look at: the HTTP status,
@@ -283,6 +285,29 @@ WHERE ep.name = N'AIIndexTuner';
 | `IncludeQueryText` | 1 | 0 leaves plan cache query text out of the prompt |
 | `KeepRunDetail` | 1 | Keep the collected data and raw response on each run |
 | `MaxPayloadChars` | 500000 | The largest collected payload sent to the model, in characters (NULL = no limit). A larger one fails before the request with an error that names its size; narrow the scope or raise the limit |
+| `EnableLogging` | 1 | Log each step of a run to `AIIndexTuner.RunLog`; `sp_AIIndexTuner @Logging` overrides it for one call |
+
+### Step log
+
+With logging on, each step of a run is written to `AIIndexTuner.RunLog` when it starts and again
+when it ends: every collector section (named as in the payload), the AI request, the wait for the
+AI response, each recommendation applied in CREATE mode, and the return of the two result sets
+(`Return results`). `Chars` is the number of characters
+a section added to the payload; for the AI steps, the length of the request and of the answer.
+Each write commits on its own, so from another session you can see where a running call is: the
+row with no `EndTime` is the step running now, and the AI response row's `Message` shows the polls
+so far. A caller that wraps the call in its own transaction hides the rows until it commits.
+
+```sql
+SELECT l.Collector, l.StartTime, l.EndTime,
+       ISNULL(l.ElapsedMs, DATEDIFF(MILLISECOND, l.StartTime, SYSDATETIME())) AS ElapsedMs,
+       l.Chars, l.Message
+FROM AIIndexTuner.RunLog AS l
+WHERE l.RunId = (SELECT MAX(RunId) FROM AIIndexTuner.Run)
+ORDER BY l.RunLogId;
+```
+
+`@CollectOnly = 1` creates no run, so its rows have a NULL `RunId`.
 
 ## Data disclosure
 

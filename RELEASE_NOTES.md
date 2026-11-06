@@ -7,6 +7,74 @@ To upgrade, run the new [aisqltuner-index-tuner.sql](aisqltuner-index-tuner.sql)
 where the tool is installed. It adds new columns with `ALTER TABLE`, so earlier runs and
 recommendations are kept, and it replaces the procedures and functions.
 
+## 2026-11-06
+
+### Added
+
+- **Step log, `AIIndexTuner.RunLog`**
+  ([#39](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/39), issue #38). Each step of
+  a run gets a row when it starts and is completed when it ends: every collector section, named as
+  in the payload, the AI request, the wait for the AI response, each recommendation applied in
+  CREATE mode, and the two final result sets (`Return results`, for issue #40). Columns: `Collector`, `StartTime`, `EndTime`, `ElapsedMs`, `Chars` (characters the
+  section added to the payload; for the AI steps, of the request and of the answer) and `Message`
+  (polls so far while waiting for the answer; the status of an applied recommendation; the error
+  of a failed step). The row with no `EndTime` is the step running now, visible from another
+  session. On by default through the new `AIIndexTuner.Config.EnableLogging`; `sp_AIIndexTuner
+  @Logging = 0 | 1` overrides it for one call. A Managed Instance run had spent 11 minutes with no
+  way to tell which part was slow.
+- **Setup errors stop a live run before collecting**
+  ([#39](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/39), issue #38). Before, a
+  setup mistake surfaced only at the AI call, after a collection that took almost 7 minutes on a
+  Managed Instance. Now a run that collects first checks, and fails in under a second with:
+  50212 if the REST endpoint feature is off (SQL Server and Managed Instance); 50213 if
+  `Config.CredentialName` is not the start of the request URL; 50214 if that credential does not
+  exist, listing the credentials that do (checked only for a caller with `CONTROL` on the
+  database, who can see them all). A run with `@CollectedData` or `@TestResponse` is not checked.
+- **`setup/Configure-Endpoint.sql` takes each value once and refuses placeholders.** Step 0 holds
+  the endpoint, deployment, API key or managed-identity choice, and master key password; the
+  credential name and the configuration row are derived from them, so they cannot disagree. If a
+  `<placeholder>` is left, the script stops before changing anything. Before, a credential created
+  under the placeholder name `https://<your-resource>.openai.azure.com` raised no error. The script
+  ends with a check of the credential and the REST endpoint feature.
+
+### Fixed
+
+- **Setup instructions left the REST endpoint feature off on Managed Instance.** The script and
+  README said `sp_configure 'external rest endpoint enabled'` was for SQL Server 2025 only; it is
+  off by default on Azure SQL Managed Instance too.
+
+- **COLUMN CARDINALITY could run for many minutes before reading any statistics**
+  ([#39](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/39), issue #38). On a Managed
+  Instance, a whole-database run spent over 14 minutes on CPU in the one statement that picks the
+  statistics objects to read. It filtered `sys.stats` by two `IN (SELECT TOP (20) ...)` subqueries
+  joined by `OR`. The two candidate lists, the top 20 high-impact missing-index tables and the top
+  20 largest tables, are now built once into a temp table and joined, as INDEX PAGE DENSITY already
+  did. The tables chosen are the same.
+- **"A severe error occurred on the current command" on Managed Instance**
+  ([#39](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/39), issue #40). For a
+  sysadmin or securityadmin caller, the usage-period lookup read error logs 0 to 6 with
+  `sp_readerrorlog`. A Managed Instance kept logs 0 to 3, and reading 4 to 6 fails with error 22004
+  from `xp_readerrorlog`, which the lookup's `TRY...CATCH` did not catch. The lookup alone
+  reproduced the client error, so every call that collected ended with it, though the run itself
+  completed. The lookup now lists the logs that exist with `sp_enumerrorlogs` and reads only those;
+  if they cannot be listed, it reads only the current log.
+- **NON-SARGABLE PREDICATES could read every cached plan to keep 50**
+  ([#39](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/39), issue #38). The step log
+  of a Managed Instance run showed this section taking 229 of the 279 seconds of collection, while
+  PLAN CACHE QUERY STATISTICS, which picks the same statements, took 47 ms. The plan text was read
+  in the same statement that picked the top 50 by CPU. Now the 50 are picked first and only their
+  plans are read and searched. The statements and the output are the same.
+- **QUERY STORE WRITE WORKLOAD MIX parsed the same query text many times**
+  ([#39](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/39), issue #38). The section
+  cleaned and searched each query's text once per runtime-stats row, which is one row per plan per
+  interval over the last 7 days, before dropping the statements that are not writes. It now adds up
+  executions per query and hour first, classifies each query's text once, and then combines them.
+  The output is the same.
+- **COLUMN CARDINALITY skipped itself for long schema and table names**
+  ([#39](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/39)). The quoted
+  `[schema].[table]` name, up to 517 characters, was stored in `nvarchar(300)`; a longer one failed
+  the section with a truncation error. It is now `nvarchar(520)`.
+
 ## 2026-10-31
 
 ### Added

@@ -81,11 +81,14 @@ CREATE OR ALTER PROCEDURE AIIndexTuner.usp_InvokeModel
     @OutputTokens int OUTPUT,
     @Truncated    bit OUTPUT,
     @RawResponse  nvarchar(max) OUTPUT,
-    @PollCount    int = NULL OUTPUT
+    @PollCount    int = NULL OUTPUT,
+    @RunId        int = NULL,   -- for AIIndexTuner.RunLog
+    @Logging      bit = 0       -- 1 = log the request and the wait for the answer (issue #38)
 AS
 BEGIN
     SET NOCOUNT ON;
     SET @PollCount = 0;
+    DECLARE @LogId int, @LogChars int, @Zero int = 0, @LogLen int;
 
     DECLARE @Endpoint nvarchar(400), @Deployment nvarchar(128), @Credential sysname, @Effort varchar(10),
             @MaxOutputTokens int, @Timeout smallint, @Background bit, @MaxWaitSec int, @PollSec tinyint,
@@ -114,6 +117,9 @@ BEGIN
             @Delay char(8) = CONCAT('00:00:', RIGHT(CONCAT('0', @PollSec), 2)),
             @Error nvarchar(4000);
 
+    -- AI request: Chars is the length of the request body.
+    SET @LogLen = LEN(@Body);
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'AI request', @Chars = @Zero, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     EXEC @rc = sys.sp_invoke_external_rest_endpoint
         @url = @Url,
         @method = N'POST',
@@ -134,6 +140,11 @@ BEGIN
 
     SELECT @Status = JSON_VALUE(@Response, '$.result.status'),
            @ResponseId = JSON_VALUE(@Response, '$.result.id');
+
+    -- AI response: the wait for the answer (background mode polls); Chars is the length of the answer text.
+    -- Message shows the polls so far while it waits.
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'AI response', @Chars = @LogLen, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
+    SET @LogChars = 0;
 
     -- Background mode: poll until the response leaves queued / in_progress.
     WHILE @Status IN ('queued', 'in_progress')
@@ -167,6 +178,8 @@ BEGIN
         END;
 
         SET @Status = JSON_VALUE(@Response, '$.result.status');
+        IF @Logging = 1
+            UPDATE AIIndexTuner.RunLog SET Message = CONCAT(@PollCount, N' polls; status ', @Status) WHERE RunLogId = @LogId;
     END;
 
     SET @RawResponse = @Response;
@@ -184,6 +197,9 @@ BEGIN
                               AND JSON_VALUE(@Response, '$.result.incomplete_details.reason') = 'max_output_tokens' THEN 1 ELSE 0 END;
 
     SET @Text = AIIndexTuner.fn_ResponseText(@Response);
+
+    SET @LogLen = ISNULL(LEN(@Text), 0);
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, NULL, @Chars = @LogLen, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
 
     IF @Text IS NULL
     BEGIN
