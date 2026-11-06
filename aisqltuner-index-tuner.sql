@@ -1046,12 +1046,12 @@ BEGIN
        Density vectors for the tables behind the top 20 high-impact missing indexes and the 20 largest
        tables over 10,000 rows (plus the scoped table), via DBCC SHOW_STATISTICS ... WITH DENSITY_VECTOR. */
     -- The candidate statistics, kept for SKEWED LOW-CARDINALITY COLUMNS.
-    CREATE TABLE #CardStats (object_id int, stats_id int, StatsTable nvarchar(300), StatsName sysname);
+    CREATE TABLE #CardStats (object_id int, stats_id int, StatsTable nvarchar(520), StatsName sysname);   -- QUOTENAME(schema) + '.' + QUOTENAME(table): up to 517
     BEGIN TRY
         CREATE TABLE #RawDensity (AllDensity float, AvgLength float, Columns nvarchar(4000));
-        CREATE TABLE #Density (TableName nvarchar(300), AllDensity float, AvgLength float, Columns nvarchar(4000));
+        CREATE TABLE #Density (TableName nvarchar(520), AllDensity float, AvgLength float, Columns nvarchar(4000));
 
-        DECLARE @StatsTable nvarchar(300), @StatsName sysname, @sql nvarchar(max), @CardinalityErrors int = 0;
+        DECLARE @StatsTable nvarchar(520), @StatsName sysname, @sql nvarchar(max), @CardinalityErrors int = 0;
 
         /* The candidate tables, each list built once, then joined to sys.stats. The two lists used to be
            IN (SELECT TOP ...) subqueries joined by OR in the sys.stats query, and on a Managed Instance
