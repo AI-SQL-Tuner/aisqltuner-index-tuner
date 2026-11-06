@@ -18,6 +18,16 @@ recommendations are kept, and it replaces the procedures and functions.
   joined by `OR`. The two candidate lists, the top 20 high-impact missing-index tables and the top
   20 largest tables, are now built once into a temp table and joined, as INDEX PAGE DENSITY already
   did. The tables chosen are the same.
+- **QUERY STORE WRITE WORKLOAD MIX parsed the same query text many times**
+  ([#39](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/39), issue #38). The section
+  cleaned and searched each query's text once per runtime-stats row, which is one row per plan per
+  interval over the last 7 days, before dropping the statements that are not writes. It now adds up
+  executions per query and hour first, classifies each query's text once, and then combines them.
+  The output is the same.
+- **COLUMN CARDINALITY skipped itself for long schema and table names**
+  ([#39](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/39)). The quoted
+  `[schema].[table]` name, up to 517 characters, was stored in `nvarchar(300)`; a longer one failed
+  the section with a truncation error. It is now `nvarchar(520)`.
 
 ## 2026-10-31
 
