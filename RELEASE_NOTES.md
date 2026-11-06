@@ -7,6 +7,18 @@ To upgrade, run the new [aisqltuner-index-tuner.sql](aisqltuner-index-tuner.sql)
 where the tool is installed. It adds new columns with `ALTER TABLE`, so earlier runs and
 recommendations are kept, and it replaces the procedures and functions.
 
+## 2026-11-06
+
+### Fixed
+
+- **COLUMN CARDINALITY could run for many minutes before reading any statistics**
+  ([#39](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/39), issue #38). On a Managed
+  Instance, a whole-database run spent over 14 minutes on CPU in the one statement that picks the
+  statistics objects to read. It filtered `sys.stats` by two `IN (SELECT TOP (20) ...)` subqueries
+  joined by `OR`. The two candidate lists, the top 20 high-impact missing-index tables and the top
+  20 largest tables, are now built once into a temp table and joined, as INDEX PAGE DENSITY already
+  did. The tables chosen are the same.
+
 ## 2026-10-31
 
 ### Added
