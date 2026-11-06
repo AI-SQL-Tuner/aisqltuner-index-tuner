@@ -69,7 +69,7 @@ can apply what it finds.
    `dbo.sp_AIIndexTuner` and `dbo.sp_AIIndexTuner_Apply`. Install it in each database you tune,
    because the endpoint credential is a database scoped credential.
 2. Fill in and run [setup/Configure-Endpoint.sql](setup/Configure-Endpoint.sql). It enables the
-   REST endpoint feature (SQL Server 2025 only), creates the database master key and credential,
+   REST endpoint feature (SQL Server 2025 and Azure SQL Managed Instance), creates the database master key and credential,
    and writes the configuration row. To keep a filled-in copy with your key, save it as
    `setup/Configure-Endpoint-DEV.sql`, which `.gitignore` excludes.
 3. Smoke test: `EXEC dbo.sp_AIIndexTuner;`, then check that the latest `AIIndexTuner.Run` row has

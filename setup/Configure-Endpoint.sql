@@ -5,8 +5,10 @@
     <placeholders>. Run the steps in order.
 */
 
-/* 1. SQL Server 2025 only: allow sp_invoke_external_rest_endpoint (off by default).
-      Azure SQL Database has it on already. Needs ALTER SETTINGS (sysadmin or serveradmin).
+/* 1. SQL Server 2025 and Azure SQL Managed Instance: allow sp_invoke_external_rest_endpoint (off
+      by default on both). A Managed Instance needs the SQL Server 2025 or Always-up-to-date update
+      policy. Azure SQL Database and Fabric SQL Database have it on already. Needs ALTER SETTINGS
+      (sysadmin or serveradmin).
 
 EXEC sp_configure 'external rest endpoint enabled', 1;
 RECONFIGURE WITH OVERRIDE;
