@@ -50,6 +50,12 @@ recommendations are kept, and it replaces the procedures and functions.
   joined by `OR`. The two candidate lists, the top 20 high-impact missing-index tables and the top
   20 largest tables, are now built once into a temp table and joined, as INDEX PAGE DENSITY already
   did. The tables chosen are the same.
+- **NON-SARGABLE PREDICATES could read every cached plan to keep 50**
+  ([#39](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/39), issue #38). The step log
+  of a Managed Instance run showed this section taking 229 of the 279 seconds of collection, while
+  PLAN CACHE QUERY STATISTICS, which picks the same statements, took 47 ms. The plan text was read
+  in the same statement that picked the top 50 by CPU. Now the 50 are picked first and only their
+  plans are read and searched. The statements and the output are the same.
 - **QUERY STORE WRITE WORKLOAD MIX parsed the same query text many times**
   ([#39](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/pull/39), issue #38). The section
   cleaned and searched each query's text once per runtime-stats row, which is one row per plan per

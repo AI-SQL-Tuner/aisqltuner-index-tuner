@@ -300,7 +300,7 @@ BEGIN
             EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, NULL, @LogId = @ApplyLogId OUTPUT, @CharsAtStart = @ApplyLogChars OUTPUT;
             IF @Logging = 1
                 UPDATE AIIndexTuner.RunLog
-                SET Message = (SELECT LEFT(CONCAT(Status, N': ', StatusReason), 4000) FROM AIIndexTuner.Recommendation WHERE RecommendationId = @RecId)
+                SET Message = (SELECT LEFT(CONCAT(Status, N': ' + StatusReason), 4000) FROM AIIndexTuner.Recommendation WHERE RecommendationId = @RecId)
                 WHERE RunLogId = @ApplyLogRow;
             FETCH NEXT FROM apply_cur INTO @RecId;
         END;

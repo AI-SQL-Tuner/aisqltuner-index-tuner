@@ -600,21 +600,35 @@ BEGIN
        A live run missed YEAR() and DATEDIFF() around Invoices columns, seen only in query text. */
     BEGIN TRY
         DROP TABLE IF EXISTS #NonSargable;
+        /* The top 50 statements first, then the plans of those 50 only. As one statement, with
+           sys.dm_exec_text_query_plan applied before TOP (50), the plan text could be read for
+           every cached statement of this database before 50 were kept: on a Managed Instance this
+           section took 229 seconds, while PLAN CACHE QUERY STATISTICS, which picks the same
+           statements without reading plans, took 47 ms. */
+        DROP TABLE IF EXISTS #NsStmts;
+        SELECT TOP (50) ROW_NUMBER() OVER (ORDER BY qs.total_worker_time DESC) AS stmt_id,
+               qs.query_hash, qs.execution_count, qs.total_worker_time, qs.total_logical_reads,
+               qs.plan_handle, qs.statement_start_offset, qs.statement_end_offset
+        INTO #NsStmts
+        FROM sys.dm_exec_query_stats AS qs
+        CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
+        CROSS APPLY (SELECT CAST(pa.value AS int) AS dbid FROM sys.dm_exec_plan_attributes(qs.plan_handle) AS pa WHERE pa.attribute = N'dbid') AS pdb
+        -- The same statements as the plan cache section, without this tool's own.
+        WHERE pdb.dbid = DB_ID()
+          AND (st.objectid IS NULL OR OBJECT_SCHEMA_NAME(st.objectid, st.dbid) IS NULL OR OBJECT_SCHEMA_NAME(st.objectid, st.dbid) NOT LIKE N'AIIndexTuner%')
+          AND st.text NOT LIKE N'%AIIndexTuner%'
+        ORDER BY qs.total_worker_time DESC;
+
+        DROP TABLE IF EXISTS #NsPlans;
+        SELECT n.stmt_id, n.query_hash, n.execution_count, n.total_worker_time, n.total_logical_reads,
+               -- NULL for a plan nested deeper than the xml type allows.
+               TRY_CONVERT(xml, tqp.query_plan) AS plan_xml
+        INTO #NsPlans
+        FROM #NsStmts AS n
+        CROSS APPLY sys.dm_exec_text_query_plan(n.plan_handle, n.statement_start_offset, n.statement_end_offset) AS tqp;
+
         WITH XMLNAMESPACES (DEFAULT 'http://schemas.microsoft.com/sqlserver/2004/07/showplan'),
-        stmts AS (
-            SELECT TOP (50) ROW_NUMBER() OVER (ORDER BY qs.total_worker_time DESC) AS stmt_id,
-                   qs.query_hash, qs.execution_count, qs.total_worker_time, qs.total_logical_reads,
-                   -- NULL for a plan nested deeper than the xml type allows.
-                   TRY_CONVERT(xml, tqp.query_plan) AS plan_xml
-            FROM sys.dm_exec_query_stats AS qs
-            CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
-            CROSS APPLY (SELECT CAST(pa.value AS int) AS dbid FROM sys.dm_exec_plan_attributes(qs.plan_handle) AS pa WHERE pa.attribute = N'dbid') AS pdb
-            CROSS APPLY sys.dm_exec_text_query_plan(qs.plan_handle, qs.statement_start_offset, qs.statement_end_offset) AS tqp
-            -- The same statements as the plan cache section, without this tool's own.
-            WHERE pdb.dbid = DB_ID()
-              AND (st.objectid IS NULL OR OBJECT_SCHEMA_NAME(st.objectid, st.dbid) IS NULL OR OBJECT_SCHEMA_NAME(st.objectid, st.dbid) NOT LIKE N'AIIndexTuner%')
-              AND st.text NOT LIKE N'%AIIndexTuner%'
-            ORDER BY qs.total_worker_time DESC)
+        stmts AS (SELECT stmt_id, query_hash, execution_count, total_worker_time, total_logical_reads, plan_xml FROM #NsPlans)
         -- A column of a table in this database (parameters and variables have no Table) under an
         -- Intrinsic (YEAR shows as datepart), Convert, Arithmetic or user-defined function. LIKE is an
         -- Intrinsic too, but it compares the column rather than wrapping it, and PROBE is a bitmap
