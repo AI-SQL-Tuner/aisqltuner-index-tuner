@@ -253,6 +253,12 @@ BEGIN
                    estimated_size_mb float, confidence varchar(20), rationale nvarchar(max),
                    benefiting_queries nvarchar(max) AS JSON, script nvarchar(max), replaces_index nvarchar(4000)) AS r;
 
+        -- A script that targets another table than the recommendation names (issue #41). The apply
+        -- step builds its own DDL and never runs Script, but a person may copy it.
+        UPDATE AIIndexTuner.Recommendation
+        SET ScriptWarning = AIIndexTuner.fn_ScriptTargetWarning(Script, SchemaName, TableName)
+        WHERE RunId = @RunId AND NULLIF(LTRIM(Script), N'') IS NOT NULL AND TableName IS NOT NULL;
+
         UPDATE AIIndexTuner.Run
         SET Summary = JSON_VALUE(@Text, '$.summary'), Status = 'Succeeded', CompletedAt = SYSDATETIME()
         WHERE RunId = @RunId;
@@ -325,7 +331,7 @@ BEGIN
         UPDATE AIIndexTuner.RunLog SET Message = N'1 of 2 result sets done' WHERE RunLogId = @ResultsLogRow;
 
     SELECT RecommendationId, Priority, PriorityLevel, Category, Title, SchemaName, TableName, IndexName, IndexType, ReplacesIndex, Confidence, EstimatedSizeMB,
-           Status, StatusReason, Rationale, Script, AppliedDDL, UndoDDL
+           Status, StatusReason, Rationale, Script, ScriptWarning, AppliedDDL, UndoDDL
     FROM AIIndexTuner.Recommendation
     WHERE RunId = @RunId
     ORDER BY Priority, RecommendationId;

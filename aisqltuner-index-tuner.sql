@@ -217,6 +217,11 @@ IF COL_LENGTH(N'AIIndexTuner.Recommendation', N'ReplacesIndex') IS NULL
         ReplacesIndex sysname NULL;   -- ConsolidateIndex: the existing nonclustered index a widening rebuilds, under its own name
 GO
 
+IF COL_LENGTH(N'AIIndexTuner.Recommendation', N'ScriptWarning') IS NULL
+    ALTER TABLE AIIndexTuner.Recommendation ADD
+        ScriptWarning nvarchar(4000) NULL;   -- set when Script targets another table than SchemaName.TableName (issue #41)
+GO
+
 /* ===== Helpers ===== */
 
 /* Ends the open step, if any, and starts @Step, if given; @Step NULL only ends. Chars is the growth
@@ -259,6 +264,129 @@ RETURNS tinyint
 AS
 BEGIN
     RETURN CASE UPPER(LTRIM(RTRIM(@Level)) COLLATE Latin1_General_100_BIN2) WHEN 'HIGH' THEN 3 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 1 END;
+END;
+GO
+
+/* Issue #41: a warning when the model's Script targets a different table than the recommendation's
+   SchemaName and TableName, NULL otherwise. Script is never run by this tool, but a person may copy
+   it, and a script that names another table either fails or changes the wrong table.
+   The targets are the objects after ALTER TABLE, UPDATE STATISTICS, and INDEX or STATISTICS
+   <name> ON (CREATE / DROP [IF EXISTS] / ALTER INDEX, CREATE STATISTICS), read from a token scan
+   that skips comments and string literals. A script with no target (sp_query_store_unforce_plan,
+   ALTER DATABASE) or with more than one distinct target table is left unchecked. A one-part name
+   is compared by table only. Keywords are upper-cased under a fixed collation (see fn_LevelRank);
+   names are compared under the database's collation, as SQL Server resolves them. */
+CREATE OR ALTER FUNCTION AIIndexTuner.fn_ScriptTargetWarning(@Script nvarchar(max), @SchemaName sysname, @TableName sysname)
+RETURNS nvarchar(4000)
+AS
+BEGIN
+    IF @Script IS NULL OR NULLIF(@TableName, N'') IS NULL RETURN NULL;
+
+    DECLARE @Tokens TABLE (Pos int IDENTITY(1, 1) PRIMARY KEY, Raw nvarchar(4000) NOT NULL, Up nvarchar(4000) NOT NULL);
+    DECLARE @n bigint = DATALENGTH(@Script) / 2, @i bigint = 1, @j bigint, @c nchar(1), @Close nchar(1),
+            @Delims nvarchar(40) = N' .,;()[]"''=+-*/<>!%&|^~' + NCHAR(9) + NCHAR(10) + NCHAR(13);
+
+    -- 1. Tokens: words, delimited identifiers ([x], "x") and single punctuation characters.
+    WHILE @i <= @n
+    BEGIN
+        SET @c = SUBSTRING(@Script, @i, 1);
+        IF CHARINDEX(@c COLLATE Latin1_General_100_BIN2, N' ' + NCHAR(9) + NCHAR(10) + NCHAR(13)) > 0
+            SET @i += 1;
+        ELSE IF @c = N'-' COLLATE Latin1_General_100_BIN2 AND SUBSTRING(@Script, @i + 1, 1) = N'-' COLLATE Latin1_General_100_BIN2
+        BEGIN
+            SET @j = CHARINDEX(NCHAR(10) COLLATE Latin1_General_100_BIN2, @Script, @i);
+            SET @i = CASE WHEN @j = 0 THEN @n + 1 ELSE @j + 1 END;
+        END
+        ELSE IF @c = N'/' COLLATE Latin1_General_100_BIN2 AND SUBSTRING(@Script, @i + 1, 1) = N'*' COLLATE Latin1_General_100_BIN2
+        BEGIN
+            SET @j = CHARINDEX(N'*/' COLLATE Latin1_General_100_BIN2, @Script, @i + 2);
+            SET @i = CASE WHEN @j = 0 THEN @n + 1 ELSE @j + 2 END;
+        END
+        ELSE IF CHARINDEX(@c COLLATE Latin1_General_100_BIN2, N'''["') > 0
+        BEGIN
+            -- A string literal (skipped) or a delimited identifier (kept). A doubled closing character
+            -- is part of it. An unterminated one runs to the end of the script.
+            SET @Close = CASE WHEN @c = N'[' COLLATE Latin1_General_100_BIN2 THEN N']' ELSE @c END;
+            SET @j = @i + 1;
+            WHILE 1 = 1
+            BEGIN
+                SET @j = CHARINDEX(@Close COLLATE Latin1_General_100_BIN2, @Script, @j);
+                IF @j = 0 OR SUBSTRING(@Script, @j + 1, 1) <> @Close COLLATE Latin1_General_100_BIN2 BREAK;
+                SET @j += 2;
+            END;
+            IF @j = 0 SET @j = @n;
+            IF @c <> N'''' COLLATE Latin1_General_100_BIN2
+                INSERT @Tokens (Raw, Up) VALUES (LEFT(SUBSTRING(@Script, @i, @j - @i + 1), 4000), N'');
+            SET @i = @j + 1;
+        END
+        ELSE IF CHARINDEX(@c COLLATE Latin1_General_100_BIN2, @Delims) > 0
+        BEGIN
+            INSERT @Tokens (Raw, Up) VALUES (@c, @c);
+            SET @i += 1;
+        END
+        ELSE
+        BEGIN
+            SET @j = @i;
+            WHILE @j < @n AND CHARINDEX(SUBSTRING(@Script, @j + 1, 1) COLLATE Latin1_General_100_BIN2, @Delims) = 0
+                SET @j += 1;
+            INSERT @Tokens (Raw, Up)
+            SELECT w, UPPER(w COLLATE Latin1_General_100_BIN2) FROM (SELECT LEFT(SUBSTRING(@Script, @i, @j - @i + 1), 4000) AS w) AS x;
+            SET @i = @j + 1;
+        END;
+    END;
+
+    -- 2. Where each target name starts.
+    DECLARE @Starts TABLE (Pos int PRIMARY KEY);
+    INSERT @Starts (Pos)
+    SELECT b.Pos + 1
+    FROM @Tokens AS a INNER JOIN @Tokens AS b ON b.Pos = a.Pos + 1
+    WHERE (a.Up = N'ALTER' AND b.Up = N'TABLE') OR (a.Up = N'UPDATE' AND b.Up = N'STATISTICS')
+    UNION
+    SELECT nm.Pos + 2
+    FROM @Tokens AS k
+    CROSS APPLY (SELECT CASE WHEN EXISTS (SELECT 1 FROM @Tokens AS f INNER JOIN @Tokens AS e ON e.Pos = f.Pos + 1
+                                          WHERE f.Pos = k.Pos + 1 AND f.Up = N'IF' AND e.Up = N'EXISTS')
+                             THEN k.Pos + 3 ELSE k.Pos + 1 END AS Pos) AS nm
+    INNER JOIN @Tokens AS o ON o.Pos = nm.Pos + 1 AND o.Up = N'ON'
+    WHERE k.Up IN (N'INDEX', N'STATISTICS');
+
+    -- 3. The names, joined across '.' and parsed with PARSENAME (up to four parts; "db..t" has no schema).
+    DECLARE @Targets TABLE (SchemaName sysname NULL, TableName sysname NOT NULL);
+    DECLARE @p int = (SELECT MIN(Pos) FROM @Starts), @q int, @Name nvarchar(4000), @Next nvarchar(4000);
+    WHILE @p IS NOT NULL
+    BEGIN
+        SELECT @Name = Raw, @q = @p FROM @Tokens WHERE Pos = @p;
+        IF @@ROWCOUNT = 0 SET @Name = NULL;
+        WHILE @Name IS NOT NULL AND EXISTS (SELECT 1 FROM @Tokens WHERE Pos = @q + 1 AND Raw = N'.' COLLATE Latin1_General_100_BIN2)
+        BEGIN
+            SET @Next = (SELECT Raw FROM @Tokens WHERE Pos = @q + 2);
+            IF @Next IS NULL BREAK;
+            IF @Next = N'.' COLLATE Latin1_General_100_BIN2
+                SELECT @Name += N'.', @q += 1;
+            ELSE
+                SELECT @Name += N'.' + @Next, @q += 2;
+        END;
+        -- A name, not punctuation, a temporary table or a table variable; PARSENAME takes at most 128 characters.
+        IF @Name IS NOT NULL AND LEN(@Name) <= 128
+           AND (CHARINDEX(LEFT(@Name, 1) COLLATE Latin1_General_100_BIN2, N'["') > 0
+                OR CHARINDEX(LEFT(@Name, 1) COLLATE Latin1_General_100_BIN2, @Delims + N'#@') = 0)
+           AND PARSENAME(@Name, 1) IS NOT NULL
+           AND LEFT(PARSENAME(@Name, 1), 1) NOT IN (N'#', N'@')
+            INSERT @Targets (SchemaName, TableName) VALUES (PARSENAME(@Name, 2), PARSENAME(@Name, 1));
+        SET @p = (SELECT MIN(Pos) FROM @Starts WHERE Pos > @p);
+    END;
+
+    -- 4. One target table, compared with the recommendation's.
+    IF NOT EXISTS (SELECT 1 FROM @Targets)
+       OR (SELECT COUNT(DISTINCT TableName) FROM @Targets) > 1
+       OR (SELECT COUNT(DISTINCT SchemaName) FROM @Targets) > 1
+        RETURN NULL;
+    DECLARE @TargetSchema sysname = (SELECT MAX(SchemaName) FROM @Targets), @TargetTable sysname = (SELECT MAX(TableName) FROM @Targets);
+    IF @TargetTable = @TableName AND (@TargetSchema IS NULL OR NULLIF(@SchemaName, N'') IS NULL OR @TargetSchema = @SchemaName)
+        RETURN NULL;
+    RETURN LEFT(CONCAT(N'The script targets ', QUOTENAME(@TargetSchema) + N'.', QUOTENAME(@TargetTable),
+                       N', not ', QUOTENAME(NULLIF(@SchemaName, N'')) + N'.', QUOTENAME(@TableName),
+                       N', the table this recommendation names. Correct it before running it by hand. CREATE mode and sp_AIIndexTuner_Apply build their own DDL from the recommendation''s fields and never run the script.'), 4000);
 END;
 GO
 
@@ -3207,6 +3335,12 @@ BEGIN
                    estimated_size_mb float, confidence varchar(20), rationale nvarchar(max),
                    benefiting_queries nvarchar(max) AS JSON, script nvarchar(max), replaces_index nvarchar(4000)) AS r;
 
+        -- A script that targets another table than the recommendation names (issue #41). The apply
+        -- step builds its own DDL and never runs Script, but a person may copy it.
+        UPDATE AIIndexTuner.Recommendation
+        SET ScriptWarning = AIIndexTuner.fn_ScriptTargetWarning(Script, SchemaName, TableName)
+        WHERE RunId = @RunId AND NULLIF(LTRIM(Script), N'') IS NOT NULL AND TableName IS NOT NULL;
+
         UPDATE AIIndexTuner.Run
         SET Summary = JSON_VALUE(@Text, '$.summary'), Status = 'Succeeded', CompletedAt = SYSDATETIME()
         WHERE RunId = @RunId;
@@ -3279,7 +3413,7 @@ BEGIN
         UPDATE AIIndexTuner.RunLog SET Message = N'1 of 2 result sets done' WHERE RunLogId = @ResultsLogRow;
 
     SELECT RecommendationId, Priority, PriorityLevel, Category, Title, SchemaName, TableName, IndexName, IndexType, ReplacesIndex, Confidence, EstimatedSizeMB,
-           Status, StatusReason, Rationale, Script, AppliedDDL, UndoDDL
+           Status, StatusReason, Rationale, Script, ScriptWarning, AppliedDDL, UndoDDL
     FROM AIIndexTuner.Recommendation
     WHERE RunId = @RunId
     ORDER BY Priority, RecommendationId;

@@ -1305,5 +1305,63 @@ IF (SELECT dc.definition FROM sys.default_constraints AS dc WHERE dc.name = N'DF
 PRINT 'PASS T28: each step is logged with its time and characters, and @Logging = 0 logs nothing';
 GO
 
+/* ===== T29: a Script that targets another table than the recommendation names is flagged (issue #41) =====
+   fn_ScriptTargetWarning reads the targets after ALTER TABLE, UPDATE STATISTICS and INDEX/STATISTICS
+   <name> ON, skipping comments and string literals, and flags a single target that differs from
+   SchemaName.TableName. A script with no target, or with more than one target table, is left unchecked. */
+DECLARE @Cases TABLE (Id int, Script nvarchar(max), SchemaName sysname NULL, TableName sysname NULL, Flagged bit);
+INSERT @Cases VALUES
+    (1,  N'CREATE NONCLUSTERED INDEX [IX_WorkOrderStatusEvent_EventTypeID_Cover] ON [WO].[WorkOrder] ([EventTypeID]) INCLUDE ([StatusID]);', N'WO', N'WorkOrderStatusEvent', 1),
+    (2,  N'CREATE INDEX [IX_Orders_CustomerId] ON [dbo].[Orders] ([CustomerId]) INCLUDE ([TotalDue]);', N'dbo', N'Orders', 0),
+    (3,  N'CREATE INDEX IX_Orders_CustomerId ON Orders (CustomerId);', N'dbo', N'Orders', 0),
+    (4,  N'ALTER INDEX ALL ON Customers REBUILD;', N'dbo', N'Orders', 1),
+    (5,  N'UPDATE STATISTICS SomeDb.dbo.Customers WITH FULLSCAN;', N'dbo', N'Orders', 1),
+    (6,  N'UPDATE STATISTICS SomeDb..Orders;', N'dbo', N'Orders', 0),
+    (7,  N'-- ALTER TABLE dbo.Customers first' + NCHAR(13) + NCHAR(10)
+         + N'/* or ALTER TABLE dbo.Customers */ IF NOT EXISTS (SELECT 1 FROM dbo.Orders AS o LEFT JOIN dbo.Customers AS c ON c.CustomerId = o.CustomerId WHERE c.CustomerId IS NULL)' + NCHAR(10)
+         + N'    ALTER TABLE dbo.Orders WITH CHECK CHECK CONSTRAINT FK_Orders_Customers;' + NCHAR(10)
+         + N'ELSE PRINT N''Skipped: ALTER TABLE dbo.Customers has violating rows'';', N'dbo', N'Orders', 0),
+    (8,  N'ALTER TABLE dbo.Orders WITH CHECK CHECK CONSTRAINT FK_A; ALTER TABLE dbo.Customers WITH CHECK CHECK CONSTRAINT FK_B;', N'dbo', N'AuditLog', 0),
+    (9,  N'EXEC sys.sp_query_store_unforce_plan @query_id = 1, @plan_id = 2;', N'dbo', N'Orders', 0),
+    (10, N'DROP INDEX IF EXISTS IX_Customers_Region_Dup ON dbo.Customers;', N'dbo', N'Orders', 1),
+    (11, N'CREATE STATISTICS ST_Region ON dbo.Customers (Region);', N'dbo', N'Orders', 1),
+    (12, N'CREATE INDEX IX ON dbo.Orders (CustomerId) WITH (ONLINE = ON, DROP_EXISTING = ON) ON [PRIMARY];', N'dbo', N'Orders', 0),
+    (13, N'CREATE INDEX IX ON [dbo].[Odd ]]Name] (c);', N'dbo', N'Odd ]Name', 0),
+    (14, N'CREATE INDEX IX ON sales.Orders (CustomerId);', N'dbo', N'Orders', 1),
+    (15, N'CREATE INDEX IX ON dbo.Customers (Region);', N'dbo', NULL, 0),
+    (16, N'PRINT ''unterminated ALTER TABLE dbo.Customers', N'dbo', N'Orders', 0),
+    (17, N'DROP INDEX IX_Orders_CustomerId ON dbo.Orders;' + NCHAR(10) + N'CREATE INDEX IX_Orders_CustomerId ON dbo.Orders (CustomerId) INCLUDE (TotalDue, Status);', N'dbo', N'Orders', 0),
+    (18, N'create clustered columnstore index cci on dbo.Customers;', N'dbo', N'Orders', 1),
+    (19, N'CREATE INDEX IX ON #Work (c); ALTER TABLE @t ADD x int;', N'dbo', N'Orders', 0),
+    (20, N'SELECT o.OrderId FROM dbo.Customers AS c WITH (INDEX(IX_Customers_Region)) INNER JOIN dbo.Orders AS o ON o.CustomerId = c.CustomerId;', N'dbo', N'Orders', 0),
+    (21, N'CREATE INDEX IX ON "dbo"."Customers" (Region);', N'dbo', N'Orders', 1);
+DECLARE @Wrong nvarchar(max) = (
+    SELECT STRING_AGG(CONCAT(Id, CASE WHEN Flagged = 1 THEN N' (not flagged)' ELSE N' (flagged)' END), N', ')
+    FROM @Cases
+    WHERE CASE WHEN AIIndexTuner.fn_ScriptTargetWarning(Script, SchemaName, TableName) IS NULL THEN 0 ELSE 1 END <> Flagged);
+IF @Wrong IS NOT NULL
+BEGIN
+    SET @Wrong = N'FAIL T29: fn_ScriptTargetWarning got these cases wrong: ' + @Wrong;
+    THROW 50999, @Wrong, 1;
+END;
+IF AIIndexTuner.fn_ScriptTargetWarning((SELECT Script FROM @Cases WHERE Id = 1), N'WO', N'WorkOrderStatusEvent')
+   NOT LIKE N'The script targets \[WO\].\[WorkOrder\], not \[WO\].\[WorkOrderStatusEvent\],%' ESCAPE N'\'
+    THROW 50999, N'FAIL T29: the warning does not name the script''s table and the recommendation''s.', 1;
+
+-- End to end: stored with the run, for a script on the wrong table only.
+EXEC dbo.sp_AIIndexTuner @TestResponse = N'{"summary": "s", "recommendations": [
+  {"priority": 1, "category": "CreateIndex", "title": "Wrong table", "schema_name": "dbo", "table_name": "Customers", "index_name": "IX_Customers_Email_T29",
+   "key_columns": [{"column": "Email", "descending": false}], "include_columns": [], "confidence": "High",
+   "script": "CREATE INDEX IX_Customers_Email_T29 ON dbo.Orders (Email);"},
+  {"priority": 2, "category": "Statistics", "title": "Right table", "schema_name": "dbo", "table_name": "Orders", "index_name": null,
+   "key_columns": [], "include_columns": [], "confidence": "High", "script": "UPDATE STATISTICS dbo.Orders WITH FULLSCAN;"}
+]}';
+DECLARE @RunId int = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 1 AND ScriptWarning LIKE N'The script targets \[dbo\].\[Orders\], not \[dbo\].\[Customers\],%' ESCAPE N'\')
+   OR EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 2 AND ScriptWarning IS NOT NULL)
+    THROW 50999, N'FAIL T29: ScriptWarning was not stored for the wrong-table script only.', 1;
+PRINT 'PASS T29: a Script that targets another table than SchemaName.TableName is flagged in ScriptWarning; comments, strings, scripts with no target or several targets are not';
+GO
+
 PRINT 'ALL TESTS PASSED';
 GO
