@@ -19,9 +19,6 @@ recommendations are kept, and it replaces the procedures and functions.
 - **`@MinPriority` and `@MinConfidence` rejected `High` and `Medium` under a Turkish collation**
   (issue #42). `fn_LevelRank` upper-cased under the database's collation, where the capital of `i`
   is `İ`. It now upper-cases under `Latin1_General_100_BIN2`.
-- **The Query Store write mix left out lowercase INSERT statements under a Turkish collation.** The
-  statement type is read from the upper-cased start of the query text, and under the database's
-  collation `insert` became `İNSERT`. The text is now upper-cased under `Latin1_General_100_BIN2`.
 
 ### Tests
 
@@ -29,8 +26,9 @@ recommendations are kept, and it replaces the procedures and functions.
   (`Run-All.ps1 -Collation`; `Instance` keeps the instance's). New test T1d runs collection there,
   database-wide and scoped to a table. T1, T1b and T11 now fail when collection returns NULL;
   before, every `NOT LIKE` check was unknown and T1 passed in the failing run.
-- The setup insert into `dbo.AuditLog` is written in lowercase, and new test T11b checks that the
-  write mix, scoped to that table, counts it as an INSERT.
+- T20 compared section names with `LOWER()` under the database's collation, so on a Turkish
+  database it reported every section with an `I` in its name as missing from the prompt (`INDEX`
+  became `ındex`, with a dotless ı). It now compares under `Latin1_General_100_CI_AS`.
 
 ## 2026-11-06
 

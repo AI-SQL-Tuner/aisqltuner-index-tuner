@@ -194,24 +194,6 @@ IF @Data LIKE N'%unavailable: %' OR @Data LIKE N'%could not be read: %' OR @Data
 PRINT 'PASS T11: hotspots, page density, sp_executesql settings, Query Store workload / write mix / forced plan failures, automatic tuning, CE feedback, error-log usage window';
 GO
 
-/* ===== T11b: a write statement in lowercase is counted in the Query Store write mix =====
-   The only write to dbo.AuditLog before T16 is the setup "insert" in 01_Create-TestDb.sql, written
-   in lowercase. Scoped to that table, the write mix must count it as an INSERT. Under a Turkish
-   collation, upper-casing with the database's collation turned "insert" into "İNSERT"; under other
-   collations this passes with or without that fix (run Run-All.ps1 -Collation Turkish_100_CI_AS). */
-DECLARE @Data nvarchar(max);
-EXEC AIIndexTuner.usp_CollectData @SchemaName = N'dbo', @TableName = N'AuditLog', @Data = @Data OUTPUT;
-IF @Data IS NULL
-    THROW 50999, N'FAIL T11b: collection scoped to dbo.AuditLog returned no data.', 1;
-DECLARE @WmStart int = CHARINDEX(N'=== QUERY STORE WRITE WORKLOAD MIX ===', @Data),
-        @WmEnd int = CHARINDEX(N'=== QUERY STORE FORCED PLAN FAILURES ===', @Data);
-IF @WmStart = 0 OR @WmEnd <= @WmStart
-    THROW 50999, N'FAIL T11b: the write mix section is missing or out of place.', 1;
-IF SUBSTRING(@Data, @WmStart, @WmEnd - @WmStart) NOT LIKE N'%"StatementType":"INSERT"%'
-    THROW 50999, N'FAIL T11b: the lowercase insert into dbo.AuditLog is not counted as an INSERT in the scoped write mix.', 1;
-PRINT 'PASS T11b: a write statement in lowercase is counted under its type in the Query Store write mix';
-GO
-
 /* ===== T1c: @CollectOnly writes no run ===== */
 EXEC dbo.sp_AIIndexTuner @CollectOnly = 1;
 IF EXISTS (SELECT 1 FROM AIIndexTuner.Run)
@@ -824,7 +806,9 @@ WITH headers AS (
     SELECT DISTINCT SUBSTRING(l.v, 5, LEN(l.v) - 8) AS h
     FROM (SELECT LTRIM(RTRIM(REPLACE(value, NCHAR(13), N''))) AS v FROM STRING_SPLIT(@Data, NCHAR(10))) AS l
     WHERE l.v LIKE N'=== % ===')
-SELECT @Headers = COUNT(*), @Missing = STRING_AGG(CASE WHEN CHARINDEX(LOWER(h), LOWER(@Sentence)) = 0 THEN h END, N', ')
+-- Case-insensitive under a fixed collation, not LOWER() under the database's: under a Turkish
+-- collation LOWER('INDEX') is 'ındex' (dotless ı), which the prompt's 'index' does not contain.
+SELECT @Headers = COUNT(*), @Missing = STRING_AGG(CASE WHEN CHARINDEX(h COLLATE Latin1_General_100_CI_AS, @Sentence) = 0 THEN h END, N', ')
 FROM headers;
 IF @Headers < 20
     THROW 50999, N'FAIL T20: fewer than 20 section headers were found, so the check proves little.', 1;

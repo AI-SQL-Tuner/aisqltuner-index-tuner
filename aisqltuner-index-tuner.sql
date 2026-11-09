@@ -1743,11 +1743,8 @@ BEGIN
         LEFT JOIN sys.query_store_query_variant AS qv ON qv.query_variant_query_id = q.query_id
         LEFT JOIN sys.query_store_query AS pq ON pq.query_id = qv.parent_query_id
         CROSS APPLY (SELECT COALESCE(pq.object_id, q.object_id) AS object_id) AS m
-        -- Upper-cased head of the text, with line breaks and tabs as spaces. Upper-cased under a
-        -- fixed collation: under a Turkish database collation the capital of i is İ, so a statement
-        -- written "insert ..." would become "İNSERT ..." and not be counted. The comparisons on
-        -- head.t and stmt.s below inherit this binary collation; the text is upper-cased first.
-        CROSS APPLY (SELECT UPPER(LTRIM(REPLACE(REPLACE(REPLACE(LEFT(qt.query_sql_text, 4000), NCHAR(13), N' '), NCHAR(10), N' '), NCHAR(9), N' ')) COLLATE Latin1_General_100_BIN2) AS t) AS head
+        -- Upper-cased head of the text, with line breaks and tabs as spaces.
+        CROSS APPLY (SELECT UPPER(LTRIM(REPLACE(REPLACE(REPLACE(LEFT(qt.query_sql_text, 4000), NCHAR(13), N' '), NCHAR(10), N' '), NCHAR(9), N' '))) AS t) AS head
         -- Where the statement starts after a "(@...)" parameter-declaration prefix: the first ')'
         -- followed by a write keyword. Searching for the keyword, not the first ')', copes with
         -- types such as decimal(18,2) inside the declarations.
