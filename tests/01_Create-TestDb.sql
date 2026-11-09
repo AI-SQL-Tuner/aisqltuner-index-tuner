@@ -82,7 +82,9 @@ SELECT TOP (300000) 1 + n % 20000, DATEADD(DAY, -(n % 1500), '2026-10-01'), n % 
        CASE WHEN n % 10 = 0 THEN N'Gift wrap' END
 FROM (SELECT ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n FROM sys.all_columns AS a CROSS JOIN sys.all_columns AS b) AS x;
 
-INSERT dbo.AuditLog (LoggedAt, EventType, Detail)
+-- Lowercase on purpose: T11b checks that the Query Store write mix counts it as an INSERT. Under
+-- a Turkish collation, upper-casing "insert" with the database's collation gives "İNSERT".
+insert dbo.AuditLog (LoggedAt, EventType, Detail)
 SELECT TOP (20000) DATEADD(MINUTE, -n, '2026-10-01'), CASE n % 3 WHEN 0 THEN 'LOGIN' WHEN 1 THEN 'ORDER' ELSE 'EXPORT' END, CONCAT(N'Event ', n)
 FROM (SELECT ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n FROM sys.all_columns AS a CROSS JOIN sys.all_columns AS b) AS x;
 GO
