@@ -7,6 +7,26 @@ To upgrade, run the new [aisqltuner-index-tuner.sql](aisqltuner-index-tuner.sql)
 where the tool is installed. It adds new columns with `ALTER TABLE`, so earlier runs and
 recommendations are kept, and it replaces the procedures and functions.
 
+## Unreleased
+
+### Fixed
+
+- **Collection failed with error 468 on a database whose collation differs from the instance's**
+  (issue #42). MISSING INDEX OVERLAP SIGNALS compared the missing-index DMV columns, in the
+  instance's collation, with `sys.columns.name`, in the database's. The error is not caught by the
+  section's `BEGIN TRY`, so `usp_CollectData` stopped and no recommendation could be made. The DMV
+  columns are now read as `COLLATE DATABASE_DEFAULT`.
+- **`@MinPriority` and `@MinConfidence` rejected `High` and `Medium` under a Turkish collation**
+  (issue #42). `fn_LevelRank` upper-cased under the database's collation, where the capital of `i`
+  is `İ`. It now upper-cases under `Latin1_General_100_BIN2`.
+
+### Tests
+
+- The test database is created in a collation other than the instance's by default
+  (`Run-All.ps1 -Collation`; `Instance` keeps the instance's). New test T1d runs collection there,
+  database-wide and scoped to a table. T1, T1b and T11 now fail when collection returns NULL;
+  before, every `NOT LIKE` check was unknown and T1 passed in the failing run.
+
 ## 2026-11-06
 
 ### Added

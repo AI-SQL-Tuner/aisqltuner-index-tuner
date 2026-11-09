@@ -7,7 +7,14 @@
         - an untrusted foreign key
         - a 20,000-row heap
 
-    sqlcmd -S localhost -E -C -f 65001 -v TestDb=AIIndexTunerTest -i tests\01_Create-TestDb.sql
+    TestCollation sets the database's collation:
+        Different  a collation other than the instance's (the default in Run-All.ps1), so the tests
+                   catch comparisons between instance-collated DMV columns and database-collated
+                   catalog columns, which fail with error 468 (issue #42)
+        Instance   the instance's collation
+        any other  that collation, for example Turkish_100_CI_AS
+
+    sqlcmd -S localhost -E -C -f 65001 -v TestDb=AIIndexTunerTest TestCollation=Different -i tests\01_Create-TestDb.sql
 */
 SET NOCOUNT ON;
 USE master;
@@ -18,7 +25,20 @@ BEGIN
     DROP DATABASE $(TestDb);
 END;
 GO
-CREATE DATABASE $(TestDb);
+DECLARE @Collation sysname = N'$(TestCollation)',
+        @Instance sysname = CAST(SERVERPROPERTY('Collation') AS sysname);
+IF @Collation = N'Different'
+    SET @Collation = CASE WHEN @Instance = N'Latin1_General_100_CI_AI' THEN N'SQL_Latin1_General_CP1_CI_AS' ELSE N'Latin1_General_100_CI_AI' END;
+ELSE IF @Collation = N'Instance'
+    SET @Collation = @Instance;
+IF NOT EXISTS (SELECT 1 FROM sys.fn_helpcollations() WHERE name = @Collation)
+BEGIN
+    DECLARE @Msg nvarchar(400) = N'Unknown collation: ' + @Collation;
+    THROW 50999, @Msg, 1;
+END;
+DECLARE @Create nvarchar(max) = N'CREATE DATABASE $(TestDb) COLLATE ' + @Collation + N';';
+EXEC (@Create);
+PRINT N'Created $(TestDb) with collation ' + @Collation + N' (instance: ' + @Instance + N').';
 GO
 ALTER DATABASE $(TestDb) SET RECOVERY SIMPLE;
 -- Capture every query, so the Query Store sections see the setup writes and the small workload.

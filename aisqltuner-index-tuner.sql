@@ -251,12 +251,14 @@ BEGIN
 END;
 GO
 
-/* A High, Medium or Low level as a number to compare: 3, 2 or 1. NULL for anything else. */
+/* A High, Medium or Low level as a number to compare: 3, 2 or 1. NULL for anything else.
+   Upper-cased under a fixed collation: under a Turkish database collation the capital of i is İ,
+   so UPPER('medium') would not be MEDIUM. */
 CREATE OR ALTER FUNCTION AIIndexTuner.fn_LevelRank(@Level varchar(10))
 RETURNS tinyint
 AS
 BEGIN
-    RETURN CASE UPPER(LTRIM(RTRIM(@Level))) WHEN 'HIGH' THEN 3 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 1 END;
+    RETURN CASE UPPER(LTRIM(RTRIM(@Level)) COLLATE Latin1_General_100_BIN2) WHEN 'HIGH' THEN 3 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 1 END;
 END;
 GO
 
@@ -751,9 +753,11 @@ BEGIN
                 d.object_id,
                 d.index_handle,
                 s.name + N'.' + o.name AS table_name,
-                COALESCE(d.equality_columns, N'') AS equality_columns,
-                COALESCE(d.inequality_columns, N'') AS inequality_columns,
-                COALESCE(d.included_columns, N'') AS included_columns,
+                -- The missing-index DMV columns are in the instance's collation and sys.columns.name in
+                -- the database's; without COLLATE, comparing them fails with error 468 when the two differ.
+                COALESCE(d.equality_columns, N'') COLLATE DATABASE_DEFAULT AS equality_columns,
+                COALESCE(d.inequality_columns, N'') COLLATE DATABASE_DEFAULT AS inequality_columns,
+                COALESCE(d.included_columns, N'') COLLATE DATABASE_DEFAULT AS included_columns,
                 st.avg_total_user_cost * st.avg_user_impact * (st.user_seeks + st.user_scans) AS impact_score
             FROM sys.dm_db_missing_index_details AS d
             INNER JOIN sys.dm_db_missing_index_groups AS g ON d.index_handle = g.index_handle
