@@ -356,13 +356,15 @@ exactly what would be sent, run `EXEC dbo.sp_AIIndexTuner @CollectOnly = 1;`.
 ```powershell
 .\tests\Run-All.ps1                               # localhost, Windows authentication
 .\tests\Run-All.ps1 -Database AIIndexTunerTest2   # another test database
+.\tests\Run-All.ps1 -Collation Turkish_100_CI_AS  # a test database in that collation
 ```
 
 The test runner:
 
 1. rebuilds the install script
 2. recreates the test database (`AIIndexTunerTest` by default), with Query Store capturing every
-   query:
+   query, in a collation other than the instance's unless `-Collation` names one (`Instance` for
+   the instance's), so collation conflicts between DMVs and catalog views show up:
    - 300,000 orders with no supporting index
    - a duplicate index, an untrusted foreign key and a heap
 

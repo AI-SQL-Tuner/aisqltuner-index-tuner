@@ -98,6 +98,9 @@ GO
    own INSERT ... EXEC of DBCC SHOW_STATISTICS, which SQL Server does not allow. */
 DECLARE @Data nvarchar(max);
 EXEC AIIndexTuner.usp_CollectData @Data = @Data OUTPUT;
+-- A NULL @Data makes every NOT LIKE below unknown, so none of them would throw.
+IF @Data IS NULL
+    THROW 50999, N'FAIL T1: collection returned no data.', 1;
 IF @Data NOT LIKE N'%=== MISSING INDEX RECOMMENDATIONS ===%dbo.Orders%'
    -- The Orders suggestions include TotalDue decimal(12, 2) and CustomerId int, with their types.
    OR @Data NOT LIKE N'%=== MISSING INDEX RECOMMENDATIONS ===%"IncludedColumnTypes":"TotalDue decimal(12, 2)"%=== INDEX USAGE STATISTICS ===%'
@@ -120,6 +123,8 @@ GO
 /* ===== T1b: scope to one table ===== */
 DECLARE @Data nvarchar(max);
 EXEC AIIndexTuner.usp_CollectData @SchemaName = N'dbo', @TableName = N'Customers', @Data = @Data OUTPUT;
+IF @Data IS NULL
+    THROW 50999, N'FAIL T1b: table-scoped collection returned no data.', 1;
 IF @Data LIKE N'%"TableName":"dbo.Orders"%' OR @Data LIKE N'%"TableName":"\[dbo\].\[Orders\]"%' ESCAPE N'\'
     THROW 50999, N'FAIL T1b: table-scoped collection includes another table.', 1;
 IF @Data NOT LIKE N'%limited to table: \[dbo\].\[Customers\]%' ESCAPE N'\'
@@ -136,9 +141,37 @@ IF @QsSection NOT LIKE N'%"QueryId"%' OR @QsSection LIKE N'%AuditLog%'
 PRINT 'PASS T1b: table scope filters object-level sections and resolves the Query Store scope from plan XML';
 GO
 
+/* ===== T1d: a database whose collation differs from the instance's (issue #42) =====
+   The missing-index DMV columns are in the instance's collation and sys.columns.name in the
+   database's. Compared without COLLATE, they stop the collector with error 468, which its
+   BEGIN TRY does not catch, and @Data comes back NULL. 01_Create-TestDb.sql creates the database
+   in a collation other than the instance's unless TestCollation is Instance. Runs before the
+   tests that create indexes on dbo.Orders, which clears its missing-index statistics. */
+DECLARE @DbCollation sysname = CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS sysname),
+        @InstanceCollation sysname = CAST(SERVERPROPERTY('Collation') AS sysname);
+IF @DbCollation = @InstanceCollation
+    PRINT 'SKIP T1d: the database has the instance''s collation, ' + @InstanceCollation + '; create it with TestCollation=Different';
+ELSE
+BEGIN
+    DECLARE @Data nvarchar(max), @Scoped nvarchar(max);
+    EXEC AIIndexTuner.usp_CollectData @Data = @Data OUTPUT;
+    EXEC AIIndexTuner.usp_CollectData @SchemaName = N'dbo', @TableName = N'Orders', @Data = @Scoped OUTPUT;
+    IF @Data IS NULL OR @Scoped IS NULL
+        THROW 50999, N'FAIL T1d: collection returned no data on a database whose collation differs from the instance''s.', 1;
+    IF @Data NOT LIKE N'%=== MISSING INDEX OVERLAP SIGNALS ===%"TableName":"dbo.Orders"%=== DUPLICATE AND OVERLAPPING INDEXES ===%'
+       OR @Scoped NOT LIKE N'%=== MISSING INDEX OVERLAP SIGNALS ===%"TableName":"dbo.Orders"%=== DUPLICATE AND OVERLAPPING INDEXES ===%'
+        THROW 50999, N'FAIL T1d: the missing index overlap signals for dbo.Orders are missing.', 1;
+    IF @Data LIKE N'%Warning: section skipped%' OR @Scoped LIKE N'%Warning: section skipped%'
+        THROW 50999, N'FAIL T1d: a section was skipped.', 1;
+    PRINT 'PASS T1d: collection, database-wide and scoped to a table, completes on a database collated ' + @DbCollation + ' on an instance collated ' + @InstanceCollation;
+END;
+GO
+
 /* ===== T11: the sections added after the first prototype ===== */
 DECLARE @Data nvarchar(max);
 EXEC AIIndexTuner.usp_CollectData @Data = @Data OUTPUT;
+IF @Data IS NULL
+    THROW 50999, N'FAIL T11: collection returned no data.', 1;
 DECLARE @Missing nvarchar(max) = CONCAT(
     CASE WHEN @Data NOT LIKE N'%=== INDEX OPERATIONAL HOTSPOTS ===%"IndexName":"PK_Orders"%' THEN N' operational-hotspots' END,
     CASE WHEN @Data NOT LIKE N'%=== INDEX PAGE DENSITY ===%"IndexName":"PK_Orders"%"SizeMB"%' THEN N' page-density' END,

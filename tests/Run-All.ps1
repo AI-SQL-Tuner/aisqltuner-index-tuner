@@ -5,12 +5,18 @@
 #   .\tests\Run-All.ps1                 # local default instance, Windows authentication
 #   .\tests\Run-All.ps1 -Server sql01
 #   .\tests\Run-All.ps1 -Database AIIndexTunerTest2
+#   .\tests\Run-All.ps1 -Collation Turkish_100_CI_AS
+#
+# -Collation sets the test database's collation: Different (the default) picks one other than the
+# instance's, so collation conflicts between DMVs and catalog views show up (issue #42); Instance
+# uses the instance's; any other value is used as the collation name.
 #
 # The test database is dropped and recreated, which also removes any endpoint credential set up in
 # it. If it has a database scoped credential, the runner stops, unless -Force is passed.
 param(
     [string]$Server = 'localhost',
     [string]$Database = 'AIIndexTunerTest',
+    [string]$Collation = 'Different',
     [switch]$Force
 )
 
@@ -18,9 +24,10 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 
 if ($Database -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { throw "Use a plain database name (letters, digits, underscores): $Database" }
+if ($Collation -notmatch '^[A-Za-z0-9_]+$') { throw "Use a collation name (letters, digits, underscores): $Collation" }
 
 function Invoke-Sql([string]$File, [string]$Db = 'master', [string]$Output) {
-    $sqlArgs = @('-S', $Server, '-E', '-C', '-f', '65001', '-b', '-d', $Db, '-v', "TestDb=$Database", '-i', $File)
+    $sqlArgs = @('-S', $Server, '-E', '-C', '-f', '65001', '-b', '-d', $Db, '-v', "TestDb=$Database", "TestCollation=$Collation", '-i', $File)
     if ($Output) { $sqlArgs += @('-o', $Output) }
     $output = & sqlcmd @sqlArgs
     if ($LASTEXITCODE -ne 0) {

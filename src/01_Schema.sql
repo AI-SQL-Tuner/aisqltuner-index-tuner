@@ -237,12 +237,14 @@ BEGIN
 END;
 GO
 
-/* A High, Medium or Low level as a number to compare: 3, 2 or 1. NULL for anything else. */
+/* A High, Medium or Low level as a number to compare: 3, 2 or 1. NULL for anything else.
+   Upper-cased under a fixed collation: under a Turkish database collation the capital of i is İ,
+   so UPPER('medium') would not be MEDIUM. */
 CREATE OR ALTER FUNCTION AIIndexTuner.fn_LevelRank(@Level varchar(10))
 RETURNS tinyint
 AS
 BEGIN
-    RETURN CASE UPPER(LTRIM(RTRIM(@Level))) WHEN 'HIGH' THEN 3 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 1 END;
+    RETURN CASE UPPER(LTRIM(RTRIM(@Level)) COLLATE Latin1_General_100_BIN2) WHEN 'HIGH' THEN 3 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 1 END;
 END;
 GO
 
