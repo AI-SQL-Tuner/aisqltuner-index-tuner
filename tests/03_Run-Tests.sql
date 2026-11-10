@@ -1365,39 +1365,63 @@ GO
 
 /* ===== T30: a drop for low use is checked against the index's own usage (issue #45) =====
    The 7-day usage window cannot be reached in a fresh test database, so fn_IndexUseCheck, which
-   decides once the window is long enough, is tested directly: an index read since the statistics
-   started may not go, an unread one may. The unique-index refusal comes before the window, so it is
-   tested end to end. */
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'dbo.Customers') AND name = N'IX_Customers_Region_T30Read')
-    DROP INDEX IX_Customers_Region_T30Read ON dbo.Customers;
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'dbo.Customers') AND name = N'IX_Customers_Name_T30Unread')
-    DROP INDEX IX_Customers_Name_T30Unread ON dbo.Customers;
-IF EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'dbo.Customers') AND name = N'UX_Customers_Email_Region_T30')
-    DROP INDEX UX_Customers_Email_Region_T30 ON dbo.Customers;
-CREATE INDEX IX_Customers_Region_T30Read ON dbo.Customers (Region, CustomerName);
-CREATE INDEX IX_Customers_Name_T30Unread ON dbo.Customers (CustomerName, Email) INCLUDE (Region);
-CREATE UNIQUE INDEX UX_Customers_Email_Region_T30 ON dbo.Customers (Email, Region);
+   decides once the window is long enough, is tested directly on a table of its own whose reads and
+   writes the test controls. An index may be dropped for low use when its reads-to-writes ratio is
+   below 5, or it has no reads. The unique-index refusal comes before the window, so it is tested
+   end to end. */
+DROP TABLE IF EXISTS dbo.T30_Usage;
+CREATE TABLE dbo.T30_Usage (Id int IDENTITY(1, 1) NOT NULL CONSTRAINT PK_T30_Usage PRIMARY KEY, A int NOT NULL, B int NOT NULL, C int NOT NULL);
+CREATE INDEX IX_T30_Busy   ON dbo.T30_Usage (A);
+CREATE INDEX IX_T30_Light  ON dbo.T30_Usage (B);
+CREATE INDEX IX_T30_Unread ON dbo.T30_Usage (C);
 GO
--- One seek, through a hint in an ad hoc batch (a hint in a module would block the drop on its own).
-DECLARE @n int = (SELECT COUNT(*) FROM dbo.Customers WITH (INDEX (IX_Customers_Region_T30Read)) WHERE Region = N'AB');
+-- Two write statements, so each of the three indexes above has 2 user updates.
+INSERT dbo.T30_Usage (A, B, C) SELECT TOP (100) v % 10, v % 7, v % 5 FROM (SELECT ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS v FROM sys.all_columns) AS n;
+INSERT dbo.T30_Usage (A, B, C) VALUES (1, 1, 1);
+-- Created after the writes, so it is read but never written.
+CREATE INDEX IX_T30_ReadOnly ON dbo.T30_Usage (A, B);
+GO
+-- Reads, each a seek through a hint in an ad hoc batch (a hint in a module would block the drop on its own):
+-- IX_T30_Busy 10 (ratio 5, not below 5), IX_T30_Light 9 (ratio 4.5), IX_T30_ReadOnly 1 (no writes).
+DECLARE @i int = 0, @n int;
+WHILE @i < 10
+BEGIN
+    SET @n = (SELECT COUNT(*) FROM dbo.T30_Usage WITH (INDEX (IX_T30_Busy)) WHERE A = 1);
+    IF @i < 9 SET @n = (SELECT COUNT(*) FROM dbo.T30_Usage WITH (INDEX (IX_T30_Light)) WHERE B = 1);
+    SET @i += 1;
+END;
+SET @n = (SELECT COUNT(*) FROM dbo.T30_Usage WITH (INDEX (IX_T30_ReadOnly)) WHERE A = 1);
 
-DECLARE @Read TABLE (UserReads bigint, UserUpdates bigint, LastUserRead datetime, Reason nvarchar(4000));
-DECLARE @Unread TABLE (UserReads bigint, UserUpdates bigint, LastUserRead datetime, Reason nvarchar(4000));
-INSERT @Read SELECT * FROM AIIndexTuner.fn_IndexUseCheck(OBJECT_ID(N'dbo.Customers'), INDEXPROPERTY(OBJECT_ID(N'dbo.Customers'), N'IX_Customers_Region_T30Read', 'IndexID'));
-INSERT @Unread SELECT * FROM AIIndexTuner.fn_IndexUseCheck(OBJECT_ID(N'dbo.Customers'), INDEXPROPERTY(OBJECT_ID(N'dbo.Customers'), N'IX_Customers_Name_T30Unread', 'IndexID'));
-IF NOT EXISTS (SELECT 1 FROM @Read WHERE UserReads >= 1 AND LastUserRead IS NOT NULL
-                                     AND Reason LIKE N'\[IX_Customers_Region_T30Read\] has % read(s)%so it is not dropped as unused.%' ESCAPE N'\')
+DECLARE @Use TABLE (IndexName sysname, UserReads bigint, UserUpdates bigint, ReadWriteRatio decimal(18, 2), Reason nvarchar(4000));
+INSERT @Use (IndexName, UserReads, UserUpdates, ReadWriteRatio, Reason)
+SELECT i.name, u.UserReads, u.UserUpdates, u.ReadWriteRatio, u.Reason
+FROM sys.indexes AS i
+CROSS APPLY AIIndexTuner.fn_IndexUseCheck(i.object_id, i.index_id) AS u
+WHERE i.object_id = OBJECT_ID(N'dbo.T30_Usage') AND i.name LIKE N'IX\_T30\_%' ESCAPE N'\';
+
+DECLARE @Expected TABLE (IndexName sysname PRIMARY KEY, UserReads bigint, UserUpdates bigint, Refused bit, ReasonLike nvarchar(400));
+INSERT @Expected VALUES
+    (N'IX_T30_Busy',     10, 2, 1, N'\[IX\_T30\_Busy\] has 10 read(s) (seeks, scans and lookups) and 2 write(s) in the usage statistics, a reads-to-writes ratio of 5.00, not below 5,%'),
+    (N'IX_T30_Light',     9, 2, 0, NULL),
+    (N'IX_T30_Unread',    0, 2, 0, NULL),
+    (N'IX_T30_ReadOnly',  1, 0, 1, N'\[IX\_T30\_ReadOnly\] has 1 read(s)% and 0 write(s) in the usage statistics, reads with no writes, so it is not dropped for low use.%');
+IF EXISTS (SELECT 1 FROM @Expected AS e LEFT JOIN @Use AS u ON u.IndexName = e.IndexName
+           WHERE u.IndexName IS NULL OR u.UserReads <> e.UserReads OR u.UserUpdates <> e.UserUpdates
+              OR (e.Refused = 1 AND (u.Reason IS NULL OR u.Reason NOT LIKE e.ReasonLike ESCAPE N'\'))
+              OR (e.Refused = 0 AND u.Reason IS NOT NULL))
 BEGIN
-    SELECT 'read' AS IndexCase, * FROM @Read;
-    THROW 50999, N'FAIL T30: an index that was read is not refused by fn_IndexUseCheck (see the result set above).', 1;
+    SELECT e.IndexName, e.UserReads AS ExpectedReads, u.UserReads, e.UserUpdates AS ExpectedWrites, u.UserUpdates, u.ReadWriteRatio, e.Refused, u.Reason
+    FROM @Expected AS e LEFT JOIN @Use AS u ON u.IndexName = e.IndexName;
+    THROW 50999, N'FAIL T30: fn_IndexUseCheck did not apply the 5-to-1 reads-to-writes rule (see the result set above).', 1;
 END;
-IF NOT EXISTS (SELECT 1 FROM @Unread WHERE UserReads = 0 AND Reason IS NULL)
-BEGIN
-    SELECT 'unread' AS IndexCase, * FROM @Unread;
-    THROW 50999, N'FAIL T30: an unread index is refused by fn_IndexUseCheck, or has no row (see the result set above).', 1;
-END;
+DROP TABLE dbo.T30_Usage;
+GO
 
 -- A unique index that no other unique index makes redundant is never dropped for low use.
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'dbo.Customers') AND name = N'UX_Customers_Email_Region_T30')
+    DROP INDEX UX_Customers_Email_Region_T30 ON dbo.Customers;
+CREATE UNIQUE INDEX UX_Customers_Email_Region_T30 ON dbo.Customers (Email, Region);
+GO
 EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @AllowDropIndex = 1, @TestResponse = N'{"summary": "s", "recommendations": [
   {"priority": 1, "category": "DropIndex", "title": "Unused unique", "schema_name": "dbo", "table_name": "Customers", "index_name": "UX_Customers_Email_Region_T30",
    "index_type": null, "key_columns": [], "include_columns": [], "filter_predicate": null, "is_unique": true, "confidence": "High", "rationale": "t", "script": ""}]}';
@@ -1410,11 +1434,8 @@ BEGIN
     SELECT Status, StatusReason, AppliedDDL FROM AIIndexTuner.Recommendation WHERE RunId = @RunId;
     THROW 50999, N'FAIL T30: a unique index was dropped for low use, or skipped for another reason (see the result set above).', 1;
 END;
-
-DROP INDEX IX_Customers_Region_T30Read ON dbo.Customers;
-DROP INDEX IX_Customers_Name_T30Unread ON dbo.Customers;
 DROP INDEX UX_Customers_Email_Region_T30 ON dbo.Customers;
-PRINT 'PASS T30: a low-use drop needs no reads in the usage statistics (fn_IndexUseCheck), and a unique index is never dropped for low use';
+PRINT 'PASS T30: a low-use drop needs a reads-to-writes ratio below 5, or no reads (fn_IndexUseCheck), and a unique index is never dropped for low use';
 GO
 
 PRINT 'ALL TESTS PASSED';

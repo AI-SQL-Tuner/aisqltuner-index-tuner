@@ -28,9 +28,10 @@ recommendations are kept, and it replaces the procedures and functions.
   usage statistics covered 7 days; whether the index was little used was taken from the model. A
   mistaken or steered recommendation could drop an index in heavy use, or a unique index. The proc
   now reads `sys.dm_db_index_usage_stats` (new function `fn_IndexUseCheck`) and drops an index for
-  low use only when it has no seeks, scans or lookups in that period, and never drops a unique index
-  for low use. `StatusReason` for such a drop now reads `Unused: no reads over ...` and gives the
-  updates counted in the period.
+  low use only when its reads-to-writes ratio over that period is below 5, or it has no reads, and
+  never drops a unique index for low use. `StatusReason` for such a drop now reads
+  `Low use: R read(s) to W write(s) (ratio X, below 5) over ...`. The README notes that only the
+  primary replica is in scope: usage on readable secondaries has not been tested.
 - **Collection failed with error 468 on a database whose collation differs from the instance's**
   (issue #42). MISSING INDEX OVERLAP SIGNALS compared the missing-index DMV columns, in the
   instance's collation, with `sys.columns.name`, in the database's. The error is not caught by the
@@ -42,8 +43,9 @@ recommendations are kept, and it replaces the procedures and functions.
 
 ### Tests
 
-- New test T30 (issue #45): `fn_IndexUseCheck` refuses an index that was read and allows an unread
-  one, and CREATE mode skips a low-use drop of a unique index.
+- New test T30 (issue #45): on a table whose reads and writes it controls, `fn_IndexUseCheck`
+  refuses an index at a ratio of exactly 5 and one with reads and no writes, and allows one at 4.5
+  and one with no reads. CREATE mode skips a low-use drop of a unique index.
 - The test database is created in a collation other than the instance's by default
   (`Run-All.ps1 -Collation`; `Instance` keeps the instance's). New test T1d runs collection there,
   database-wide and scoped to a table. T1, T1b and T11 now fail when collection returns NULL;
