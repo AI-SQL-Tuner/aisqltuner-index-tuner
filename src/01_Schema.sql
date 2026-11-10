@@ -134,6 +134,28 @@ IF COL_LENGTH(N'AIIndexTuner.Run', N'StoredResponseId') IS NULL
         StoredResponseDeleted bit           NULL;
 GO
 
+/* Size limits for builds (issue #49): sp_AIIndexTuner @MaxTableRows, @MaxIndexSizeMB. NULL = no limit. */
+IF COL_LENGTH(N'AIIndexTuner.Run', N'MaxTableRows') IS NULL
+    ALTER TABLE AIIndexTuner.Run ADD
+        MaxTableRows   bigint NULL,
+        MaxIndexSizeMB int    NULL;
+GO
+
+/* How CREATE mode and sp_AIIndexTuner_Apply wait for locks and use CPUs (issue #49). NULL turns each off.
+   LockTimeoutSec: the longest a drop, an offline build or a columnstore build waits for its locks before
+   it fails (SET LOCK_TIMEOUT). OnlineWaitMinutes: an online rowstore build waits this long at low priority
+   for its brief S and Sch-M locks, then gives up (WAIT_AT_LOW_PRIORITY ... ABORT_AFTER_WAIT = SELF).
+   BuildMaxDop: MAXDOP for every build; NULL leaves the server's setting. WITH VALUES gives existing installs
+   the defaults too. */
+IF COL_LENGTH(N'AIIndexTuner.Config', N'LockTimeoutSec') IS NULL
+    ALTER TABLE AIIndexTuner.Config ADD
+        LockTimeoutSec    int     NULL CONSTRAINT DF_AIIndexTuner_Config_LockTimeout DEFAULT (30) WITH VALUES
+                                       CONSTRAINT CK_AIIndexTuner_Config_LockTimeout CHECK (LockTimeoutSec BETWEEN 1 AND 3600),
+        OnlineWaitMinutes int     NULL CONSTRAINT DF_AIIndexTuner_Config_OnlineWait DEFAULT (5) WITH VALUES
+                                       CONSTRAINT CK_AIIndexTuner_Config_OnlineWait CHECK (OnlineWaitMinutes BETWEEN 1 AND 1440),
+        BuildMaxDop       tinyint NULL CONSTRAINT CK_AIIndexTuner_Config_MaxDop CHECK (BuildMaxDop BETWEEN 1 AND 64);
+GO
+
 /* Step logging (issue #38): sp_AIIndexTuner @Logging, NULL = this default. On by default, since a
    run writes only about 30 small rows. WITH VALUES gives existing installs the default too. */
 IF COL_LENGTH(N'AIIndexTuner.Config', N'EnableLogging') IS NULL

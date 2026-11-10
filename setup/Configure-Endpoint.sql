@@ -213,6 +213,9 @@ UPDATE AIIndexTuner.Config SET
     IncludeQueryText    = 1,         -- 0 leaves plan cache query text out of the prompt
     KeepRunDetail       = 1,         -- keep the collected data and raw response on AIIndexTuner.Run
     MaxPayloadChars     = 500000,    -- larger collected data fails before the request; NULL = no limit
-    EnableLogging       = 1          -- log each step of a run to AIIndexTuner.RunLog
+    EnableLogging       = 1,         -- log each step of a run to AIIndexTuner.RunLog
+    LockTimeoutSec      = 30,        -- longest wait for locks by a drop, offline or columnstore build; NULL = no limit
+    OnlineWaitMinutes   = 5,         -- low-priority wait of an online rowstore build before it gives up; NULL = normal wait
+    BuildMaxDop         = NULL       -- MAXDOP for index builds; NULL = the server's setting
 WHERE ConfigId = 1;
 */

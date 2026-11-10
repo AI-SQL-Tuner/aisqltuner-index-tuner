@@ -1511,5 +1511,109 @@ DELETE AIIndexTuner.Run WHERE RunId = @RunId;
 PRINT 'PASS T31: a stored response that cannot be deleted is recorded on the run and in RunLog, without failing';
 GO
 
+/* ===== T32: build limits and how builds wait (issue #49) =====
+   @MaxIndexSizeMB and @MaxTableRows skip a build with a reason, and sp_AIIndexTuner_Apply builds it later with a
+   higher limit. @MaxMinutes = 0 starts no change. Config's BuildMaxDop and OnlineWaitMinutes go into the DDL. */
+DECLARE @Answer nvarchar(max) = N'{"summary": "s", "recommendations": [
+  {"priority": 1, "category": "CreateIndex", "title": "Wide", "schema_name": "dbo", "table_name": "Orders", "index_name": "IX_Orders_Notes_T32",
+   "index_type": "NONCLUSTERED", "key_columns": [{"column": "Notes", "descending": false}], "include_columns": ["TotalDue"],
+   "filter_predicate": null, "is_unique": false, "confidence": "High", "rationale": "t", "script": ""},
+  {"priority": 2, "category": "CreateIndex", "title": "Small", "schema_name": "dbo", "table_name": "Customers", "index_name": "IX_Customers_Name_Region_T32",
+   "index_type": "NONCLUSTERED", "key_columns": [{"column": "CustomerName", "descending": false}, {"column": "Region", "descending": false}], "include_columns": [],
+   "filter_predicate": null, "is_unique": false, "confidence": "High", "rationale": "t", "script": ""}]}';
+
+-- dbo.Orders: about 300,000 rows at 9 + 400 (Notes) + 9 (TotalDue) + 4 (OrderId, the clustering key) bytes, about 120 MB as an
+-- upper bound; dbo.Customers: about 20,000 rows at 9 + 200 + 2 + 4 bytes, about 4 MB.
+EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @TestResponse = @Answer, @MaxIndexSizeMB = 50;
+DECLARE @RunId int = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Run WHERE RunId = @RunId AND MaxIndexSizeMB = 50 AND MaxTableRows IS NULL)
+   OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 1 AND Status = 'Skipped'
+                    AND StatusReason LIKE N'The new index is estimated at up to %MB (%rows at the columns'' declared widths), more than the limit of 50 MB (@MaxIndexSizeMB).%')
+   OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 2 AND Status = 'Applied')
+   OR EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Orders_Notes_T32')
+BEGIN
+    SELECT Priority, Status, StatusReason FROM AIIndexTuner.Recommendation WHERE RunId = @RunId;
+    THROW 50999, N'FAIL T32: @MaxIndexSizeMB did not skip the large index and build the small one (see the result set above).', 1;
+END;
+
+-- A higher limit from sp_AIIndexTuner_Apply replaces the run's.
+DECLARE @WideId int = (SELECT RecommendationId FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 1);
+INSERT #Applied EXEC dbo.sp_AIIndexTuner_Apply @RecommendationId = @WideId, @MaxIndexSizeMB = 1000;
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RecommendationId = @WideId AND Status = 'Applied')
+    THROW 50999, N'FAIL T32: a higher @MaxIndexSizeMB from sp_AIIndexTuner_Apply did not build the index.', 1;
+DROP INDEX IX_Orders_Notes_T32 ON dbo.Orders;
+DROP INDEX IX_Customers_Name_Region_T32 ON dbo.Customers;
+
+-- @MaxTableRows: dbo.Orders has more than 100,000 rows, dbo.Customers fewer.
+EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @TestResponse = @Answer, @MaxTableRows = 100000;
+SET @RunId = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 1 AND Status = 'Skipped'
+                 AND StatusReason LIKE N'\[dbo\].\[Orders\] has % rows, more than the limit of 100,000 (@MaxTableRows).%' ESCAPE N'\')
+   OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 2 AND Status = 'Applied')
+BEGIN
+    SELECT Priority, Status, StatusReason FROM AIIndexTuner.Recommendation WHERE RunId = @RunId;
+    THROW 50999, N'FAIL T32: @MaxTableRows did not skip the index on the larger table only (see the result set above).', 1;
+END;
+DROP INDEX IX_Customers_Name_Region_T32 ON dbo.Customers;
+
+-- @MaxMinutes = 0: nothing starts; every candidate is marked, and a later call applies it.
+EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @TestResponse = @Answer, @MaxMinutes = 0;
+SET @RunId = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
+IF EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RunId = @RunId
+             AND (Status <> 'Skipped' OR StatusReason NOT LIKE N'Not started: the limit of 0 minute(s) for this call (@MaxMinutes) was reached;%'))
+   OR EXISTS (SELECT 1 FROM sys.indexes WHERE name IN (N'IX_Orders_Notes_T32', N'IX_Customers_Name_Region_T32'))
+BEGIN
+    SELECT Priority, Status, StatusReason FROM AIIndexTuner.Recommendation WHERE RunId = @RunId;
+    THROW 50999, N'FAIL T32: @MaxMinutes = 0 started a change, or did not say why one was not started (see the result set above).', 1;
+END;
+DECLARE @SmallId int = (SELECT RecommendationId FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 2);
+INSERT #Applied EXEC dbo.sp_AIIndexTuner_Apply @RecommendationId = @SmallId;
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RecommendationId = @SmallId AND Status = 'Applied')
+    THROW 50999, N'FAIL T32: a change @MaxMinutes held back could not be applied later.', 1;
+DROP INDEX IX_Customers_Name_Region_T32 ON dbo.Customers;
+
+-- Invalid limits are refused.
+BEGIN TRY
+    EXEC dbo.sp_AIIndexTuner @TestResponse = @Answer, @MaxIndexSizeMB = 0;
+    THROW 50999, N'FAIL T32: @MaxIndexSizeMB = 0 was accepted.', 1;
+END TRY
+BEGIN CATCH
+    IF ERROR_NUMBER() <> 50215 THROW;
+END CATCH;
+
+-- Config: MAXDOP on every build, and a low-priority wait on an online rowstore build where the edition builds online.
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Config)
+BEGIN
+    INSERT AIIndexTuner.Config (ConfigId, Endpoint, Deployment, CredentialName, BuildMaxDop, OnlineWaitMinutes)
+    VALUES (1, N'https://t32.invalid/', N't32', N'https://t32.invalid', 1, 3);
+    BEGIN TRY
+        EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @TestResponse = @Answer, @MaxIndexSizeMB = 50;
+    END TRY
+    BEGIN CATCH
+        DELETE AIIndexTuner.Config;
+        THROW;
+    END CATCH;
+    DELETE AIIndexTuner.Config;
+    SET @RunId = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
+    DECLARE @Ddl nvarchar(max) = (SELECT AppliedDDL FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 2);
+    IF @Ddl NOT LIKE N'%MAXDOP = 1%'
+       OR (CAST(SERVERPROPERTY('EngineEdition') AS int) IN (3, 5, 8)
+           AND @Ddl NOT LIKE N'%ONLINE = ON (WAIT\_AT\_LOW\_PRIORITY (MAX\_DURATION = 3 MINUTES, ABORT\_AFTER\_WAIT = SELF))%' ESCAPE N'\')
+    BEGIN
+        SELECT @Ddl AS AppliedDDL;
+        THROW 50999, N'FAIL T32: the build did not carry BuildMaxDop and the low-priority wait (see the result set above).', 1;
+    END;
+    DROP INDEX IX_Customers_Name_Region_T32 ON dbo.Customers;
+END
+ELSE
+    PRINT 'SKIP T32 Config options: AIIndexTuner.Config has a row';
+
+-- The defaults: 30 seconds for locks, 5 minutes at low priority, no MAXDOP.
+IF (SELECT definition FROM sys.default_constraints WHERE name = N'DF_AIIndexTuner_Config_LockTimeout') <> N'((30))'
+   OR (SELECT definition FROM sys.default_constraints WHERE name = N'DF_AIIndexTuner_Config_OnlineWait') <> N'((5))'
+    THROW 50999, N'FAIL T32: unexpected LockTimeoutSec or OnlineWaitMinutes default.', 1;
+PRINT 'PASS T32: @MaxIndexSizeMB and @MaxTableRows skip builds with a reason and a later call can lift them; @MaxMinutes = 0 starts nothing; BuildMaxDop and OnlineWaitMinutes reach the DDL';
+GO
+
 PRINT 'ALL TESTS PASSED';
 GO

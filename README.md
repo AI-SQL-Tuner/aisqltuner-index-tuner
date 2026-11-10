@@ -167,6 +167,31 @@ EXEC dbo.sp_AIIndexTuner_Apply @RecommendationId = 43, @AllowDropIndex = 1;
 EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @AllowColumnstore = 1, @AllowDropIndex = 1, @MaxNewIndexes = 2;
 ```
 
+### Build limits
+
+These parameters, on `sp_AIIndexTuner` and `sp_AIIndexTuner_Apply`, limit when and how large a
+change CREATE mode and `sp_AIIndexTuner_Apply` make. `NULL` (the default) is no limit. The prompt
+is unchanged.
+
+| Parameter | Effect |
+|---|---|
+| `@MaxTableRows` | Skips a new or widened index on a table with more rows than this |
+| `@MaxIndexSizeMB` | Skips a new or widened index estimated at more MB than this. The estimate is an upper bound from the catalog: the table's rows times the declared width of the index's columns (key, included, and the clustered key or RID), with a variable-length column at its declared maximum and a `(max)` column at 8,000 bytes. A real index is usually smaller |
+| `@MaxMinutes` | Starts no change after this many minutes from the start of the call; a change already running finishes. The ones not started are marked `Skipped` with how to apply them later. `0` starts none. Collection and the AI call are not limited by it |
+
+The size limits are stored on the run, and a value passed to `sp_AIIndexTuner_Apply` replaces the
+run's, so an index held back can be built later, in a maintenance window:
+
+```sql
+EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @MaxIndexSizeMB = 1024, @MaxMinutes = 60;
+EXEC dbo.sp_AIIndexTuner_Apply @RecommendationId = 42, @MaxIndexSizeMB = 20480;   -- later, in the window
+```
+
+How builds and drops wait for locks, and how many CPUs a build uses, are set in
+`AIIndexTuner.Config` (see [Configuration](#configuration)): `LockTimeoutSec`, `OnlineWaitMinutes`
+and `BuildMaxDop`. Whether a build can run online depends on the edition (see *What it adds* under
+[Apply-mode safety](#apply-mode-safety)); an offline build blocks writes to the table while it runs.
+
 ### Apply thresholds
 
 `@MinPriority` and `@MinConfidence` set the lowest priority level and confidence a recommendation
@@ -265,7 +290,11 @@ EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @MinPriority = 'Low', @MinConfidence 
   `ALLOW_PAGE_LOCKS` and `OPTIMIZE_FOR_SEQUENTIAL_KEY`. A fill factor or compression the
   recommendation sets replaces the old one, and `StatusReason` lists what was kept and what changed.
 - **What it adds:** `ONLINE = ON` where the edition supports it (Enterprise, Azure SQL Database,
-  Managed Instance).
+  Managed Instance). An online rowstore build waits at low priority for its locks for
+  `OnlineWaitMinutes` (default 5), then gives up rather than block the workload
+  (`WAIT_AT_LOW_PRIORITY ... ABORT_AFTER_WAIT = SELF`). A drop, an offline build and a columnstore
+  build wait at most `LockTimeoutSec` (default 30) for their locks. `MAXDOP = BuildMaxDop` when set.
+  A change that gives up is marked `Failed` with the reason and can be applied again.
 - **Tagging:** each index it creates gets the extended property `AIIndexTuner`, naming the run and
   the recommendation. A widened index existed before, so its tag says *Widened by*: roll it back with
   its `UndoDDL`, not by dropping it.
@@ -309,6 +338,9 @@ WHERE ep.name = N'AIIndexTuner';
 | `KeepRunDetail` | 1 | Keep the collected data and raw response on each run |
 | `MaxPayloadChars` | 500000 | The largest collected payload sent to the model, in characters (NULL = no limit). A larger one fails before the request with an error that names its size; narrow the scope or raise the limit |
 | `EnableLogging` | 1 | Log each step of a run to `AIIndexTuner.RunLog`; `sp_AIIndexTuner @Logging` overrides it for one call |
+| `LockTimeoutSec` | 30 | The longest a drop, an offline build or a columnstore build waits for its locks before it fails (NULL = no limit) |
+| `OnlineWaitMinutes` | 5 | How long an online rowstore build waits at low priority for its locks before it gives up (NULL = wait at normal priority, without limit) |
+| `BuildMaxDop` | NULL | `MAXDOP` for every index build (NULL = the server's setting) |
 
 ### Step log
 
