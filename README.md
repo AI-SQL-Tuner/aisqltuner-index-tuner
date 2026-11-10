@@ -340,10 +340,14 @@ exactly what would be sent, run `EXEC dbo.sp_AIIndexTuner @CollectOnly = 1;`.
 
   For the same reason, `sp_AIIndexTuner_Apply` inside `INSERT ... EXEC` refuses low-use drops,
   because it cannot confirm the usage period.
-- **Model scripts are not checked:** the `Script` column is the model's own T-SQL, kept for review
-  and never executed. Live runs show it can be invalid: one suggested
+- **Model scripts are checked only for their target table:** the `Script` column is the model's own
+  T-SQL, kept for review and never executed. Live runs show it can be invalid: one suggested
   `ALTER DATABASE SCOPED CONFIGURATION SET AUTOMATIC_TUNING`, which should be
-  `ALTER DATABASE ... SET AUTOMATIC_TUNING`. Test a script before running it yourself.
+  `ALTER DATABASE ... SET AUTOMATIC_TUNING`, and one created an index `ON [WO].[WorkOrder]` for a
+  recommendation on `WO.WorkOrderStatusEvent`. `ScriptWarning` flags a script whose one target
+  table (after `ALTER TABLE`, `UPDATE STATISTICS`, or `INDEX`/`STATISTICS <name> ON`) is not the
+  recommendation's `SchemaName.TableName`. A script with no target or several is not checked, and
+  nothing else about it is. Test a script before running it yourself.
 - **Answers vary between runs:** the same input can come back with different categories. For
   example, a deferred drop came back under `Other` in one run and `DropIndex` in another, before the
   prompt reserved `DropIndex` for drops to make now. The change controls and apply-mode checks are

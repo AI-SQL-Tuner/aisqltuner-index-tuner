@@ -9,6 +9,18 @@ recommendations are kept, and it replaces the procedures and functions.
 
 ## Unreleased
 
+### Added
+
+- **`Recommendation.ScriptWarning` flags a script that targets another table** (issue #41). In a
+  Managed Instance run, a recommendation for `WO.WorkOrderStatusEvent` came with a `Script` that
+  created the index `ON [WO].[WorkOrder]`. CREATE mode was not affected, since it builds its own DDL
+  from the recommendation's fields, but a person copying the script would have changed the wrong
+  table. When a run's recommendations are stored, the target of each script (after `ALTER TABLE`,
+  `UPDATE STATISTICS`, or `INDEX`/`STATISTICS <name> ON`, outside comments and string literals) is
+  compared with `SchemaName.TableName`, and a mismatch is described in `ScriptWarning`, which
+  `sp_AIIndexTuner` returns next to `Script`. Scripts with no target, or more than one target
+  table, are not checked.
+
 ### Fixed
 
 - **Collection failed with error 468 on a database whose collation differs from the instance's**
@@ -26,6 +38,10 @@ recommendations are kept, and it replaces the procedures and functions.
   (`Run-All.ps1 -Collation`; `Instance` keeps the instance's). New test T1d runs collection there,
   database-wide and scoped to a table. T1, T1b and T11 now fail when collection returns NULL;
   before, every `NOT LIKE` check was unknown and T1 passed in the failing run.
+- T20 compared section names with `LOWER()` under the database's collation, so on a Turkish
+  database it reported every section with an `I` in its name as missing from the prompt (`INDEX`
+  became `ındex`, with a dotless ı). It now compares under `Latin1_General_100_CI_AS`.
+- New test T29 checks `fn_ScriptTargetWarning` on 21 scripts and the stored `ScriptWarning`.
 
 ## 2026-11-06
 
