@@ -229,11 +229,13 @@ EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @MinPriority = 'Low', @MinConfidence 
     also needs the error log to confirm the period, which takes securityadmin or sysadmin and doesn't
     work inside `INSERT ... EXEC`. On Azure SQL Database a failover can reset the statistics without
     a trace, so the 7 days are counted from the times it can see.
-  - low-use drops of an index whose reads-to-writes ratio in that period is 5 or more, from
-    `sys.dm_db_index_usage_stats` (reads are user seeks, scans and lookups; writes are user updates,
-    counted per statement). An index with no reads is low use; one with reads and no writes is not.
-    The model's word that an index is little used is not enough, and `StatusReason` gives the reads,
-    the writes and the period for a drop it makes. Only the primary replica is in scope: usage on
+  - low-use drops of an index whose reads-to-writes ratio in that period is 5 or more, or that
+    has 1,000 or more reads a day, from `sys.dm_db_index_usage_stats` (reads are user seeks, scans
+    and lookups; writes are user updates, counted per statement). The reads-a-day rule keeps a
+    heavily read index on a write-heavy table from going on its ratio alone. An index with no reads
+    is low use; one with reads and no writes is not. The model's word that an index is little used
+    is not enough, and `StatusReason` gives the reads, the writes, the ratio, the reads a day and
+    the period for a drop it makes. Only the primary replica is in scope: usage on
     readable secondaries is not counted there and has not been tested, so check it yourself before
     allowing drops on an availability group with readable secondaries.
   - low-use drops of a unique index, since it decides which rows the table accepts. A unique index

@@ -2595,30 +2595,48 @@ GO
     AIIndexTuner.fn_IndexUseCheck: whether an index is used little enough to be dropped for low use
     (issue #45), from what sys.dm_db_index_usage_stats has counted for it in this database since its
     statistics started. Reads are user seeks, scans and lookups; writes are user updates (inserts,
-    updates and deletes, counted per statement). An index is low use when its reads-to-writes ratio
-    is below MaxReadWriteRatio (5): it costs more to keep current than it gives back. An index with
-    no reads at all is low use; one with reads and no writes is not. Reason is NULL when the index
-    may be dropped. One row for an index that exists, with zeros when the DMV has no row for it yet.
+    updates and deletes, counted per statement). An index is low use when both:
+      - its reads-to-writes ratio is below MaxReadWriteRatio (5): it costs more to keep current than
+        it gives back, and
+      - it has fewer than MaxReadsPerDay (1000) reads a day over the period since @Since, so a
+        heavily read index on a write-heavy table is not dropped for its ratio alone.
+    An index with no reads at all is low use; one with reads and no writes is not, and neither is
+    one with reads when @Since is NULL (reads a day unknown). Reason is NULL when the index may be
+    dropped. One row for an index that exists, with zeros when the DMV has no row for it yet.
 
-    The caller confirms first that the statistics cover long enough (usp_UsageSince). Only the
-    replica the proc runs on is counted: reads on a readable secondary are not seen here.
+    @Since is when the usage statistics start, from usp_UsageSince; the caller confirms first that
+    they cover long enough. Only the replica the proc runs on is counted: reads on a readable
+    secondary are not seen here.
 */
-CREATE OR ALTER FUNCTION AIIndexTuner.fn_IndexUseCheck(@ObjectId int, @IndexId int)
+CREATE OR ALTER FUNCTION AIIndexTuner.fn_IndexUseCheck(@ObjectId int, @IndexId int, @Since datetime2(0))
 RETURNS TABLE
 AS
 RETURN (
     SELECT u.UserReads, u.UserUpdates, u.LastUserRead,
            CAST(1.0 * u.UserReads / NULLIF(u.UserUpdates, 0) AS decimal(18, 2)) AS ReadWriteRatio,
-           t.MaxReadWriteRatio,
-           CASE WHEN u.UserReads > 0 AND u.UserReads >= t.MaxReadWriteRatio * u.UserUpdates
+           CAST(1440.0 * u.UserReads / m.UsageMinutes AS decimal(18, 1)) AS ReadsPerDay,
+           t.MaxReadWriteRatio, t.MaxReadsPerDay,
+           CASE WHEN u.UserReads = 0 THEN NULL
+                WHEN u.UserReads >= t.MaxReadWriteRatio * u.UserUpdates
                 THEN CONCAT(QUOTENAME(i.name COLLATE DATABASE_DEFAULT), N' has ', u.UserReads, N' read(s) (seeks, scans and lookups) and ', u.UserUpdates,
                             N' write(s) in the usage statistics',
                             CASE WHEN u.UserUpdates = 0 THEN N', reads with no writes'
                                  ELSE CONCAT(N', a reads-to-writes ratio of ', CAST(1.0 * u.UserReads / u.UserUpdates AS decimal(18, 2)), N', not below ', t.MaxReadWriteRatio) END,
                             N', so it is not dropped for low use. Review it and drop it yourself if those reads can use another index.')
+                WHEN m.UsageMinutes IS NULL
+                THEN CONCAT(QUOTENAME(i.name COLLATE DATABASE_DEFAULT), N' has ', u.UserReads, N' read(s) in the usage statistics, and the period they cover is unknown, ',
+                            N'so its reads a day cannot be checked and it is not dropped for low use.')
+                WHEN 1440 * u.UserReads >= t.MaxReadsPerDay * m.UsageMinutes
+                THEN CONCAT(QUOTENAME(i.name COLLATE DATABASE_DEFAULT), N' has ', u.UserReads, N' read(s) (seeks, scans and lookups) over ',
+                            AIIndexTuner.fn_FormatUptime(CAST(LEAST(m.UsageMinutes, 2147483647) AS int)), N' of usage statistics, ',
+                            CAST(1440.0 * u.UserReads / m.UsageMinutes AS decimal(18, 1)), N' a day, not below ', t.MaxReadsPerDay,
+                            N', so it is not dropped for low use. Review it and drop it yourself if those reads can use another index.')
            END AS Reason
     FROM sys.indexes AS i
-    CROSS APPLY (VALUES (CAST(5 AS bigint))) AS t(MaxReadWriteRatio)
+    CROSS APPLY (VALUES (CAST(5 AS bigint), CAST(1000 AS bigint))) AS t(MaxReadWriteRatio, MaxReadsPerDay)
+    -- At least a minute, so a period that has only just started reads as a high rate rather than dividing by zero.
+    -- NULL when @Since is: GREATEST ignores a NULL argument, so it would otherwise turn an unknown period into one minute.
+    CROSS APPLY (SELECT CASE WHEN @Since IS NOT NULL THEN GREATEST(DATEDIFF_BIG(MINUTE, @Since, SYSDATETIME()), CAST(1 AS bigint)) END AS UsageMinutes) AS m
     CROSS APPLY (SELECT ISNULL(SUM(s.user_seeks + s.user_scans + s.user_lookups), 0) AS UserReads,
                         ISNULL(SUM(s.user_updates), 0) AS UserUpdates,
                         MAX(GREATEST(s.last_user_seek, s.last_user_scan, s.last_user_lookup)) AS LastUserRead
@@ -2648,8 +2666,8 @@ GO
 
     Applied: new rowstore indexes; new columnstore indexes when allowed; drops of nonclustered
     indexes when allowed, nothing depends on them, and either another index makes them redundant
-    or they are low use: not unique, and fewer than 5 reads per write in usage statistics that
-    cover at least 7 days (the model's word that an index is little used is not enough, issue #45);
+    or they are low use: not unique, and fewer than 5 reads per write and fewer than 1000 reads a
+    day in usage statistics that cover at least 7 days (the model's word that an index is little used is not enough, issue #45);
     and widenings.
     A widening is a ConsolidateIndex that names the index it replaces (ReplacesIndex): a nonclustered rowstore index that is not
     unique, not filtered, not partitioned and not disabled. The new index must keep its keys as
@@ -2807,7 +2825,7 @@ BEGIN
         -- covers the includes and filter, and keeps any uniqueness, so nothing is lost however short
         -- the usage history. Or it is low use, which is checked here rather than taken from the model
         -- (issue #45): it is not unique, the usage statistics cover at least @MinUsageDays, and they
-        -- show a reads-to-writes ratio below 5 in that time (fn_IndexUseCheck).
+        -- show a reads-to-writes ratio below 5 and fewer than 1000 reads a day in that time (fn_IndexUseCheck).
         DECLARE @Basis nvarchar(4000), @MinUsageDays int = 7;
         IF @Reason IS NULL
         BEGIN
@@ -2864,11 +2882,13 @@ BEGIN
                 ELSE
                 BEGIN
                     -- The period is long enough; now whether the index was used little in it.
-                    DECLARE @UseReason nvarchar(4000), @UserReads bigint, @UserUpdates bigint, @ReadWriteRatio decimal(18, 2), @MaxRatio bigint;
+                    DECLARE @UseReason nvarchar(4000), @UserReads bigint, @UserUpdates bigint, @ReadWriteRatio decimal(18, 2), @MaxRatio bigint,
+                            @ReadsPerDay decimal(18, 1), @MaxReadsPerDay bigint;
                     BEGIN TRY
                         SELECT @UseReason = Reason, @UserReads = UserReads, @UserUpdates = UserUpdates,
-                               @ReadWriteRatio = ReadWriteRatio, @MaxRatio = MaxReadWriteRatio
-                        FROM AIIndexTuner.fn_IndexUseCheck(@ObjectId, @IndexId);
+                               @ReadWriteRatio = ReadWriteRatio, @MaxRatio = MaxReadWriteRatio,
+                               @ReadsPerDay = ReadsPerDay, @MaxReadsPerDay = MaxReadsPerDay
+                        FROM AIIndexTuner.fn_IndexUseCheck(@ObjectId, @IndexId, @Since);
                     END TRY
                     BEGIN CATCH
                         SET @UseReason = CONCAT(N'No other index covers ', QUOTENAME(@IndexName), N', and its reads could not be read from sys.dm_db_index_usage_stats ',
@@ -2881,7 +2901,8 @@ BEGIN
                         SET @Reason = CONCAT(N'No other index covers ', QUOTENAME(@IndexName), N', and its usage could not be found, so it is not dropped for low use.');
                     ELSE
                         SET @Basis = CONCAT(N'Low use: ', @UserReads, N' read(s) to ', @UserUpdates, N' write(s)',
-                                            CASE WHEN @UserReads = 0 THEN N'' ELSE CONCAT(N' (ratio ', @ReadWriteRatio, N', below ', @MaxRatio, N')') END,
+                                            CASE WHEN @UserReads = 0 THEN N''
+                                                 ELSE CONCAT(N' (ratio ', @ReadWriteRatio, N', below ', @MaxRatio, N'; ', @ReadsPerDay, N' reads a day, below ', @MaxReadsPerDay, N')') END,
                                             N' over ', AIIndexTuner.fn_FormatUptime(DATEDIFF(MINUTE, @Since, SYSDATETIME())), N' of usage statistics (since ',
                                             CONVERT(varchar(19), @Since, 120), N', from ', @SinceSource, N').');
                 END;

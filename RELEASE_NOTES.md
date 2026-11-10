@@ -28,9 +28,10 @@ recommendations are kept, and it replaces the procedures and functions.
   usage statistics covered 7 days; whether the index was little used was taken from the model. A
   mistaken or steered recommendation could drop an index in heavy use, or a unique index. The proc
   now reads `sys.dm_db_index_usage_stats` (new function `fn_IndexUseCheck`) and drops an index for
-  low use only when its reads-to-writes ratio over that period is below 5, or it has no reads, and
-  never drops a unique index for low use. `StatusReason` for such a drop now reads
-  `Low use: R read(s) to W write(s) (ratio X, below 5) over ...`. The README notes that only the
+  low use only when, over that period, its reads-to-writes ratio is below 5 and it has fewer than
+  1,000 reads a day, or it has no reads, and never drops a unique index for low use. `StatusReason`
+  for such a drop now reads `Low use: R read(s) to W write(s) (ratio X, below 5; Y reads a day,
+  below 1000) over ...`. The README notes that only the
   primary replica is in scope: usage on readable secondaries has not been tested.
 - **Widening an index in place discarded its options** (issue #46). A widening is rebuilt with
   `CREATE INDEX ... WITH (DROP_EXISTING = ON)`, which takes the options it states and defaults for
@@ -56,7 +57,8 @@ recommendations are kept, and it replaces the procedures and functions.
   and says so in `StatusReason`.
 - New test T30 (issue #45): on a table whose reads and writes it controls, `fn_IndexUseCheck`
   refuses an index at a ratio of exactly 5 and one with reads and no writes, and allows one at 4.5
-  and one with no reads. CREATE mode skips a low-use drop of a unique index.
+  and one with no reads. The index at 4.5 is refused when its 9 reads fall in a 10-minute period
+  (1,296 a day) or the period is unknown. CREATE mode skips a low-use drop of a unique index.
 - The test database is created in a collation other than the instance's by default
   (`Run-All.ps1 -Collation`; `Instance` keeps the instance's). New test T1d runs collection there,
   database-wide and scoped to a table. T1, T1b and T11 now fail when collection returns NULL;

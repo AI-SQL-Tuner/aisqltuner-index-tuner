@@ -1393,7 +1393,7 @@ GO
    The 7-day usage window cannot be reached in a fresh test database, so fn_IndexUseCheck, which
    decides once the window is long enough, is tested directly on a table of its own whose reads and
    writes the test controls. An index may be dropped for low use when its reads-to-writes ratio is
-   below 5, or it has no reads. The unique-index refusal comes before the window, so it is tested
+   below 5 and it has fewer than 1000 reads a day, or it has no reads. The unique-index refusal comes before the window, so it is tested
    end to end. */
 DROP TABLE IF EXISTS dbo.T30_Usage;
 CREATE TABLE dbo.T30_Usage (Id int IDENTITY(1, 1) NOT NULL CONSTRAINT PK_T30_Usage PRIMARY KEY, A int NOT NULL, B int NOT NULL, C int NOT NULL);
@@ -1418,11 +1418,13 @@ BEGIN
 END;
 SET @n = (SELECT COUNT(*) FROM dbo.T30_Usage WITH (INDEX (IX_T30_ReadOnly)) WHERE A = 1);
 
+-- Over a 7-day period: at most 10 reads, well under 1000 a day, so only the ratio decides.
+DECLARE @Week datetime2(0) = DATEADD(DAY, -7, SYSDATETIME());
 DECLARE @Use TABLE (IndexName sysname, UserReads bigint, UserUpdates bigint, ReadWriteRatio decimal(18, 2), Reason nvarchar(4000));
 INSERT @Use (IndexName, UserReads, UserUpdates, ReadWriteRatio, Reason)
 SELECT i.name, u.UserReads, u.UserUpdates, u.ReadWriteRatio, u.Reason
 FROM sys.indexes AS i
-CROSS APPLY AIIndexTuner.fn_IndexUseCheck(i.object_id, i.index_id) AS u
+CROSS APPLY AIIndexTuner.fn_IndexUseCheck(i.object_id, i.index_id, @Week) AS u
 WHERE i.object_id = OBJECT_ID(N'dbo.T30_Usage') AND i.name LIKE N'IX\_T30\_%' ESCAPE N'\';
 
 DECLARE @Expected TABLE (IndexName sysname PRIMARY KEY, UserReads bigint, UserUpdates bigint, Refused bit, ReasonLike nvarchar(400));
@@ -1439,6 +1441,25 @@ BEGIN
     SELECT e.IndexName, e.UserReads AS ExpectedReads, u.UserReads, e.UserUpdates AS ExpectedWrites, u.UserUpdates, u.ReadWriteRatio, e.Refused, u.Reason
     FROM @Expected AS e LEFT JOIN @Use AS u ON u.IndexName = e.IndexName;
     THROW 50999, N'FAIL T30: fn_IndexUseCheck did not apply the 5-to-1 reads-to-writes rule (see the result set above).', 1;
+END;
+
+-- The reads-a-day rule. IX_T30_Light passes the ratio (4.5), but its 9 reads over a 10-minute period
+-- are 1296.0 a day, not below 1000. With no known period it is refused too; an unread index is not.
+DECLARE @Light int = INDEXPROPERTY(OBJECT_ID(N'dbo.T30_Usage'), N'IX_T30_Light', 'IndexID'),
+        @Unread int = INDEXPROPERTY(OBJECT_ID(N'dbo.T30_Usage'), N'IX_T30_Unread', 'IndexID'),
+        @TenMinutes datetime2(0) = DATEADD(MINUTE, -10, SYSDATETIME());
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.fn_IndexUseCheck(OBJECT_ID(N'dbo.T30_Usage'), @Light, @TenMinutes)
+               WHERE ReadsPerDay >= 1000
+                 AND Reason LIKE N'\[IX\_T30\_Light\] has 9 read(s) (seeks, scans and lookups) over % of usage statistics, 1%.% a day, not below 1000, so it is not dropped for low use.%' ESCAPE N'\')
+   OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.fn_IndexUseCheck(OBJECT_ID(N'dbo.T30_Usage'), @Light, NULL)
+                  WHERE Reason LIKE N'\[IX\_T30\_Light\] has 9 read(s) in the usage statistics, and the period they cover is unknown,%' ESCAPE N'\')
+   OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.fn_IndexUseCheck(OBJECT_ID(N'dbo.T30_Usage'), @Unread, @TenMinutes) WHERE UserReads = 0 AND Reason IS NULL)
+   OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.fn_IndexUseCheck(OBJECT_ID(N'dbo.T30_Usage'), @Light, @Week) WHERE ReadsPerDay < 2 AND Reason IS NULL)
+BEGIN
+    SELECT N'10 minutes' AS Period, * FROM AIIndexTuner.fn_IndexUseCheck(OBJECT_ID(N'dbo.T30_Usage'), @Light, @TenMinutes)
+    UNION ALL SELECT N'unknown', * FROM AIIndexTuner.fn_IndexUseCheck(OBJECT_ID(N'dbo.T30_Usage'), @Light, NULL)
+    UNION ALL SELECT N'7 days', * FROM AIIndexTuner.fn_IndexUseCheck(OBJECT_ID(N'dbo.T30_Usage'), @Light, @Week);
+    THROW 50999, N'FAIL T30: fn_IndexUseCheck did not apply the 1000-reads-a-day rule (see the result set above).', 1;
 END;
 DROP TABLE dbo.T30_Usage;
 GO
@@ -1461,7 +1482,7 @@ BEGIN
     THROW 50999, N'FAIL T30: a unique index was dropped for low use, or skipped for another reason (see the result set above).', 1;
 END;
 DROP INDEX UX_Customers_Email_Region_T30 ON dbo.Customers;
-PRINT 'PASS T30: a low-use drop needs a reads-to-writes ratio below 5, or no reads (fn_IndexUseCheck), and a unique index is never dropped for low use';
+PRINT 'PASS T30: a low-use drop needs a reads-to-writes ratio below 5 and fewer than 1000 reads a day, or no reads (fn_IndexUseCheck), and a unique index is never dropped for low use';
 GO
 
 PRINT 'ALL TESTS PASSED';
