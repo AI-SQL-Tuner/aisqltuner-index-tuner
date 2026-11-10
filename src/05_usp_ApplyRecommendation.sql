@@ -418,7 +418,7 @@ BEGIN
         BEGIN CATCH
             UPDATE AIIndexTuner.Recommendation
             SET Status = 'Failed', AppliedDDL = @Ddl,
-                StatusReason = LEFT(CONCAT(ERROR_MESSAGE(), CASE WHEN ERROR_NUMBER() = 1222
+                StatusReason = LEFT(CONCAT(ERROR_MESSAGE(), CASE WHEN ERROR_NUMBER() = 1222 AND @LockTimeoutSec IS NOT NULL
                     THEN CONCAT(N' The drop waited ', @LockTimeoutSec, N' seconds (AIIndexTuner.Config.LockTimeoutSec) for its lock. Apply it again when the table is quieter.') END), 4000)
             WHERE RecommendationId = @RecommendationId;
             RETURN;
@@ -722,7 +722,8 @@ BEGIN
             -- Error 1222 for both ways of giving up: the lock timeout, and the end of a low-priority wait (ABORT_AFTER_WAIT = SELF).
             StatusReason = LEFT(CONCAT(ERROR_MESSAGE(), CASE WHEN ERROR_NUMBER() = 1222 AND @LowPriority = 1
                 THEN CONCAT(N' The online build waited ', @OnlineWaitMinutes, N' minute(s) at low priority (AIIndexTuner.Config.OnlineWaitMinutes) for its lock, then gave up rather than block the workload. Apply it again when the table is quieter.')
-                WHEN ERROR_NUMBER() = 1222
+                -- Only when this tool set the timeout: a caller's own SET LOCK_TIMEOUT also raises 1222.
+                WHEN ERROR_NUMBER() = 1222 AND @LockTimeoutSec IS NOT NULL AND @LowPriority = 0
                 THEN CONCAT(N' The build waited ', @LockTimeoutSec, N' seconds (AIIndexTuner.Config.LockTimeoutSec) for its lock. Apply it again when the table is quieter.') END), 4000)
         WHERE RecommendationId = @RecommendationId;
         RETURN;

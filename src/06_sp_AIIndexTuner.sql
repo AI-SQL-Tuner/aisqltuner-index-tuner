@@ -3,7 +3,8 @@ SET QUOTED_IDENTIFIER ON;
 GO
 /*
     AIIndexTuner.usp_SkipForMaxMinutes: marks a recommendation that was not started because the call's
-    @MaxMinutes was reached (issue #49), with how to apply it later. One already Applied is left alone.
+    @MaxMinutes was reached (issue #49), with how to apply it later. Only one still Recommended is
+    marked: an earlier Skipped or Failed result, and its reason, stays as the last attempt left it.
 */
 CREATE OR ALTER PROCEDURE AIIndexTuner.usp_SkipForMaxMinutes
     @RecommendationId int,
@@ -16,7 +17,7 @@ BEGIN
     SET Status = 'Skipped',
         StatusReason = CONCAT(N'Not started: the limit of ', @MaxMinutes, N' minute(s) for this call (@MaxMinutes) was reached; the call started at ',
                               CONVERT(varchar(19), @CallStarted, 120), N'. Apply it later with sp_AIIndexTuner_Apply @RecommendationId = ', @RecommendationId, N'.')
-    WHERE RecommendationId = @RecommendationId AND Status <> 'Applied';
+    WHERE RecommendationId = @RecommendationId AND Status = 'Recommended';
 END;
 GO
 

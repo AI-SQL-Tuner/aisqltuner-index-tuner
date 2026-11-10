@@ -1556,6 +1556,15 @@ BEGIN
 END;
 DROP INDEX IX_Customers_Name_Region_T32 ON dbo.Customers;
 
+-- @MaxMinutes marks only what is still Recommended: an earlier Skipped result keeps its own reason.
+INSERT #Applied EXEC dbo.sp_AIIndexTuner_Apply @RunId = @RunId, @MaxMinutes = 0;
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 1 AND Status = 'Skipped'
+                 AND StatusReason LIKE N'\[dbo\].\[Orders\] has % rows, more than the limit of 100,000 (@MaxTableRows).%' ESCAPE N'\')
+BEGIN
+    SELECT Priority, Status, StatusReason FROM AIIndexTuner.Recommendation WHERE RunId = @RunId;
+    THROW 50999, N'FAIL T32: @MaxMinutes overwrote the reason of an earlier skip (see the result set above).', 1;
+END;
+
 -- @MaxMinutes = 0: nothing starts; every candidate is marked, and a later call applies it.
 EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @TestResponse = @Answer, @MaxMinutes = 0;
 SET @RunId = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
