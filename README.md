@@ -335,16 +335,46 @@ ORDER BY l.RunLogId;
 ## Data disclosure
 
 The collected diagnostics go to the Azure OpenAI endpoint you configure, and to nothing else.
-They include:
+To see exactly what would be sent, run `EXEC dbo.sp_AIIndexTuner @CollectOnly = 1;`.
 
-- object, index and column names
-- row counts and usage counters
+**What is sent.** The payload includes:
+
+- the server name (`@@SERVERNAME`), database name, edition, version and product level, and the
+  times the usage statistics start from (server start, database creation, latest restore and
+  the error log's "Starting up database" message)
+- object, index, column, constraint and statistics names, with column types
+- row counts, sizes, usage and operational counters, page density and fragmentation, and the
+  average width of wide columns (sampled with `DATALENGTH`; the values themselves are not sent)
+- **column values**: for each skewed low-cardinality column (up to 20), each value in its
+  statistics histogram (up to 10 per column, the first 60 characters of each) with its share of
+  the rows, for example `Closed: 99.50%, Open: 0.50%`. These are table data, not metadata, so a
+  column such as a status, country or customer tier sends its actual values. There is no setting
+  that leaves them out; scope the run with `@SchemaName` and `@TableName` to limit which tables
+  are read.
 - up to 600 characters of each of the top plan cache statements
 - up to 400 characters of each non-SARGable predicate, from the plan
+- up to 600 characters of each Query Store query in the workload and forced plan failure
+  sections, and up to 200 characters of each query in the cardinality estimation and degree of
+  parallelism feedback sections
 
-Statement text and predicates can contain literal values. Set `IncludeQueryText = 0` to leave
-them out. To see
-exactly what would be sent, run `EXEC dbo.sp_AIIndexTuner @CollectOnly = 1;`.
+Statement text and predicates can contain literal values. Set `IncludeQueryText = 0` to leave out
+all of the query text and predicates above; it does not affect the column values.
+
+**Copies kept after the run.**
+
+- At the endpoint: the Responses API stores each response, the prompt (the payload above)
+  included, for 30 days by default, and background mode (`UseBackgroundMode = 1`, the default)
+  requires it. Once the run has read the answer, or stops waiting for it,
+  `AIIndexTuner.usp_DeleteResponse` deletes the stored response. `AIIndexTuner.Run` records the
+  response id (`StoredResponseId`) and whether the delete succeeded (`StoredResponseDeleted`); when
+  it is 0, `AIIndexTuner.RunLog` says why, and you can delete it yourself with
+  `DELETE <endpoint>/openai/v1/responses/<StoredResponseId>`. What Azure keeps for abuse monitoring
+  is set on the Azure OpenAI resource, not by this tool.
+- In the database: with `KeepRunDetail = 1` (the default), `AIIndexTuner.Run` keeps the full
+  payload (`CollectedData`) and the raw response (`RawResponse`) of every run, and
+  `AIIndexTuner.Recommendation` keeps the model's rationale and scripts. Nothing deletes them;
+  set `KeepRunDetail = 0` to stop keeping the payload and raw response, and delete old runs
+  yourself. A retention setting and purge procedure are tracked in issue #55.
 
 ## Known limitations
 

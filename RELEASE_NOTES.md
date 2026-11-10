@@ -48,6 +48,16 @@ recommendations are kept, and it replaces the procedures and functions.
   this database) and their Query Store queries (`sp_query_store_remove_query`), and reports what it
   removed or why it could not. The script's header and step 3 now state that it is for the initial
   setup only: re-running it does not change the key of an existing credential.
+- **The stored copy of each AI response was never deleted** (issue #48). The Responses API keeps
+  every response, the prompt with the collected diagnostics included, for 30 days by default. The
+  new `AIIndexTuner.usp_DeleteResponse` deletes it once `usp_InvokeModel` has read the answer or
+  stops waiting for it, in background and foreground mode. `AIIndexTuner.Run` records
+  `StoredResponseId` and `StoredResponseDeleted`; a failed delete does not fail the run, and
+  `AIIndexTuner.RunLog` says why.
+- **The README's data disclosure left out what is sent and kept** (issue #48). It now lists the
+  column values sent from statistics histograms (with no setting to leave them out), the Query
+  Store and feedback query text, the server and database names, and the copies kept at the
+  endpoint and in `AIIndexTuner.Run`.
 - **Collection failed with error 468 on a database whose collation differs from the instance's**
   (issue #42). MISSING INDEX OVERLAP SIGNALS compared the missing-index DMV columns, in the
   instance's collation, with `sys.columns.name`, in the database's. The error is not caught by the
@@ -59,6 +69,8 @@ recommendations are kept, and it replaces the procedures and functions.
 
 ### Tests
 
+- New test T31 (issue #48): a stored response that cannot be deleted (an unresolvable host) is
+  recorded on the run and in `RunLog` without failing, and a call with no response id does nothing.
 - T25 (issue #46): the widened index is PAGE-compressed with a fill factor, `PAD_INDEX` and
   `ALLOW_PAGE_LOCKS = OFF`, and keeps them all when the recommendation sets neither fill factor nor
   compression. A second widening that sets them uses the recommendation's values, keeps the rest,

@@ -13,6 +13,9 @@ GO
     with "background": true, and the response is polled with GET .../responses/{id} until it
     completes or MaxWaitSec runs out.
 
+    The Responses API stores every response for 30 days by default, prompt included. Once the answer
+    is read, or the run gives up on it, the stored response is deleted (usp_DeleteResponse, issue #48).
+
     Only OpenAI models are supported for now.
 */
 /* The Responses API request body. A function so the tests can check it without a network call. */
@@ -69,6 +72,58 @@ BEGIN
                      CROSS APPLY OPENJSON(ci.value) WITH ([type] varchar(50) '$.type', [text] nvarchar(max) '$.text') AS ct) AS c
         WHERE JSON_VALUE(o.value, '$.type') = 'message'
           AND c.[type] = 'output_text');
+END;
+GO
+
+/* Deletes a response the endpoint stored (issue #48): DELETE {endpoint}/openai/v1/responses/{id}.
+   The Responses API keeps every response for 30 days by default, background ones included, and a
+   stored response holds the whole prompt (the collected diagnostics) and the answer. Never throws:
+   a failed delete must not cost the run its answer. The outcome goes on the run row
+   (StoredResponseId, StoredResponseDeleted) and, with logging on, the reason into AIIndexTuner.RunLog. */
+CREATE OR ALTER PROCEDURE AIIndexTuner.usp_DeleteResponse
+    @Url        nvarchar(4000),   -- {endpoint}/openai/v1/responses
+    @ResponseId nvarchar(200),
+    @Credential sysname,
+    @Timeout    smallint,
+    @RunId      int = NULL,
+    @Logging    bit = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+    IF NULLIF(LTRIM(@ResponseId), N'') IS NULL RETURN;
+
+    DECLARE @rc int, @Response nvarchar(max), @HttpCode int, @Deleted bit = 0, @Message nvarchar(4000),
+            @DeleteUrl nvarchar(4000) = CONCAT(@Url, N'/', @ResponseId),
+            @LogId int, @LogRow int, @LogChars int, @Zero int = 0;
+
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'AI response delete', @Chars = @Zero, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
+    SET @LogRow = @LogId;
+
+    BEGIN TRY
+        EXEC @rc = sys.sp_invoke_external_rest_endpoint
+            @url = @DeleteUrl,
+            @method = N'DELETE',
+            @credential = @Credential,
+            @timeout = @Timeout,
+            @response = @Response OUTPUT;
+
+        SET @HttpCode = JSON_VALUE(@Response, '$.response.status.http.code');
+        IF @rc = 0 AND @HttpCode BETWEEN 200 AND 299
+            SELECT @Deleted = 1, @Message = CONCAT(N'Deleted stored response ', @ResponseId, N'.');
+        ELSE
+            SET @Message = CONCAT(N'Could not delete stored response ', @ResponseId, N': HTTP ', @HttpCode, N': ',
+                                  ISNULL(JSON_VALUE(@Response, '$.result.error.message'), LEFT(@Response, 2000)));
+    END TRY
+    BEGIN CATCH
+        SET @Message = CONCAT(N'Could not delete stored response ', @ResponseId, N': ', ERROR_MESSAGE());
+    END CATCH;
+
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, NULL, @Chars = @Zero, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
+    IF @Logging = 1
+        UPDATE AIIndexTuner.RunLog SET Message = LEFT(@Message, 4000) WHERE RunLogId = @LogRow;
+
+    IF @RunId IS NOT NULL
+        UPDATE AIIndexTuner.Run SET StoredResponseId = LEFT(@ResponseId, 200), StoredResponseDeleted = @Deleted WHERE RunId = @RunId;
 END;
 GO
 
@@ -154,6 +209,8 @@ BEGIN
             SET @RawResponse = @Response;
             SET @Error = CONCAT(N'The AI response ', @ResponseId, N' was still ', @Status, N' after ', @MaxWaitSec,
                                 N' seconds. Raise AIIndexTuner.Config.MaxWaitSec, lower ReasoningEffort, or narrow the scope.');
+            -- Still running, so the delete may be refused; its outcome is recorded either way.
+            EXEC AIIndexTuner.usp_DeleteResponse @Url, @ResponseId, @Credential, @Timeout, @RunId, @Logging;
             THROW 50004, @Error, 1;
         END;
 
@@ -174,6 +231,7 @@ BEGIN
             SET @RawResponse = @Response;
             SET @Error = CONCAT(N'Polling the AI response returned HTTP ', @HttpCode, N': ',
                                 ISNULL(JSON_VALUE(@Response, '$.result.error.message'), LEFT(@Response, 2000)));
+            EXEC AIIndexTuner.usp_DeleteResponse @Url, @ResponseId, @Credential, @Timeout, @RunId, @Logging;
             THROW 50005, @Error, 1;
         END;
 
@@ -183,6 +241,10 @@ BEGIN
     END;
 
     SET @RawResponse = @Response;
+
+    -- The answer is in hand (or the response ended without one), so the stored copy can go (issue #48).
+    -- The Responses API stores every response by default, so this runs in background and foreground mode alike.
+    EXEC AIIndexTuner.usp_DeleteResponse @Url, @ResponseId, @Credential, @Timeout, @RunId, @Logging;
 
     IF @Status IN ('failed', 'cancelled')
     BEGIN

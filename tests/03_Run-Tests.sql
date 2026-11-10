@@ -1485,5 +1485,31 @@ DROP INDEX UX_Customers_Email_Region_T30 ON dbo.Customers;
 PRINT 'PASS T30: a low-use drop needs a reads-to-writes ratio below 5 and fewer than 1000 reads a day, or no reads (fn_IndexUseCheck), and a unique index is never dropped for low use';
 GO
 
+/* ===== T31: deleting the stored response never fails the run, and its outcome is recorded (issue #48) =====
+   The delete goes to the network, so only its failure path can run here: a host that does not resolve.
+   It must not throw, must mark the run's response as not deleted, and must log why. No response id: nothing. */
+INSERT AIIndexTuner.Run (Mode) VALUES ('RECOMMEND');
+DECLARE @RunId int = SCOPE_IDENTITY();
+EXEC AIIndexTuner.usp_DeleteResponse @Url = N'https://aiindextuner-t31.invalid/openai/v1/responses', @ResponseId = NULL,
+     @Credential = N'https://aiindextuner-t31.invalid', @Timeout = 5, @RunId = @RunId, @Logging = 1;
+IF EXISTS (SELECT 1 FROM AIIndexTuner.Run WHERE RunId = @RunId AND (StoredResponseId IS NOT NULL OR StoredResponseDeleted IS NOT NULL))
+   OR EXISTS (SELECT 1 FROM AIIndexTuner.RunLog WHERE RunId = @RunId)
+    THROW 50999, N'FAIL T31: a delete with no response id did something.', 1;
+
+EXEC AIIndexTuner.usp_DeleteResponse @Url = N'https://aiindextuner-t31.invalid/openai/v1/responses', @ResponseId = N'resp_t31',
+     @Credential = N'https://aiindextuner-t31.invalid', @Timeout = 5, @RunId = @RunId, @Logging = 1;
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Run WHERE RunId = @RunId AND StoredResponseId = N'resp_t31' AND StoredResponseDeleted = 0)
+   OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.RunLog WHERE RunId = @RunId AND Collector = N'AI response delete' AND EndTime IS NOT NULL
+                    AND Message LIKE N'Could not delete stored response resp\_t31: %' ESCAPE N'\')
+BEGIN
+    SELECT StoredResponseId, StoredResponseDeleted FROM AIIndexTuner.Run WHERE RunId = @RunId;
+    SELECT Collector, EndTime, Message FROM AIIndexTuner.RunLog WHERE RunId = @RunId;
+    THROW 50999, N'FAIL T31: a failed delete was not recorded on the run and in RunLog (see the result sets above).', 1;
+END;
+DELETE AIIndexTuner.RunLog WHERE RunId = @RunId;
+DELETE AIIndexTuner.Run WHERE RunId = @RunId;
+PRINT 'PASS T31: a stored response that cannot be deleted is recorded on the run and in RunLog, without failing';
+GO
+
 PRINT 'ALL TESTS PASSED';
 GO
