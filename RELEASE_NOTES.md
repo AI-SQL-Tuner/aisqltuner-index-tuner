@@ -32,6 +32,13 @@ recommendations are kept, and it replaces the procedures and functions.
   never drops a unique index for low use. `StatusReason` for such a drop now reads
   `Low use: R read(s) to W write(s) (ratio X, below 5) over ...`. The README notes that only the
   primary replica is in scope: usage on readable secondaries has not been tested.
+- **Widening an index in place discarded its options** (issue #46). A widening is rebuilt with
+  `CREATE INDEX ... WITH (DROP_EXISTING = ON)`, which takes the options it states and defaults for
+  the rest, and it stated only the fill factor and compression the model gave. A PAGE-compressed
+  index widened with no `data_compression` came back uncompressed, and a fill factor, `PAD_INDEX`,
+  `ALLOW_ROW_LOCKS`, `ALLOW_PAGE_LOCKS` or `OPTIMIZE_FOR_SEQUENTIAL_KEY` setting reverted to the
+  default. The widening now starts from the old index's options; a fill factor or compression the
+  recommendation sets replaces the old one, and `StatusReason` lists what was kept and what changed.
 - **Collection failed with error 468 on a database whose collation differs from the instance's**
   (issue #42). MISSING INDEX OVERLAP SIGNALS compared the missing-index DMV columns, in the
   instance's collation, with `sys.columns.name`, in the database's. The error is not caught by the
@@ -43,6 +50,10 @@ recommendations are kept, and it replaces the procedures and functions.
 
 ### Tests
 
+- T25 (issue #46): the widened index is PAGE-compressed with a fill factor, `PAD_INDEX` and
+  `ALLOW_PAGE_LOCKS = OFF`, and keeps them all when the recommendation sets neither fill factor nor
+  compression. A second widening that sets them uses the recommendation's values, keeps the rest,
+  and says so in `StatusReason`.
 - New test T30 (issue #45): on a table whose reads and writes it controls, `fn_IndexUseCheck`
   refuses an index at a ratio of exactly 5 and one with reads and no writes, and allows one at 4.5
   and one with no reads. CREATE mode skips a low-use drop of a unique index.

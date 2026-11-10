@@ -249,7 +249,10 @@ EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @MinPriority = 'Low', @MinConfidence 
 - **How it widens:** in place, under the replaced index's name, with `DROP_EXISTING = ON` on the
   same filegroup. The old index keeps serving queries until the new one is built, and hints and plan
   guides that name it keep working. A widening counts towards `@MaxNewIndexes` but needs no
-  `@AllowDropIndex`, because the old index's keys and columns all survive.
+  `@AllowDropIndex`, because the old index's keys and columns all survive. It also keeps the old
+  index's options: fill factor, data compression, `PAD_INDEX`, `ALLOW_ROW_LOCKS`,
+  `ALLOW_PAGE_LOCKS` and `OPTIMIZE_FOR_SEQUENTIAL_KEY`. A fill factor or compression the
+  recommendation sets replaces the old one, and `StatusReason` lists what was kept and what changed.
 - **What it adds:** `ONLINE = ON` where the edition supports it (Enterprise, Azure SQL Database,
   Managed Instance).
 - **Tagging:** each index it creates gets the extended property `AIIndexTuner`, naming the run and

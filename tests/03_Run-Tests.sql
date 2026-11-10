@@ -985,7 +985,7 @@ GO
    included columns is rebuilt under the old name with DROP_EXISTING, and its UndoDDL puts the old
    definition back. Everything else a consolidation can be stays for review, with a reason. */
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_T25_Narrow')
-    CREATE INDEX IX_T25_Narrow ON dbo.Orders (CustomerId) INCLUDE (Status) WITH (FILLFACTOR = 95);
+    CREATE INDEX IX_T25_Narrow ON dbo.Orders (CustomerId) INCLUDE (Status) WITH (FILLFACTOR = 95, PAD_INDEX = ON, ALLOW_PAGE_LOCKS = OFF, DATA_COMPRESSION = PAGE);
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_T25_Order')
     CREATE INDEX IX_T25_Order ON dbo.Orders (OrderDate) INCLUDE (TotalDue);
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_T25_Filtered')
@@ -1041,7 +1041,7 @@ INSERT #T25 VALUES ('limit', N'{"summary": "limit", "recommendations": [
   {"priority": 1, "category": "ConsolidateIndex", "title": "Widen", "schema_name": "dbo", "table_name": "Orders",
    "index_name": "IX_T25_Narrow", "replaces_index": "IX_T25_Narrow", "index_type": "NONCLUSTERED",
    "key_columns": [{"column": "CustomerId", "descending": false}], "include_columns": ["Status", "TotalDue"],
-   "filter_predicate": null, "is_unique": false, "confidence": "High", "rationale": "t", "script": ""},
+   "filter_predicate": null, "is_unique": false, "fill_factor": 80, "data_compression": "ROW", "confidence": "High", "rationale": "t", "script": ""},
   {"priority": 2, "category": "CreateIndex", "title": "New", "schema_name": "dbo", "table_name": "Customers",
    "index_name": "IX_T25_New", "index_type": "NONCLUSTERED",
    "key_columns": [{"column": "CustomerName", "descending": false}], "include_columns": [],
@@ -1053,7 +1053,7 @@ EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @TestResponse = @Answer;
 DECLARE @RunId int = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
 DECLARE @Expected TABLE (Priority int PRIMARY KEY, Status varchar(20), ReasonLike nvarchar(400));
 INSERT @Expected VALUES
-    (1, 'Applied', N'Widened \[IX\_T25\_Narrow\] in place, keeping its keys and included columns. The recommendation named the new index \[IX\_T25\_Wide\]; it keeps the name of the index it replaces.'),
+    (1, 'Applied', N'Widened \[IX\_T25\_Narrow\] in place, keeping its keys and included columns. The recommendation named the new index \[IX\_T25\_Wide\]; it keeps the name of the index it replaces. Kept its options: FILLFACTOR = 95, DATA\_COMPRESSION = PAGE, PAD\_INDEX = ON, ALLOW\_PAGE\_LOCKS = OFF.'),
     (2, 'Skipped', N'\[IX\_T25\_Unique\] is unique or enforces a constraint, so widening it is left for review.'),
     (3, 'Skipped', N'\[IX\_T25\_Filtered\] is filtered, so widening it is left for review.'),
     (4, 'Skipped', N'The new keys do not start with the keys of \[IX\_T25\_Order\] in the same order and direction%'),
@@ -1083,6 +1083,18 @@ BEGIN
     SELECT @Ddl AS AppliedDDL;
     THROW 50999, N'FAIL T25: the widening was not rebuilt in place from the validated fields (see the result set above).', 1;
 END;
+-- It keeps the old index's options, since the recommendation set no fill factor or compression (issue #46).
+IF NOT EXISTS (SELECT 1 FROM sys.indexes AS i
+               INNER JOIN sys.partitions AS p ON p.object_id = i.object_id AND p.index_id = i.index_id
+               WHERE i.object_id = OBJECT_ID(N'dbo.Orders') AND i.name = N'IX_T25_Narrow'
+                 AND i.fill_factor = 95 AND i.is_padded = 1 AND i.allow_page_locks = 0 AND i.allow_row_locks = 1
+                 AND p.data_compression_desc = N'PAGE')
+BEGIN
+    SELECT i.fill_factor, i.is_padded, i.allow_row_locks, i.allow_page_locks, p.data_compression_desc, @Ddl AS AppliedDDL
+    FROM sys.indexes AS i INNER JOIN sys.partitions AS p ON p.object_id = i.object_id AND p.index_id = i.index_id
+    WHERE i.object_id = OBJECT_ID(N'dbo.Orders') AND i.name = N'IX_T25_Narrow';
+    THROW 50999, N'FAIL T25: the widened index lost the options of the index it replaced (see the result set above).', 1;
+END;
 IF NOT EXISTS (SELECT 1 FROM sys.extended_properties
                WHERE class = 7 AND major_id = OBJECT_ID(N'dbo.Orders') AND name = N'AIIndexTuner'
                  AND minor_id = INDEXPROPERTY(OBJECT_ID(N'dbo.Orders'), N'IX_T25_Narrow', 'IndexID')
@@ -1097,7 +1109,7 @@ IF (SELECT StatusReason FROM AIIndexTuner.Recommendation WHERE RecommendationId 
 
 -- The UndoDDL rebuilds the old definition in place, options included.
 DECLARE @Undo nvarchar(max) = (SELECT UndoDDL FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 1);
-IF @Undo <> N'CREATE NONCLUSTERED INDEX [IX_T25_Narrow] ON [dbo].[Orders] ([CustomerId] ASC) INCLUDE ([Status]) WITH (FILLFACTOR = 95, DROP_EXISTING = ON) ON [PRIMARY];'
+IF @Undo <> N'CREATE NONCLUSTERED INDEX [IX_T25_Narrow] ON [dbo].[Orders] ([CustomerId] ASC) INCLUDE ([Status]) WITH (FILLFACTOR = 95, PAD_INDEX = ON, ALLOW_PAGE_LOCKS = OFF, DATA_COMPRESSION = PAGE, DROP_EXISTING = ON) ON [PRIMARY];'
 BEGIN
     SELECT @Undo AS UndoDDL;
     THROW 50999, N'FAIL T25: unexpected UndoDDL for the widening (see the result set above).', 1;
@@ -1105,6 +1117,8 @@ END;
 EXEC sys.sp_executesql @Undo;
 IF (SELECT COUNT(*) FROM sys.index_columns WHERE object_id = OBJECT_ID(N'dbo.Orders') AND index_id = INDEXPROPERTY(OBJECT_ID(N'dbo.Orders'), N'IX_T25_Narrow', 'IndexID')) <> 2
    OR (SELECT fill_factor FROM sys.indexes WHERE object_id = OBJECT_ID(N'dbo.Orders') AND name = N'IX_T25_Narrow') <> 95
+   OR (SELECT p.data_compression_desc FROM sys.partitions AS p WHERE p.object_id = OBJECT_ID(N'dbo.Orders')
+          AND p.index_id = INDEXPROPERTY(OBJECT_ID(N'dbo.Orders'), N'IX_T25_Narrow', 'IndexID')) <> N'PAGE'
     THROW 50999, N'FAIL T25: the UndoDDL did not restore the old index.', 1;
 
 -- A widening counts as a new index for @MaxNewIndexes.
@@ -1115,13 +1129,25 @@ IF (SELECT Status FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Prio
    OR (SELECT StatusReason FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 2) NOT LIKE N'The limit of 1 new index(es)%'
    OR EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_T25_New')
     THROW 50999, N'FAIL T25: a widening did not count towards @MaxNewIndexes.', 1;
+-- A fill factor and compression the recommendation sets replace the old index's, and the note says so;
+-- the options it has no field for are still kept (issue #46).
+IF NOT EXISTS (SELECT 1 FROM sys.indexes AS i
+               INNER JOIN sys.partitions AS p ON p.object_id = i.object_id AND p.index_id = i.index_id
+               WHERE i.object_id = OBJECT_ID(N'dbo.Orders') AND i.name = N'IX_T25_Narrow'
+                 AND i.fill_factor = 80 AND i.is_padded = 1 AND i.allow_page_locks = 0 AND p.data_compression_desc = N'ROW')
+   OR (SELECT StatusReason FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 1)
+      NOT LIKE N'%Kept its options: PAD\_INDEX = ON, ALLOW\_PAGE\_LOCKS = OFF. The recommendation changes FILLFACTOR from 95 to 80, DATA\_COMPRESSION from PAGE to ROW.' ESCAPE N'\'
+BEGIN
+    SELECT StatusReason, AppliedDDL FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AND Priority = 1;
+    THROW 50999, N'FAIL T25: a widening did not apply the recommendation''s fill factor and compression over the old index''s, or did not say so (see the result set above).', 1;
+END;
 
 DROP TABLE #T25;
 DROP INDEX IX_T25_Narrow ON dbo.Orders;
 DROP INDEX IX_T25_Order ON dbo.Orders;
 DROP INDEX IX_T25_Filtered ON dbo.Orders;
 DROP INDEX IX_T25_Unique ON dbo.Customers;
-PRINT 'PASS T25: CREATE mode widens an index in place under its own name, with UndoDDL that restores it and a widened tag; non-widenings, unique, filtered, clustered and columnstore cases stay for review, and a widening counts towards @MaxNewIndexes';
+PRINT 'PASS T25: CREATE mode widens an index in place under its own name, keeping its options unless the recommendation sets them, with UndoDDL that restores it and a widened tag; non-widenings, unique, filtered, clustered and columnstore cases stay for review, and a widening counts towards @MaxNewIndexes';
 GO
 
 /* ===== T26: redundant overlaps, non-SARGable predicates and the payload size limit (issue #21) ===== */

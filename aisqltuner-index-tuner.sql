@@ -3076,10 +3076,54 @@ BEGIN
     -- With DROP_EXISTING, the old index keeps serving queries until the new one is built.
     IF @EngineEdition IN (3, 5, 8)
         SET @Options += N', ONLINE = ON';
+
+    -- A widening keeps the options of the index it replaces (issue #46). CREATE INDEX ... WITH
+    -- (DROP_EXISTING = ON) builds the new index with the options it states and defaults for the rest,
+    -- so without this a compressed index came back uncompressed and a fill factor reset to the
+    -- server's. The recommendation's own fill factor or compression wins where it gives one, and the
+    -- note says what changed. The replaced index is not unique, filtered or partitioned (checked above).
+    DECLARE @Kept nvarchar(1000) = N'', @Changed nvarchar(1000) = N'', @WidenOptions nvarchar(400) = N'';
+    IF @IsWidening = 1
+    BEGIN
+        DECLARE @OldFillFactor tinyint, @OldPadded bit, @OldRowLocks bit, @OldPageLocks bit, @OldSeqKey bit, @OldCompression nvarchar(60);
+        SELECT @OldFillFactor = i.fill_factor, @OldPadded = i.is_padded, @OldRowLocks = i.allow_row_locks, @OldPageLocks = i.allow_page_locks,
+               @OldSeqKey = i.optimize_for_sequential_key,
+               @OldCompression = (SELECT TOP (1) p.data_compression_desc COLLATE DATABASE_DEFAULT FROM sys.partitions AS p
+                                  WHERE p.object_id = i.object_id AND p.index_id = i.index_id ORDER BY p.partition_number)
+        FROM sys.indexes AS i
+        WHERE i.object_id = @ObjectId AND i.index_id = @OldId;
+
+        IF @FillFactor IS NULL AND @OldFillFactor > 0
+            SELECT @FillFactor = @OldFillFactor, @Kept += CONCAT(N', FILLFACTOR = ', @OldFillFactor);
+        ELSE IF @FillFactor IS NOT NULL AND @FillFactor <> NULLIF(@OldFillFactor, 0)
+            SET @Changed += CONCAT(N', FILLFACTOR from ', @OldFillFactor, N' to ', @FillFactor);
+        ELSE IF @FillFactor IS NOT NULL AND ISNULL(@OldFillFactor, 0) = 0 AND @FillFactor <> 100
+            SET @Changed += CONCAT(N', FILLFACTOR from the server default to ', @FillFactor);
+
+        IF @Compression IS NULL AND @OldCompression IN (N'ROW', N'PAGE')
+            SELECT @Compression = @OldCompression, @Kept += CONCAT(N', DATA_COMPRESSION = ', @OldCompression);
+        ELSE IF @Compression IS NOT NULL AND @Compression <> ISNULL(@OldCompression, N'NONE')
+            SET @Changed += CONCAT(N', DATA_COMPRESSION from ', ISNULL(@OldCompression, N'NONE'), N' to ', @Compression);
+
+        -- Options the recommendation has no field for: always the old index's.
+        SET @WidenOptions = CONCAT(
+            CASE WHEN @OldPadded = 1 THEN N', PAD_INDEX = ON' END,
+            CASE WHEN @OldRowLocks = 0 THEN N', ALLOW_ROW_LOCKS = OFF' END,
+            CASE WHEN @OldPageLocks = 0 THEN N', ALLOW_PAGE_LOCKS = OFF' END,
+            CASE WHEN @OldSeqKey = 1 THEN N', OPTIMIZE_FOR_SEQUENTIAL_KEY = ON' END);
+        SET @Kept += @WidenOptions;
+    END;
+
     IF @IsColumnstore = 0 AND @FillFactor BETWEEN 1 AND 100
         SET @Options += CONCAT(N', FILLFACTOR = ', @FillFactor);
+    SET @Options += @WidenOptions;
     IF @IsColumnstore = 0 AND @Compression IN ('NONE', 'ROW', 'PAGE')
         SET @Options += CONCAT(N', DATA_COMPRESSION = ', @Compression);
+
+    IF @IsWidening = 1
+        SET @Note = CONCAT(@Note,
+                           CASE WHEN @Kept <> N'' THEN CONCAT(N' Kept its options: ', STUFF(@Kept, 1, 2, N''), N'.') END,
+                           CASE WHEN @Changed <> N'' THEN CONCAT(N' The recommendation changes ', STUFF(@Changed, 1, 2, N''), N'.') END);
 
     SET @Ddl = CONCAT(
         N'CREATE ',
