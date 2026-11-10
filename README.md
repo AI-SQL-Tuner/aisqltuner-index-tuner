@@ -74,6 +74,15 @@ can apply what it finds.
    `<placeholder>` is left. On SQL Server 2025 and Azure SQL Managed Instance, also run its step 1,
    which enables the REST endpoint feature and needs `ALTER SETTINGS`. To keep a filled-in copy with your key, save it as
    `setup/Configure-Endpoint-DEV.sql`, which `.gitignore` excludes.
+   - The script is for the initial setup only. An existing credential with the endpoint's name is
+     kept as it is, so re-running the script with a new key does not change the key; use
+     `ALTER DATABASE SCOPED CREDENTIAL` for that (step 3 shows how).
+   - Step 0 holds the API key and master key password as literals, which the plan cache and Query
+     Store could keep. Its last step removes those copies and returns what it removed
+     (`SetupTextPlanCache`, `SetupTextQueryStore`). It needs `VIEW SERVER STATE`,
+     `ALTER ANY DATABASE SCOPED CONFIGURATION` and `ALTER` on the database; a part it cannot do
+     reads `NOT DONE` with the reason. It cannot reach a copy captured by an Extended Events
+     session, a trace or an audit, so run it where nothing is capturing statement text.
 3. Smoke test: `EXEC dbo.sp_AIIndexTuner;`, then check that the latest `AIIndexTuner.Run` row has
    `Status = 'Succeeded'`. If it failed, `ErrorMessage` names the part to look at: the HTTP status,
    the credential, or polling.

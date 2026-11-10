@@ -40,6 +40,14 @@ recommendations are kept, and it replaces the procedures and functions.
   `ALLOW_ROW_LOCKS`, `ALLOW_PAGE_LOCKS` or `OPTIMIZE_FOR_SEQUENTIAL_KEY` setting reverted to the
   default. The widening now starts from the old index's options; a fill factor or compression the
   recommendation sets replaces the old one, and `StatusReason` lists what was kept and what changed.
+- **`setup/Configure-Endpoint.sql` left the API key in the plan cache and Query Store** (issue
+  #47). Step 0 types the key and master key password as literals in a `SELECT`, whose text SQL
+  Server does not hide, unlike `CREATE MASTER KEY` and `CREATE DATABASE SCOPED CREDENTIAL`. The
+  script's batches are now marked, and a new last step removes their cached plans
+  (`ALTER DATABASE SCOPED CONFIGURATION CLEAR PROCEDURE_CACHE <plan_handle>`, for plans compiled in
+  this database) and their Query Store queries (`sp_query_store_remove_query`), and reports what it
+  removed or why it could not. The script's header and step 3 now state that it is for the initial
+  setup only: re-running it does not change the key of an existing credential.
 - **Collection failed with error 468 on a database whose collation differs from the instance's**
   (issue #42). MISSING INDEX OVERLAP SIGNALS compared the missing-index DMV columns, in the
   instance's collation, with `sys.columns.name`, in the database's. The error is not caught by the
