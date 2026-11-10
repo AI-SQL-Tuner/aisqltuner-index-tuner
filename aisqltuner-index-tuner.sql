@@ -2592,6 +2592,34 @@ END;
 GO
 
 /*
+    AIIndexTuner.fn_IndexUseCheck: the user reads and updates sys.dm_db_index_usage_stats has counted
+    for an index in this database since its statistics started, and a reason the index may not be
+    dropped as unused, or NULL when it may (issue #45). Any seek, scan or lookup counts as a read.
+    One row for an index that exists, with zeros when the DMV has no row for it yet.
+
+    The caller confirms first that the statistics cover long enough (usp_UsageSince); this says only
+    whether the index was read in that time. Reads on a readable secondary replica are counted
+    there, not here.
+*/
+CREATE OR ALTER FUNCTION AIIndexTuner.fn_IndexUseCheck(@ObjectId int, @IndexId int)
+RETURNS TABLE
+AS
+RETURN (
+    SELECT u.UserReads, u.UserUpdates, u.LastUserRead,
+           CASE WHEN u.UserReads > 0
+                THEN CONCAT(QUOTENAME(i.name COLLATE DATABASE_DEFAULT), N' has ', u.UserReads, N' read(s) (seeks, scans and lookups) in the usage statistics, the last at ',
+                            CONVERT(varchar(19), u.LastUserRead, 120), N', so it is not dropped as unused. Review it and drop it yourself if those reads can use another index.')
+           END AS Reason
+    FROM sys.indexes AS i
+    CROSS APPLY (SELECT ISNULL(SUM(s.user_seeks + s.user_scans + s.user_lookups), 0) AS UserReads,
+                        ISNULL(SUM(s.user_updates), 0) AS UserUpdates,
+                        MAX(GREATEST(s.last_user_seek, s.last_user_scan, s.last_user_lookup)) AS LastUserRead
+                 FROM sys.dm_db_index_usage_stats AS s
+                 WHERE s.database_id = DB_ID() AND s.object_id = i.object_id AND s.index_id = i.index_id) AS u
+    WHERE i.object_id = @ObjectId AND i.index_id = @IndexId);
+GO
+
+/*
     AIIndexTuner.usp_ApplyRecommendation
 
     Applies one stored CreateIndex or DropIndex recommendation, or a ConsolidateIndex one that
@@ -2612,8 +2640,9 @@ GO
 
     Applied: new rowstore indexes; new columnstore indexes when allowed; drops of nonclustered
     indexes when allowed, nothing depends on them, and either another index makes them redundant
-    or the usage statistics cover at least 7 days; and widenings. A widening is a ConsolidateIndex
-    that names the index it replaces (ReplacesIndex): a nonclustered rowstore index that is not
+    or they are unused: not unique, and no reads in usage statistics that cover at least 7 days
+    (the model's word that an index is little used is not enough, issue #45); and widenings.
+    A widening is a ConsolidateIndex that names the index it replaces (ReplacesIndex): a nonclustered rowstore index that is not
     unique, not filtered, not partitioned and not disabled. The new index must keep its keys as
     its leading keys, in the same order and direction, and keep every column it includes. It is
     rebuilt in place under its own name (CREATE INDEX ... WITH (DROP_EXISTING = ON)), so nothing
@@ -2767,8 +2796,9 @@ BEGIN
 
         -- Why it can go. Either another index makes it redundant: it has the same leading keys,
         -- covers the includes and filter, and keeps any uniqueness, so nothing is lost however short
-        -- the usage history. Or it is little used, which the usage DMVs show only over enough time,
-        -- so a low-use drop needs at least @MinUsageDays of usage statistics.
+        -- the usage history. Or it is unused, which is checked here rather than taken from the model
+        -- (issue #45): it is not unique, the usage statistics cover at least @MinUsageDays, and they
+        -- show no reads of it in that time.
         DECLARE @Basis nvarchar(4000), @MinUsageDays int = 7;
         IF @Reason IS NULL
         BEGIN
@@ -2796,6 +2826,10 @@ BEGIN
 
             IF @Redundant IS NOT NULL
                 SET @Basis = CONCAT(N'Redundant: ', QUOTENAME(@Redundant), N' has the same leading keys and covers it.');
+            -- However little it is read, a unique index decides which rows the table accepts.
+            ELSE IF @DropUnique = 1
+                SET @Reason = CONCAT(QUOTENAME(@IndexName), N' is unique, and no other unique index with the same keys makes it redundant, so dropping it ',
+                                     N'would stop the table rejecting duplicates. It is not dropped as unused. Review it and drop it yourself.');
             ELSE
             BEGIN
                 DECLARE @Since datetime2(0), @SinceSource nvarchar(400), @ErrorLogsSearched int, @HasInstanceLogs bit;
@@ -2819,8 +2853,26 @@ BEGIN
                                          AIIndexTuner.fn_FormatUptime(DATEDIFF(MINUTE, @Since, SYSDATETIME())), N' (since ', CONVERT(varchar(19), @Since, 120),
                                          N', from ', @SinceSource, N'). An index is dropped for low use only after at least ', @MinUsageDays, N' days of them.');
                 ELSE
-                    SET @Basis = CONCAT(N'Low use over ', AIIndexTuner.fn_FormatUptime(DATEDIFF(MINUTE, @Since, SYSDATETIME())), N' of usage statistics (since ',
-                                        CONVERT(varchar(19), @Since, 120), N').');
+                BEGIN
+                    -- The period is long enough; now whether the index was read in it.
+                    DECLARE @UseReason nvarchar(4000), @UserReads bigint, @UserUpdates bigint;
+                    BEGIN TRY
+                        SELECT @UseReason = Reason, @UserReads = UserReads, @UserUpdates = UserUpdates
+                        FROM AIIndexTuner.fn_IndexUseCheck(@ObjectId, @IndexId);
+                    END TRY
+                    BEGIN CATCH
+                        SET @UseReason = CONCAT(N'No other index covers ', QUOTENAME(@IndexName), N', and its reads could not be read from sys.dm_db_index_usage_stats ',
+                                                N'(that needs VIEW SERVER STATE or VIEW SERVER PERFORMANCE STATE), so it is not dropped as unused: ', ERROR_MESSAGE());
+                    END CATCH;
+
+                    IF @UseReason IS NOT NULL
+                        SET @Reason = @UseReason;
+                    ELSE IF @UserReads IS NULL
+                        SET @Reason = CONCAT(N'No other index covers ', QUOTENAME(@IndexName), N', and its usage could not be found, so it is not dropped as unused.');
+                    ELSE
+                        SET @Basis = CONCAT(N'Unused: no reads over ', AIIndexTuner.fn_FormatUptime(DATEDIFF(MINUTE, @Since, SYSDATETIME())), N' of usage statistics (since ',
+                                            CONVERT(varchar(19), @Since, 120), N', from ', @SinceSource, N'); ', @UserUpdates, N' update(s) kept it current in that time.');
+                END;
             END;
         END;
 

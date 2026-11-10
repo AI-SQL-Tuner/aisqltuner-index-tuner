@@ -1363,5 +1363,59 @@ IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RunId = @RunId AN
 PRINT 'PASS T29: a Script that targets another table than SchemaName.TableName is flagged in ScriptWarning; comments, strings, scripts with no target or several targets are not';
 GO
 
+/* ===== T30: a drop for low use is checked against the index's own usage (issue #45) =====
+   The 7-day usage window cannot be reached in a fresh test database, so fn_IndexUseCheck, which
+   decides once the window is long enough, is tested directly: an index read since the statistics
+   started may not go, an unread one may. The unique-index refusal comes before the window, so it is
+   tested end to end. */
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'dbo.Customers') AND name = N'IX_Customers_Region_T30Read')
+    DROP INDEX IX_Customers_Region_T30Read ON dbo.Customers;
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'dbo.Customers') AND name = N'IX_Customers_Name_T30Unread')
+    DROP INDEX IX_Customers_Name_T30Unread ON dbo.Customers;
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'dbo.Customers') AND name = N'UX_Customers_Email_Region_T30')
+    DROP INDEX UX_Customers_Email_Region_T30 ON dbo.Customers;
+CREATE INDEX IX_Customers_Region_T30Read ON dbo.Customers (Region, CustomerName);
+CREATE INDEX IX_Customers_Name_T30Unread ON dbo.Customers (CustomerName, Email) INCLUDE (Region);
+CREATE UNIQUE INDEX UX_Customers_Email_Region_T30 ON dbo.Customers (Email, Region);
+GO
+-- One seek, through a hint in an ad hoc batch (a hint in a module would block the drop on its own).
+DECLARE @n int = (SELECT COUNT(*) FROM dbo.Customers WITH (INDEX (IX_Customers_Region_T30Read)) WHERE Region = N'AB');
+
+DECLARE @Read TABLE (UserReads bigint, UserUpdates bigint, LastUserRead datetime, Reason nvarchar(4000));
+DECLARE @Unread TABLE (UserReads bigint, UserUpdates bigint, LastUserRead datetime, Reason nvarchar(4000));
+INSERT @Read SELECT * FROM AIIndexTuner.fn_IndexUseCheck(OBJECT_ID(N'dbo.Customers'), INDEXPROPERTY(OBJECT_ID(N'dbo.Customers'), N'IX_Customers_Region_T30Read', 'IndexID'));
+INSERT @Unread SELECT * FROM AIIndexTuner.fn_IndexUseCheck(OBJECT_ID(N'dbo.Customers'), INDEXPROPERTY(OBJECT_ID(N'dbo.Customers'), N'IX_Customers_Name_T30Unread', 'IndexID'));
+IF NOT EXISTS (SELECT 1 FROM @Read WHERE UserReads >= 1 AND LastUserRead IS NOT NULL
+                                     AND Reason LIKE N'\[IX_Customers_Region_T30Read\] has % read(s)%so it is not dropped as unused.%' ESCAPE N'\')
+BEGIN
+    SELECT 'read' AS IndexCase, * FROM @Read;
+    THROW 50999, N'FAIL T30: an index that was read is not refused by fn_IndexUseCheck (see the result set above).', 1;
+END;
+IF NOT EXISTS (SELECT 1 FROM @Unread WHERE UserReads = 0 AND Reason IS NULL)
+BEGIN
+    SELECT 'unread' AS IndexCase, * FROM @Unread;
+    THROW 50999, N'FAIL T30: an unread index is refused by fn_IndexUseCheck, or has no row (see the result set above).', 1;
+END;
+
+-- A unique index that no other unique index makes redundant is never dropped for low use.
+EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @AllowDropIndex = 1, @TestResponse = N'{"summary": "s", "recommendations": [
+  {"priority": 1, "category": "DropIndex", "title": "Unused unique", "schema_name": "dbo", "table_name": "Customers", "index_name": "UX_Customers_Email_Region_T30",
+   "index_type": null, "key_columns": [], "include_columns": [], "filter_predicate": null, "is_unique": true, "confidence": "High", "rationale": "t", "script": ""}]}';
+DECLARE @RunId int = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation
+               WHERE RunId = @RunId AND Status = 'Skipped'
+                 AND StatusReason LIKE N'\[UX_Customers_Email_Region_T30\] is unique, and no other unique index with the same keys makes it redundant%' ESCAPE N'\')
+   OR NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'dbo.Customers') AND name = N'UX_Customers_Email_Region_T30')
+BEGIN
+    SELECT Status, StatusReason, AppliedDDL FROM AIIndexTuner.Recommendation WHERE RunId = @RunId;
+    THROW 50999, N'FAIL T30: a unique index was dropped for low use, or skipped for another reason (see the result set above).', 1;
+END;
+
+DROP INDEX IX_Customers_Region_T30Read ON dbo.Customers;
+DROP INDEX IX_Customers_Name_T30Unread ON dbo.Customers;
+DROP INDEX UX_Customers_Email_Region_T30 ON dbo.Customers;
+PRINT 'PASS T30: a low-use drop needs no reads in the usage statistics (fn_IndexUseCheck), and a unique index is never dropped for low use';
+GO
+
 PRINT 'ALL TESTS PASSED';
 GO

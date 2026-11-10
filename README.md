@@ -229,6 +229,13 @@ EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @MinPriority = 'Low', @MinConfidence 
     also needs the error log to confirm the period, which takes securityadmin or sysadmin and doesn't
     work inside `INSERT ... EXEC`. On Azure SQL Database a failover can reset the statistics without
     a trace, so the 7 days are counted from the times it can see.
+  - low-use drops of an index that `sys.dm_db_index_usage_stats` shows any read of (a user seek,
+    scan or lookup) in that period. The model's word that an index is little used is not enough:
+    the proc drops it only when it is unused, and `StatusReason` gives the period and the updates
+    it no longer has to make. Reads on a readable secondary replica are not counted on the primary,
+    so check them before allowing drops on an availability group.
+  - low-use drops of a unique index, since it decides which rows the table accepts. A unique index
+    is dropped only when another unique index with the same keys makes it redundant.
 - **Widenings it refuses, each with a reason:**
   - a consolidation that doesn't name the index it replaces (`replaces_index`), such as a merge of
     two indexes or a new clustered index
