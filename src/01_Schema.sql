@@ -123,6 +123,17 @@ IF COL_LENGTH(N'AIIndexTuner.Run', N'MinPriority') IS NULL
         MinConfidence varchar(10) NULL;
 GO
 
+/* The response the endpoint stored for the run (issue #48). The Responses API keeps a response for
+   30 days by default, prompt and answer included; usp_InvokeModel deletes it once the run is done
+   with it. StoredResponseDeleted: 1 = deleted, 0 = the delete failed (AIIndexTuner.RunLog says why;
+   delete it yourself with DELETE <endpoint>/openai/v1/responses/<StoredResponseId>), NULL = no
+   response was stored (a test response, or the request failed before the endpoint created one). */
+IF COL_LENGTH(N'AIIndexTuner.Run', N'StoredResponseId') IS NULL
+    ALTER TABLE AIIndexTuner.Run ADD
+        StoredResponseId      nvarchar(200) NULL,
+        StoredResponseDeleted bit           NULL;
+GO
+
 /* Step logging (issue #38): sp_AIIndexTuner @Logging, NULL = this default. On by default, since a
    run writes only about 30 small rows. WITH VALUES gives existing installs the default too. */
 IF COL_LENGTH(N'AIIndexTuner.Config', N'EnableLogging') IS NULL

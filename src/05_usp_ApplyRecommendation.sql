@@ -56,6 +56,60 @@ END;
 GO
 
 /*
+    AIIndexTuner.fn_IndexUseCheck: whether an index is used little enough to be dropped for low use
+    (issue #45), from what sys.dm_db_index_usage_stats has counted for it in this database since its
+    statistics started. Reads are user seeks, scans and lookups; writes are user updates (inserts,
+    updates and deletes, counted per statement). An index is low use when both:
+      - its reads-to-writes ratio is below MaxReadWriteRatio (5): it costs more to keep current than
+        it gives back, and
+      - it has fewer than MaxReadsPerDay (1000) reads a day over the period since @Since, so a
+        heavily read index on a write-heavy table is not dropped for its ratio alone.
+    An index with no reads at all is low use; one with reads and no writes is not, and neither is
+    one with reads when @Since is NULL (reads a day unknown). Reason is NULL when the index may be
+    dropped. One row for an index that exists, with zeros when the DMV has no row for it yet.
+
+    @Since is when the usage statistics start, from usp_UsageSince; the caller confirms first that
+    they cover long enough. Only the replica the proc runs on is counted: reads on a readable
+    secondary are not seen here.
+*/
+CREATE OR ALTER FUNCTION AIIndexTuner.fn_IndexUseCheck(@ObjectId int, @IndexId int, @Since datetime2(0))
+RETURNS TABLE
+AS
+RETURN (
+    SELECT u.UserReads, u.UserUpdates, u.LastUserRead,
+           CAST(1.0 * u.UserReads / NULLIF(u.UserUpdates, 0) AS decimal(18, 2)) AS ReadWriteRatio,
+           CAST(1440.0 * u.UserReads / m.UsageMinutes AS decimal(18, 1)) AS ReadsPerDay,
+           t.MaxReadWriteRatio, t.MaxReadsPerDay,
+           CASE WHEN u.UserReads = 0 THEN NULL
+                WHEN u.UserReads >= t.MaxReadWriteRatio * u.UserUpdates
+                THEN CONCAT(QUOTENAME(i.name COLLATE DATABASE_DEFAULT), N' has ', u.UserReads, N' read(s) (seeks, scans and lookups) and ', u.UserUpdates,
+                            N' write(s) in the usage statistics',
+                            CASE WHEN u.UserUpdates = 0 THEN N', reads with no writes'
+                                 ELSE CONCAT(N', a reads-to-writes ratio of ', CAST(1.0 * u.UserReads / u.UserUpdates AS decimal(18, 2)), N', not below ', t.MaxReadWriteRatio) END,
+                            N', so it is not dropped for low use. Review it and drop it yourself if those reads can use another index.')
+                WHEN m.UsageMinutes IS NULL
+                THEN CONCAT(QUOTENAME(i.name COLLATE DATABASE_DEFAULT), N' has ', u.UserReads, N' read(s) in the usage statistics, and the period they cover is unknown, ',
+                            N'so its reads a day cannot be checked and it is not dropped for low use.')
+                WHEN 1440 * u.UserReads >= t.MaxReadsPerDay * m.UsageMinutes
+                THEN CONCAT(QUOTENAME(i.name COLLATE DATABASE_DEFAULT), N' has ', u.UserReads, N' read(s) (seeks, scans and lookups) over ',
+                            AIIndexTuner.fn_FormatUptime(CAST(LEAST(m.UsageMinutes, 2147483647) AS int)), N' of usage statistics, ',
+                            CAST(1440.0 * u.UserReads / m.UsageMinutes AS decimal(18, 1)), N' a day, not below ', t.MaxReadsPerDay,
+                            N', so it is not dropped for low use. Review it and drop it yourself if those reads can use another index.')
+           END AS Reason
+    FROM sys.indexes AS i
+    CROSS APPLY (VALUES (CAST(5 AS bigint), CAST(1000 AS bigint))) AS t(MaxReadWriteRatio, MaxReadsPerDay)
+    -- At least a minute, so a period that has only just started reads as a high rate rather than dividing by zero.
+    -- NULL when @Since is: GREATEST ignores a NULL argument, so it would otherwise turn an unknown period into one minute.
+    CROSS APPLY (SELECT CASE WHEN @Since IS NOT NULL THEN GREATEST(DATEDIFF_BIG(MINUTE, @Since, SYSDATETIME()), CAST(1 AS bigint)) END AS UsageMinutes) AS m
+    CROSS APPLY (SELECT ISNULL(SUM(s.user_seeks + s.user_scans + s.user_lookups), 0) AS UserReads,
+                        ISNULL(SUM(s.user_updates), 0) AS UserUpdates,
+                        MAX(GREATEST(s.last_user_seek, s.last_user_scan, s.last_user_lookup)) AS LastUserRead
+                 FROM sys.dm_db_index_usage_stats AS s
+                 WHERE s.database_id = DB_ID() AND s.object_id = i.object_id AND s.index_id = i.index_id) AS u
+    WHERE i.object_id = @ObjectId AND i.index_id = @IndexId);
+GO
+
+/*
     AIIndexTuner.usp_ApplyRecommendation
 
     Applies one stored CreateIndex or DropIndex recommendation, or a ConsolidateIndex one that
@@ -76,8 +130,10 @@ GO
 
     Applied: new rowstore indexes; new columnstore indexes when allowed; drops of nonclustered
     indexes when allowed, nothing depends on them, and either another index makes them redundant
-    or the usage statistics cover at least 7 days; and widenings. A widening is a ConsolidateIndex
-    that names the index it replaces (ReplacesIndex): a nonclustered rowstore index that is not
+    or they are low use: not unique, and fewer than 5 reads per write and fewer than 1000 reads a
+    day in usage statistics that cover at least 7 days (the model's word that an index is little used is not enough, issue #45);
+    and widenings.
+    A widening is a ConsolidateIndex that names the index it replaces (ReplacesIndex): a nonclustered rowstore index that is not
     unique, not filtered, not partitioned and not disabled. The new index must keep its keys as
     its leading keys, in the same order and direction, and keep every column it includes. It is
     rebuilt in place under its own name (CREATE INDEX ... WITH (DROP_EXISTING = ON)), so nothing
@@ -231,8 +287,9 @@ BEGIN
 
         -- Why it can go. Either another index makes it redundant: it has the same leading keys,
         -- covers the includes and filter, and keeps any uniqueness, so nothing is lost however short
-        -- the usage history. Or it is little used, which the usage DMVs show only over enough time,
-        -- so a low-use drop needs at least @MinUsageDays of usage statistics.
+        -- the usage history. Or it is low use, which is checked here rather than taken from the model
+        -- (issue #45): it is not unique, the usage statistics cover at least @MinUsageDays, and they
+        -- show a reads-to-writes ratio below 5 and fewer than 1000 reads a day in that time (fn_IndexUseCheck).
         DECLARE @Basis nvarchar(4000), @MinUsageDays int = 7;
         IF @Reason IS NULL
         BEGIN
@@ -260,6 +317,10 @@ BEGIN
 
             IF @Redundant IS NOT NULL
                 SET @Basis = CONCAT(N'Redundant: ', QUOTENAME(@Redundant), N' has the same leading keys and covers it.');
+            -- However little it is read, a unique index decides which rows the table accepts.
+            ELSE IF @DropUnique = 1
+                SET @Reason = CONCAT(QUOTENAME(@IndexName), N' is unique, and no other unique index with the same keys makes it redundant, so dropping it ',
+                                     N'would stop the table rejecting duplicates. It is not dropped for low use. Review it and drop it yourself.');
             ELSE
             BEGIN
                 DECLARE @Since datetime2(0), @SinceSource nvarchar(400), @ErrorLogsSearched int, @HasInstanceLogs bit;
@@ -283,8 +344,32 @@ BEGIN
                                          AIIndexTuner.fn_FormatUptime(DATEDIFF(MINUTE, @Since, SYSDATETIME())), N' (since ', CONVERT(varchar(19), @Since, 120),
                                          N', from ', @SinceSource, N'). An index is dropped for low use only after at least ', @MinUsageDays, N' days of them.');
                 ELSE
-                    SET @Basis = CONCAT(N'Low use over ', AIIndexTuner.fn_FormatUptime(DATEDIFF(MINUTE, @Since, SYSDATETIME())), N' of usage statistics (since ',
-                                        CONVERT(varchar(19), @Since, 120), N').');
+                BEGIN
+                    -- The period is long enough; now whether the index was used little in it.
+                    DECLARE @UseReason nvarchar(4000), @UserReads bigint, @UserUpdates bigint, @ReadWriteRatio decimal(18, 2), @MaxRatio bigint,
+                            @ReadsPerDay decimal(18, 1), @MaxReadsPerDay bigint;
+                    BEGIN TRY
+                        SELECT @UseReason = Reason, @UserReads = UserReads, @UserUpdates = UserUpdates,
+                               @ReadWriteRatio = ReadWriteRatio, @MaxRatio = MaxReadWriteRatio,
+                               @ReadsPerDay = ReadsPerDay, @MaxReadsPerDay = MaxReadsPerDay
+                        FROM AIIndexTuner.fn_IndexUseCheck(@ObjectId, @IndexId, @Since);
+                    END TRY
+                    BEGIN CATCH
+                        SET @UseReason = CONCAT(N'No other index covers ', QUOTENAME(@IndexName), N', and its reads could not be read from sys.dm_db_index_usage_stats ',
+                                                N'(that needs VIEW SERVER STATE or VIEW SERVER PERFORMANCE STATE), so it is not dropped for low use: ', ERROR_MESSAGE());
+                    END CATCH;
+
+                    IF @UseReason IS NOT NULL
+                        SET @Reason = @UseReason;
+                    ELSE IF @UserReads IS NULL
+                        SET @Reason = CONCAT(N'No other index covers ', QUOTENAME(@IndexName), N', and its usage could not be found, so it is not dropped for low use.');
+                    ELSE
+                        SET @Basis = CONCAT(N'Low use: ', @UserReads, N' read(s) to ', @UserUpdates, N' write(s)',
+                                            CASE WHEN @UserReads = 0 THEN N''
+                                                 ELSE CONCAT(N' (ratio ', @ReadWriteRatio, N', below ', @MaxRatio, N'; ', @ReadsPerDay, N' reads a day, below ', @MaxReadsPerDay, N')') END,
+                                            N' over ', AIIndexTuner.fn_FormatUptime(DATEDIFF(MINUTE, @Since, SYSDATETIME())), N' of usage statistics (since ',
+                                            CONVERT(varchar(19), @Since, 120), N', from ', @SinceSource, N').');
+                END;
             END;
         END;
 
@@ -476,10 +561,54 @@ BEGIN
     -- With DROP_EXISTING, the old index keeps serving queries until the new one is built.
     IF @EngineEdition IN (3, 5, 8)
         SET @Options += N', ONLINE = ON';
+
+    -- A widening keeps the options of the index it replaces (issue #46). CREATE INDEX ... WITH
+    -- (DROP_EXISTING = ON) builds the new index with the options it states and defaults for the rest,
+    -- so without this a compressed index came back uncompressed and a fill factor reset to the
+    -- server's. The recommendation's own fill factor or compression wins where it gives one, and the
+    -- note says what changed. The replaced index is not unique, filtered or partitioned (checked above).
+    DECLARE @Kept nvarchar(1000) = N'', @Changed nvarchar(1000) = N'', @WidenOptions nvarchar(400) = N'';
+    IF @IsWidening = 1
+    BEGIN
+        DECLARE @OldFillFactor tinyint, @OldPadded bit, @OldRowLocks bit, @OldPageLocks bit, @OldSeqKey bit, @OldCompression nvarchar(60);
+        SELECT @OldFillFactor = i.fill_factor, @OldPadded = i.is_padded, @OldRowLocks = i.allow_row_locks, @OldPageLocks = i.allow_page_locks,
+               @OldSeqKey = i.optimize_for_sequential_key,
+               @OldCompression = (SELECT TOP (1) p.data_compression_desc COLLATE DATABASE_DEFAULT FROM sys.partitions AS p
+                                  WHERE p.object_id = i.object_id AND p.index_id = i.index_id ORDER BY p.partition_number)
+        FROM sys.indexes AS i
+        WHERE i.object_id = @ObjectId AND i.index_id = @OldId;
+
+        IF @FillFactor IS NULL AND @OldFillFactor > 0
+            SELECT @FillFactor = @OldFillFactor, @Kept += CONCAT(N', FILLFACTOR = ', @OldFillFactor);
+        ELSE IF @FillFactor IS NOT NULL AND @FillFactor <> NULLIF(@OldFillFactor, 0)
+            SET @Changed += CONCAT(N', FILLFACTOR from ', @OldFillFactor, N' to ', @FillFactor);
+        ELSE IF @FillFactor IS NOT NULL AND ISNULL(@OldFillFactor, 0) = 0 AND @FillFactor <> 100
+            SET @Changed += CONCAT(N', FILLFACTOR from the server default to ', @FillFactor);
+
+        IF @Compression IS NULL AND @OldCompression IN (N'ROW', N'PAGE')
+            SELECT @Compression = @OldCompression, @Kept += CONCAT(N', DATA_COMPRESSION = ', @OldCompression);
+        ELSE IF @Compression IS NOT NULL AND @Compression <> ISNULL(@OldCompression, N'NONE')
+            SET @Changed += CONCAT(N', DATA_COMPRESSION from ', ISNULL(@OldCompression, N'NONE'), N' to ', @Compression);
+
+        -- Options the recommendation has no field for: always the old index's.
+        SET @WidenOptions = CONCAT(
+            CASE WHEN @OldPadded = 1 THEN N', PAD_INDEX = ON' END,
+            CASE WHEN @OldRowLocks = 0 THEN N', ALLOW_ROW_LOCKS = OFF' END,
+            CASE WHEN @OldPageLocks = 0 THEN N', ALLOW_PAGE_LOCKS = OFF' END,
+            CASE WHEN @OldSeqKey = 1 THEN N', OPTIMIZE_FOR_SEQUENTIAL_KEY = ON' END);
+        SET @Kept += @WidenOptions;
+    END;
+
     IF @IsColumnstore = 0 AND @FillFactor BETWEEN 1 AND 100
         SET @Options += CONCAT(N', FILLFACTOR = ', @FillFactor);
+    SET @Options += @WidenOptions;
     IF @IsColumnstore = 0 AND @Compression IN ('NONE', 'ROW', 'PAGE')
         SET @Options += CONCAT(N', DATA_COMPRESSION = ', @Compression);
+
+    IF @IsWidening = 1
+        SET @Note = CONCAT(@Note,
+                           CASE WHEN @Kept <> N'' THEN CONCAT(N' Kept its options: ', STUFF(@Kept, 1, 2, N''), N'.') END,
+                           CASE WHEN @Changed <> N'' THEN CONCAT(N' The recommendation changes ', STUFF(@Changed, 1, 2, N''), N'.') END);
 
     SET @Ddl = CONCAT(
         N'CREATE ',

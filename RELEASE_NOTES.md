@@ -23,6 +23,41 @@ recommendations are kept, and it replaces the procedures and functions.
 
 ### Fixed
 
+- **A low-use index drop was applied without checking the index's usage** (issue #45). With
+  `@AllowDropIndex = 1`, a `DropIndex` that no other index made redundant was applied once the
+  usage statistics covered 7 days; whether the index was little used was taken from the model. A
+  mistaken or steered recommendation could drop an index in heavy use, or a unique index. The proc
+  now reads `sys.dm_db_index_usage_stats` (new function `fn_IndexUseCheck`) and drops an index for
+  low use only when, over that period, its reads-to-writes ratio is below 5 and it has fewer than
+  1,000 reads a day, or it has no reads, and never drops a unique index for low use. `StatusReason`
+  for such a drop now reads `Low use: R read(s) to W write(s) (ratio X, below 5; Y reads a day,
+  below 1000) over ...`. The README notes that only the
+  primary replica is in scope: usage on readable secondaries has not been tested.
+- **Widening an index in place discarded its options** (issue #46). A widening is rebuilt with
+  `CREATE INDEX ... WITH (DROP_EXISTING = ON)`, which takes the options it states and defaults for
+  the rest, and it stated only the fill factor and compression the model gave. A PAGE-compressed
+  index widened with no `data_compression` came back uncompressed, and a fill factor, `PAD_INDEX`,
+  `ALLOW_ROW_LOCKS`, `ALLOW_PAGE_LOCKS` or `OPTIMIZE_FOR_SEQUENTIAL_KEY` setting reverted to the
+  default. The widening now starts from the old index's options; a fill factor or compression the
+  recommendation sets replaces the old one, and `StatusReason` lists what was kept and what changed.
+- **`setup/Configure-Endpoint.sql` left the API key in the plan cache and Query Store** (issue
+  #47). Step 0 types the key and master key password as literals in a `SELECT`, whose text SQL
+  Server does not hide, unlike `CREATE MASTER KEY` and `CREATE DATABASE SCOPED CREDENTIAL`. The
+  script's batches are now marked, and a new last step removes their cached plans
+  (`ALTER DATABASE SCOPED CONFIGURATION CLEAR PROCEDURE_CACHE <plan_handle>`, for plans compiled in
+  this database) and their Query Store queries (`sp_query_store_remove_query`), and reports what it
+  removed or why it could not. The script's header and step 3 now state that it is for the initial
+  setup only: re-running it does not change the key of an existing credential.
+- **The stored copy of each AI response was never deleted** (issue #48). The Responses API keeps
+  every response, the prompt with the collected diagnostics included, for 30 days by default. The
+  new `AIIndexTuner.usp_DeleteResponse` deletes it once `usp_InvokeModel` has read the answer or
+  stops waiting for it, in background and foreground mode. `AIIndexTuner.Run` records
+  `StoredResponseId` and `StoredResponseDeleted`; a failed delete does not fail the run, and
+  `AIIndexTuner.RunLog` says why.
+- **The README's data disclosure left out what is sent and kept** (issue #48). It now lists the
+  column values sent from statistics histograms (with no setting to leave them out), the Query
+  Store and feedback query text, the server and database names, and the copies kept at the
+  endpoint and in `AIIndexTuner.Run`.
 - **Collection failed with error 468 on a database whose collation differs from the instance's**
   (issue #42). MISSING INDEX OVERLAP SIGNALS compared the missing-index DMV columns, in the
   instance's collation, with `sys.columns.name`, in the database's. The error is not caught by the
@@ -34,6 +69,16 @@ recommendations are kept, and it replaces the procedures and functions.
 
 ### Tests
 
+- New test T31 (issue #48): a stored response that cannot be deleted (an unresolvable host) is
+  recorded on the run and in `RunLog` without failing, and a call with no response id does nothing.
+- T25 (issue #46): the widened index is PAGE-compressed with a fill factor, `PAD_INDEX` and
+  `ALLOW_PAGE_LOCKS = OFF`, and keeps them all when the recommendation sets neither fill factor nor
+  compression. A second widening that sets them uses the recommendation's values, keeps the rest,
+  and says so in `StatusReason`.
+- New test T30 (issue #45): on a table whose reads and writes it controls, `fn_IndexUseCheck`
+  refuses an index at a ratio of exactly 5 and one with reads and no writes, and allows one at 4.5
+  and one with no reads. The index at 4.5 is refused when its 9 reads fall in a 10-minute period
+  (1,296 a day) or the period is unknown. CREATE mode skips a low-use drop of a unique index.
 - The test database is created in a collation other than the instance's by default
   (`Run-All.ps1 -Collation`; `Instance` keeps the instance's). New test T1d runs collection there,
   database-wide and scoped to a table. T1, T1b and T11 now fail when collection returns NULL;
