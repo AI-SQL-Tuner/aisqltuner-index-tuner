@@ -11,6 +11,16 @@ recommendations are kept, and it replaces the procedures and functions.
 
 ### Added
 
+- **Build limits and lock handling for CREATE mode and `sp_AIIndexTuner_Apply`** (issue #49).
+  - `@MaxTableRows` and `@MaxIndexSizeMB` skip a new or widened index on a larger table, or one
+    estimated (an upper bound from the catalog) at more MB. They are stored on the run, and
+    `sp_AIIndexTuner_Apply` can pass higher ones to build it later.
+  - `@MaxMinutes` starts no change after that many minutes from the start of the call; a change
+    already running finishes, and the rest are marked `Skipped` with how to apply them later.
+  - New `AIIndexTuner.Config` settings: an online rowstore build waits at low priority for
+    `OnlineWaitMinutes` (default 5) and then gives up; a drop, an offline build or a columnstore build
+    waits at most `LockTimeoutSec` (default 30) for its locks; `BuildMaxDop` caps a build's
+    parallelism. A change that gives up is marked `Failed` with the reason.
 - **`Recommendation.ScriptWarning` flags a script that targets another table** (issue #41). In a
   Managed Instance run, a recommendation for `WO.WorkOrderStatusEvent` came with a `Script` that
   created the index `ON [WO].[WorkOrder]`. CREATE mode was not affected, since it builds its own DDL
@@ -69,6 +79,10 @@ recommendations are kept, and it replaces the procedures and functions.
 
 ### Tests
 
+- New test T32 (issue #49): the two size limits skip a build with a reason and a later call with a
+  higher limit builds it; `@MaxMinutes = 0` starts nothing; `BuildMaxDop` and `OnlineWaitMinutes`
+  reach the DDL. The lock timeout and the low-priority wait giving up need a blocking session and are
+  not tested.
 - New test T31 (issue #48): a stored response that cannot be deleted (an unresolvable host) is
   recorded on the run and in `RunLog` without failing, and a call with no response id does nothing.
 - T25 (issue #46): the widened index is PAGE-compressed with a fill factor, `PAD_INDEX` and

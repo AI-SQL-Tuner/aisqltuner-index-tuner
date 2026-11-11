@@ -2,6 +2,26 @@ SET ANSI_NULLS ON;
 SET QUOTED_IDENTIFIER ON;
 GO
 /*
+    AIIndexTuner.usp_SkipForMaxMinutes: marks a recommendation that was not started because the call's
+    @MaxMinutes was reached (issue #49), with how to apply it later. Only one still Recommended is
+    marked: an earlier Skipped or Failed result, and its reason, stays as the last attempt left it.
+*/
+CREATE OR ALTER PROCEDURE AIIndexTuner.usp_SkipForMaxMinutes
+    @RecommendationId int,
+    @MaxMinutes       int,
+    @CallStarted      datetime2(3)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    UPDATE AIIndexTuner.Recommendation
+    SET Status = 'Skipped',
+        StatusReason = CONCAT(N'Not started: the limit of ', @MaxMinutes, N' minute(s) for this call (@MaxMinutes) was reached; the call started at ',
+                              CONVERT(varchar(19), @CallStarted, 120), N'. Apply it later with sp_AIIndexTuner_Apply @RecommendationId = ', @RecommendationId, N'.')
+    WHERE RecommendationId = @RecommendationId AND Status = 'Recommended';
+END;
+GO
+
+/*
     dbo.sp_AIIndexTuner: AI-assisted index tuning from inside SQL Server.
 
         EXEC dbo.sp_AIIndexTuner;                                      -- whole database, recommend only
@@ -39,6 +59,18 @@ GO
     A recommendation the model gave no level counts as Low. sp_AIIndexTuner_Apply can apply a
     skipped one after review, with a lower minimum.
 
+    Build limits (issue #49; enforced when applying, the prompt is unchanged):
+        @MaxTableRows       skip a new or widened index on a table with more rows than this.
+        @MaxIndexSizeMB     skip a new or widened index estimated (an upper bound, from the columns'
+                            declared widths) at more MB than this.
+        @MaxMinutes         start no change after this many minutes from the start of this call; one
+                            already running finishes. The ones not started are marked Skipped with how
+                            to apply them later. 0 starts none. Collection and the AI call are not
+                            limited by it.
+    NULL (the default) is no limit. sp_AIIndexTuner_Apply takes the same three; its size limits replace
+    the run's. How builds and drops wait for locks, and their MAXDOP, are set in AIIndexTuner.Config
+    (LockTimeoutSec, OnlineWaitMinutes, BuildMaxDop).
+
     Testing and troubleshooting:
         @CollectOnly = 1    returns the collected data and the system prompt; no AI call, no run row.
         @TestResponse = N'{...}'
@@ -66,11 +98,15 @@ CREATE OR ALTER PROCEDURE dbo.sp_AIIndexTuner
     @MaxNewIndexes    int = NULL,
     @MinPriority      varchar(10) = NULL,
     @MinConfidence    varchar(10) = NULL,
-    @Logging          bit = NULL
+    @Logging          bit = NULL,
+    @MaxTableRows     bigint = NULL,
+    @MaxIndexSizeMB   int = NULL,
+    @MaxMinutes       int = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF;
+    DECLARE @CallStarted datetime2(3) = SYSDATETIME();   -- for @MaxMinutes
 
     SET @Mode = UPPER(LTRIM(RTRIM(@Mode)));
     SET @SchemaName = NULLIF(LTRIM(RTRIM(@SchemaName)), N'');
@@ -97,6 +133,8 @@ BEGIN
 
     IF @MaxNewIndexes < 0
         THROW 50209, N'@MaxNewIndexes must be 0 or more, or NULL for no limit.', 1;
+    IF @MaxTableRows <= 0 OR @MaxIndexSizeMB <= 0 OR @MaxMinutes < 0
+        THROW 50215, N'@MaxTableRows and @MaxIndexSizeMB must be more than 0, and @MaxMinutes 0 or more, or NULL for no limit.', 1;
     IF (@MinPriority IS NOT NULL AND AIIndexTuner.fn_LevelRank(@MinPriority) IS NULL)
        OR (@MinConfidence IS NOT NULL AND AIIndexTuner.fn_LevelRank(@MinConfidence) IS NULL)
         THROW 50210, N'@MinPriority and @MinConfidence must be High, Medium or Low, or NULL for no minimum.', 1;
@@ -158,14 +196,14 @@ BEGIN
 
     DECLARE @RunId int;
     INSERT AIIndexTuner.Run (Mode, SchemaName, TableName, Endpoint, Deployment, ApiShape, ReasoningEffort, SystemPromptHash,
-                             AllowColumnstore, AllowDropIndex, MaxNewIndexes, MinPriority, MinConfidence)
+                             AllowColumnstore, AllowDropIndex, MaxNewIndexes, MinPriority, MinConfidence, MaxTableRows, MaxIndexSizeMB)
     VALUES (@Mode, @SchemaName, @TableName,
             CASE WHEN @TestResponse IS NULL THEN @Endpoint END,
             CASE WHEN @TestResponse IS NULL THEN @Deployment END,
             CASE WHEN @TestResponse IS NULL THEN 'OpenAIResponses' ELSE 'Test' END,
             CASE WHEN @TestResponse IS NULL THEN @Effort END,
             CONVERT(char(64), HASHBYTES('SHA2_256', @SystemPrompt), 2),
-            @AllowColumnstore, @AllowDropIndex, @MaxNewIndexes, @MinPriority, @MinConfidence);
+            @AllowColumnstore, @AllowDropIndex, @MaxNewIndexes, @MinPriority, @MinConfidence, @MaxTableRows, @MaxIndexSizeMB);
     SET @RunId = SCOPE_IDENTITY();
 
     BEGIN TRY
@@ -298,6 +336,14 @@ BEGIN
         FETCH NEXT FROM apply_cur INTO @RecId;
         WHILE @@FETCH_STATUS = 0
         BEGIN
+            -- @MaxMinutes (issue #49): once it is reached, nothing more starts; what is running has finished.
+            IF @MaxMinutes IS NOT NULL AND SYSDATETIME() >= DATEADD(MINUTE, @MaxMinutes, @CallStarted)
+            BEGIN
+                EXEC AIIndexTuner.usp_SkipForMaxMinutes @RecId, @MaxMinutes, @CallStarted;
+                FETCH NEXT FROM apply_cur INTO @RecId;
+                CONTINUE;
+            END;
+
             SET @ApplyStep = (SELECT LEFT(CONCAT(N'Apply ', Category, N' ', IndexName, N' (recommendation ', RecommendationId, N')'), 128)
                               FROM AIIndexTuner.Recommendation WHERE RecommendationId = @RecId);
             EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, @ApplyStep, @LogId = @ApplyLogId OUTPUT, @CharsAtStart = @ApplyLogChars OUTPUT;
@@ -357,6 +403,9 @@ GO
 
     @MinPriority and @MinConfidence (High, Medium or Low) replace the run's minimums when given, so
     'Low' applies a recommendation the run's minimums held back for review. When NULL, the run's apply.
+
+    @MaxTableRows and @MaxIndexSizeMB replace the run's size limits when given. @MaxMinutes starts no
+    change after that many minutes from the start of this call (see sp_AIIndexTuner).
 */
 CREATE OR ALTER PROCEDURE dbo.sp_AIIndexTuner_Apply
     @RecommendationId int = NULL,
@@ -365,15 +414,21 @@ CREATE OR ALTER PROCEDURE dbo.sp_AIIndexTuner_Apply
     @AllowDropIndex   bit = NULL,
     @MaxNewIndexes    int = NULL,
     @MinPriority      varchar(10) = NULL,
-    @MinConfidence    varchar(10) = NULL
+    @MinConfidence    varchar(10) = NULL,
+    @MaxTableRows     bigint = NULL,
+    @MaxIndexSizeMB   int = NULL,
+    @MaxMinutes       int = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
+    DECLARE @CallStarted datetime2(3) = SYSDATETIME();   -- for @MaxMinutes
 
     IF (@RecommendationId IS NULL AND @RunId IS NULL) OR (@RecommendationId IS NOT NULL AND @RunId IS NOT NULL)
         THROW 50301, N'Pass either @RecommendationId or @RunId.', 1;
     IF @MaxNewIndexes < 0
         THROW 50302, N'@MaxNewIndexes must be 0 or more, or NULL for no limit.', 1;
+    IF @MaxTableRows <= 0 OR @MaxIndexSizeMB <= 0 OR @MaxMinutes < 0
+        THROW 50304, N'@MaxTableRows and @MaxIndexSizeMB must be more than 0, and @MaxMinutes 0 or more, or NULL for the run''s limits / no limit.', 1;
     IF (@MinPriority IS NOT NULL AND AIIndexTuner.fn_LevelRank(@MinPriority) IS NULL)
        OR (@MinConfidence IS NOT NULL AND AIIndexTuner.fn_LevelRank(@MinConfidence) IS NULL)
         THROW 50303, N'@MinPriority and @MinConfidence must be High, Medium or Low, or NULL for the run''s minimums.', 1;
@@ -404,9 +459,13 @@ BEGIN
     FETCH NEXT FROM apply_cur INTO @Id;
     WHILE @@FETCH_STATUS = 0
     BEGIN
-        EXEC AIIndexTuner.usp_ApplyRecommendation @RecommendationId = @Id, @AllowColumnstore = @AllowColumnstore,
-                                                  @AllowDropIndex = @AllowDropIndex, @MaxNewIndexes = @MaxNewIndexes,
-                                                  @MinPriority = @MinPriority, @MinConfidence = @MinConfidence;
+        IF @MaxMinutes IS NOT NULL AND SYSDATETIME() >= DATEADD(MINUTE, @MaxMinutes, @CallStarted)
+            EXEC AIIndexTuner.usp_SkipForMaxMinutes @Id, @MaxMinutes, @CallStarted;
+        ELSE
+            EXEC AIIndexTuner.usp_ApplyRecommendation @RecommendationId = @Id, @AllowColumnstore = @AllowColumnstore,
+                                                      @AllowDropIndex = @AllowDropIndex, @MaxNewIndexes = @MaxNewIndexes,
+                                                      @MinPriority = @MinPriority, @MinConfidence = @MinConfidence,
+                                                      @MaxTableRows = @MaxTableRows, @MaxIndexSizeMB = @MaxIndexSizeMB;
         FETCH NEXT FROM apply_cur INTO @Id;
     END;
     CLOSE apply_cur;

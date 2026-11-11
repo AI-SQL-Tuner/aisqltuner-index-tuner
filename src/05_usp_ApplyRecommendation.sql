@@ -123,6 +123,15 @@ GO
     caller can pass the same settings: 0 from either side blocks a change, and 1 from either side
     allows one that the other left NULL (recommend-only). @MaxNewIndexes uses the lower limit.
 
+    Size limits (issue #49): @MaxTableRows and @MaxIndexSizeMB skip a new or widened index on a table with
+    more rows, or whose size estimated from the catalog is larger. The caller's value replaces the run's
+    (sp_AIIndexTuner @MaxTableRows, @MaxIndexSizeMB), so a skipped one can be built later with a higher limit.
+
+    Locks and CPUs (issue #49, AIIndexTuner.Config): an online rowstore build waits at low priority for
+    OnlineWaitMinutes and then gives up rather than block the workload; a drop, an offline build and a
+    columnstore build wait at most LockTimeoutSec for their locks; BuildMaxDop, when set, caps a build's
+    parallelism. A change that gives up is marked Failed with the reason, and can be applied again.
+
     Apply thresholds: @MinPriority and @MinConfidence (High, Medium or Low) skip a recommendation
     whose priority level or confidence is below them; one the model gave no level counts as Low.
     The caller's value replaces the run's (sp_AIIndexTuner @MinPriority, @MinConfidence), so a
@@ -148,7 +157,9 @@ CREATE OR ALTER PROCEDURE AIIndexTuner.usp_ApplyRecommendation
     @AllowDropIndex   bit = NULL,
     @MaxNewIndexes    int = NULL,
     @MinPriority      varchar(10) = NULL,
-    @MinConfidence    varchar(10) = NULL
+    @MinConfidence    varchar(10) = NULL,
+    @MaxTableRows     bigint = NULL,
+    @MaxIndexSizeMB   int = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -157,14 +168,16 @@ BEGIN
             @IndexType varchar(30), @KeyColumns nvarchar(max), @IncludeColumns nvarchar(max), @Filter nvarchar(4000), @IsUnique bit,
             @FillFactor tinyint, @Compression varchar(10), @RunId int, @PriorityLevel varchar(10), @Confidence varchar(10),
             @ReplacesIndex sysname, @Script nvarchar(max),
-            @RunColumnstore bit, @RunDropIndex bit, @RunMaxNew int, @RunMinPriority varchar(10), @RunMinConfidence varchar(10);
+            @RunColumnstore bit, @RunDropIndex bit, @RunMaxNew int, @RunMinPriority varchar(10), @RunMinConfidence varchar(10),
+            @RunMaxTableRows bigint, @RunMaxIndexSizeMB int;
 
     SELECT @Category = r.Category, @Status = r.Status, @SchemaName = r.SchemaName, @TableName = r.TableName, @IndexName = r.IndexName,
            @IndexType = r.IndexType, @KeyColumns = r.KeyColumns, @IncludeColumns = r.IncludeColumns, @Filter = r.FilterPredicate,
            @IsUnique = r.IsUnique, @FillFactor = r.[FillFactor], @Compression = r.DataCompression, @RunId = r.RunId,
            @PriorityLevel = r.PriorityLevel, @Confidence = r.Confidence, @ReplacesIndex = NULLIF(LTRIM(r.ReplacesIndex), N''), @Script = r.Script,
            @RunColumnstore = run.AllowColumnstore, @RunDropIndex = run.AllowDropIndex, @RunMaxNew = run.MaxNewIndexes,
-           @RunMinPriority = run.MinPriority, @RunMinConfidence = run.MinConfidence
+           @RunMinPriority = run.MinPriority, @RunMinConfidence = run.MinConfidence,
+           @RunMaxTableRows = run.MaxTableRows, @RunMaxIndexSizeMB = run.MaxIndexSizeMB
     FROM AIIndexTuner.Recommendation AS r
     INNER JOIN AIIndexTuner.Run AS run ON run.RunId = r.RunId
     WHERE r.RecommendationId = @RecommendationId;
@@ -184,7 +197,18 @@ BEGIN
                                  WHEN @MaxNewIndexes IS NULL OR @RunMaxNew < @MaxNewIndexes THEN @RunMaxNew
                                  ELSE @MaxNewIndexes END,
            @MinPriority = ISNULL(@MinPriority, @RunMinPriority),
-           @MinConfidence = ISNULL(@MinConfidence, @RunMinConfidence);
+           @MinConfidence = ISNULL(@MinConfidence, @RunMinConfidence),
+           -- Size limits (issue #49) work like the apply thresholds: the caller's value replaces the run's, so
+           -- an index held back by a run's limit can be built later, in a maintenance window, with a higher one.
+           @MaxTableRows = ISNULL(@MaxTableRows, @RunMaxTableRows),
+           @MaxIndexSizeMB = ISNULL(@MaxIndexSizeMB, @RunMaxIndexSizeMB);
+
+    -- How a change waits for its locks and how many CPUs a build may use (issue #49). No configuration row
+    -- (as in the tests' canned runs) leaves all three unset.
+    DECLARE @LockTimeoutSec int, @OnlineWaitMinutes int, @BuildMaxDop tinyint;
+    SELECT @LockTimeoutSec = LockTimeoutSec, @OnlineWaitMinutes = OnlineWaitMinutes, @BuildMaxDop = BuildMaxDop
+    FROM AIIndexTuner.Config WHERE ConfigId = 1;
+    DECLARE @LockTimeoutMs int = @LockTimeoutSec * 1000;
 
     -- A widening builds a new index from the same fields as CreateIndex, under the replaced index's name.
     DECLARE @IsWidening bit = CASE WHEN @Category = 'ConsolidateIndex' AND @ReplacesIndex IS NOT NULL THEN 1 ELSE 0 END;
@@ -384,12 +408,18 @@ BEGIN
 
         SET @Ddl = CONCAT(N'DROP INDEX ', QUOTENAME(@IndexName), N' ON ', @Target, N';');
 
+        -- A drop needs a schema modification lock. Behind a long transaction it would otherwise wait, and
+        -- queue every later query on the table behind it, without limit (issue #49).
+        -- SET LOCK_TIMEOUT runs in the same dynamic batch as the DDL; SQL Server restores it when the batch returns.
+        DECLARE @DropExec nvarchar(max) = CONCAT(CASE WHEN @LockTimeoutMs IS NOT NULL THEN CONCAT(N'SET LOCK_TIMEOUT ', @LockTimeoutMs, N'; ') END, @Ddl);
         BEGIN TRY
-            EXEC sys.sp_executesql @Ddl;
+            EXEC sys.sp_executesql @DropExec;
         END TRY
         BEGIN CATCH
             UPDATE AIIndexTuner.Recommendation
-            SET Status = 'Failed', StatusReason = ERROR_MESSAGE(), AppliedDDL = @Ddl
+            SET Status = 'Failed', AppliedDDL = @Ddl,
+                StatusReason = LEFT(CONCAT(ERROR_MESSAGE(), CASE WHEN ERROR_NUMBER() = 1222 AND @LockTimeoutSec IS NOT NULL
+                    THEN CONCAT(N' The drop waited ', @LockTimeoutSec, N' seconds (AIIndexTuner.Config.LockTimeoutSec) for its lock. Apply it again when the table is quieter.') END), 4000)
             WHERE RecommendationId = @RecommendationId;
             RETURN;
         END CATCH;
@@ -526,6 +556,48 @@ BEGIN
             SET @Reason = CONCAT(N'Existing index ', QUOTENAME(@Covering), N' already has these leading keys and covers the included columns.');
     END;
 
+    -- Size limits (issue #49): the table's rows, and the new index's size estimated from the catalog. The
+    -- estimate is an upper bound: rows times the declared width of the index's columns (key, included and
+    -- the row locator: the clustered index key, or an 8-byte RID on a heap), a variable-length column at its
+    -- declared maximum and a (max) column at 8,000 bytes, plus 9 bytes of row overhead. A clustered
+    -- columnstore index counts every column, uncompressed. Real indexes are usually smaller.
+    DECLARE @TableRows bigint, @EstimatedMB decimal(18, 1);
+    IF @Reason IS NULL AND (@MaxTableRows IS NOT NULL OR @MaxIndexSizeMB IS NOT NULL)
+    BEGIN
+        DECLARE @SizeColumns TABLE (column_id int PRIMARY KEY);
+        IF @IndexType = 'CLUSTERED COLUMNSTORE'
+            INSERT @SizeColumns (column_id) SELECT column_id FROM sys.columns WHERE object_id = @ObjectId;
+        ELSE
+        BEGIN
+            INSERT @SizeColumns (column_id) SELECT column_id FROM @Keys UNION SELECT column_id FROM @Includes;
+            INSERT @SizeColumns (column_id)
+            SELECT ic.column_id
+            FROM sys.indexes AS i
+            INNER JOIN sys.index_columns AS ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+            WHERE i.object_id = @ObjectId AND i.type = 1 AND ic.key_ordinal > 0
+              AND ic.column_id NOT IN (SELECT column_id FROM @SizeColumns);
+        END;
+
+        SET @TableRows = ISNULL((SELECT SUM(row_count) FROM sys.dm_db_partition_stats WHERE object_id = @ObjectId AND index_id IN (0, 1)), 0);
+        -- decimal(38, 0) before multiplying: rows times bytes can pass the bigint maximum on a very large, wide table.
+        SET @EstimatedMB = CAST(CAST(@TableRows AS decimal(38, 0)) * (
+                9 + ISNULL((SELECT SUM(CAST(CASE WHEN c.max_length = -1 THEN 8000 ELSE c.max_length END AS bigint))
+                            FROM @SizeColumns AS sc INNER JOIN sys.columns AS c ON c.object_id = @ObjectId AND c.column_id = sc.column_id), 0)
+                  + CASE WHEN @IndexType <> 'CLUSTERED COLUMNSTORE'
+                              AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = @ObjectId AND type = 1) THEN 8 ELSE 0 END
+            ) / 1048576.0 AS decimal(18, 1));
+
+        IF @MaxTableRows IS NOT NULL AND @TableRows > @MaxTableRows
+            SET @Reason = CONCAT(@Target, N' has ', FORMAT(@TableRows, 'N0', 'en-US'), N' rows, more than the limit of ', FORMAT(@MaxTableRows, 'N0', 'en-US'),
+                                 N' (@MaxTableRows). Build it when there is time for it: apply it with sp_AIIndexTuner_Apply @RecommendationId = ', @RecommendationId,
+                                 N', @MaxTableRows = <a higher limit>.');
+        ELSE IF @MaxIndexSizeMB IS NOT NULL AND @EstimatedMB > @MaxIndexSizeMB
+            SET @Reason = CONCAT(N'The new index is estimated at up to ', FORMAT(@EstimatedMB, 'N1', 'en-US'), N' MB (', FORMAT(@TableRows, 'N0', 'en-US'),
+                                 N' rows at the columns'' declared widths), more than the limit of ', FORMAT(@MaxIndexSizeMB, 'N0', 'en-US'),
+                                 N' MB (@MaxIndexSizeMB). Build it when there is time for it: apply it with sp_AIIndexTuner_Apply @RecommendationId = ', @RecommendationId,
+                                 N', @MaxIndexSizeMB = <a higher limit>.');
+    END;
+
     -- Name: a widening keeps the replaced index's, so hints and plans that name it still work.
     DECLARE @Note nvarchar(4000) = NULL;
     IF @Reason IS NULL AND @IsWidening = 1
@@ -559,8 +631,16 @@ BEGIN
 
     -- Online index operations: Enterprise (and Developer), Azure SQL Database and Managed Instance.
     -- With DROP_EXISTING, the old index keeps serving queries until the new one is built.
-    IF @EngineEdition IN (3, 5, 8)
+    -- A rowstore build that may wait at low priority does so (issue #49): blocked for OnlineWaitMinutes when it
+    -- needs its brief S or Sch-M lock, it gives up (ABORT_AFTER_WAIT = SELF) rather than queue the workload
+    -- behind it. Columnstore builds and offline builds use LOCK_TIMEOUT instead (below).
+    DECLARE @LowPriority bit = CASE WHEN @EngineEdition IN (3, 5, 8) AND @IsColumnstore = 0 AND @OnlineWaitMinutes > 0 THEN 1 ELSE 0 END;
+    IF @LowPriority = 1
+        SET @Options += CONCAT(N', ONLINE = ON (WAIT_AT_LOW_PRIORITY (MAX_DURATION = ', @OnlineWaitMinutes, N' MINUTES, ABORT_AFTER_WAIT = SELF))');
+    ELSE IF @EngineEdition IN (3, 5, 8)
         SET @Options += N', ONLINE = ON';
+    IF @BuildMaxDop IS NOT NULL
+        SET @Options += CONCAT(N', MAXDOP = ', @BuildMaxDop);
 
     -- A widening keeps the options of the index it replaces (issue #46). CREATE INDEX ... WITH
     -- (DROP_EXISTING = ON) builds the new index with the options it states and defaults for the rest,
@@ -631,12 +711,21 @@ BEGIN
     SET @Undo = CASE WHEN @IsWidening = 1 THEN AIIndexTuner.fn_IndexDefinition(@ObjectId, @OldId, 1)
                      ELSE CONCAT(N'DROP INDEX ', QUOTENAME(@IndexName), N' ON ', @Target, N';') END;
 
+    -- SET LOCK_TIMEOUT runs in the same dynamic batch as the DDL; SQL Server restores it when the batch returns.
+    DECLARE @BuildExec nvarchar(max) = CONCAT(CASE WHEN @LowPriority = 0 AND @LockTimeoutMs IS NOT NULL
+                                                   THEN CONCAT(N'SET LOCK_TIMEOUT ', @LockTimeoutMs, N'; ') END, @Ddl);
     BEGIN TRY
-        EXEC sys.sp_executesql @Ddl;
+        EXEC sys.sp_executesql @BuildExec;
     END TRY
     BEGIN CATCH
         UPDATE AIIndexTuner.Recommendation
-        SET Status = 'Failed', StatusReason = ERROR_MESSAGE(), AppliedDDL = @Ddl
+        SET Status = 'Failed', AppliedDDL = @Ddl,
+            -- Error 1222 for both ways of giving up: the lock timeout, and the end of a low-priority wait (ABORT_AFTER_WAIT = SELF).
+            StatusReason = LEFT(CONCAT(ERROR_MESSAGE(), CASE WHEN ERROR_NUMBER() = 1222 AND @LowPriority = 1
+                THEN CONCAT(N' The online build waited ', @OnlineWaitMinutes, N' minute(s) at low priority (AIIndexTuner.Config.OnlineWaitMinutes) for its lock, then gave up rather than block the workload. Apply it again when the table is quieter.')
+                -- Only when this tool set the timeout: a caller's own SET LOCK_TIMEOUT also raises 1222.
+                WHEN ERROR_NUMBER() = 1222 AND @LockTimeoutSec IS NOT NULL AND @LowPriority = 0
+                THEN CONCAT(N' The build waited ', @LockTimeoutSec, N' seconds (AIIndexTuner.Config.LockTimeoutSec) for its lock. Apply it again when the table is quieter.') END), 4000)
         WHERE RecommendationId = @RecommendationId;
         RETURN;
     END CATCH;
