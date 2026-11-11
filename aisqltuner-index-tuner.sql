@@ -3210,7 +3210,8 @@ BEGIN
         END;
 
         SET @TableRows = ISNULL((SELECT SUM(row_count) FROM sys.dm_db_partition_stats WHERE object_id = @ObjectId AND index_id IN (0, 1)), 0);
-        SET @EstimatedMB = CAST(@TableRows * (
+        -- decimal(38, 0) before multiplying: rows times bytes can pass the bigint maximum on a very large, wide table.
+        SET @EstimatedMB = CAST(CAST(@TableRows AS decimal(38, 0)) * (
                 9 + ISNULL((SELECT SUM(CAST(CASE WHEN c.max_length = -1 THEN 8000 ELSE c.max_length END AS bigint))
                             FROM @SizeColumns AS sc INNER JOIN sys.columns AS c ON c.object_id = @ObjectId AND c.column_id = sc.column_id), 0)
                   + CASE WHEN @IndexType <> 'CLUSTERED COLUMNSTORE'
