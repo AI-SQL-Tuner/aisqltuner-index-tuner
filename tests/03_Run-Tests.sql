@@ -1624,5 +1624,141 @@ IF (SELECT definition FROM sys.default_constraints WHERE name = N'DF_AIIndexTune
 PRINT 'PASS T32: @MaxIndexSizeMB and @MaxTableRows skip builds with a reason and a later call can lift them; @MaxMinutes = 0 starts nothing; BuildMaxDop and OnlineWaitMinutes reach the DDL';
 GO
 
+/* ===== T33: the AI call survives transient failures, cancels what it gives up on, and runs left Running are marked Abandoned (issue #50) =====
+   The endpoint is not reachable here, so the retry and error rules are checked through fn_RetryDelaySec and
+   fn_ResponseError with canned sp_invoke_external_rest_endpoint answers, and the network paths through a host
+   that does not resolve. */
+-- Retry rules: a poll is retried on no response and on 408/429/5xx, the request only on 429 and 503;
+-- 2, 4, 8 seconds, then no more; Retry-After (any case) or retry-after-ms is honoured, but not past 60 seconds.
+DECLARE @Headers nvarchar(max) = N'{"response":{"status":{"http":{"code":429}},"headers":{"RETRY-AFTER":"7"}},"result":{}}';
+IF AIIndexTuner.fn_RetryDelaySec('GET', NULL, NULL, 1) <> 2
+   OR AIIndexTuner.fn_RetryDelaySec('GET', NULL, NULL, 3) <> 8
+   OR AIIndexTuner.fn_RetryDelaySec('GET', NULL, NULL, 4) IS NOT NULL
+   OR AIIndexTuner.fn_RetryDelaySec('GET', 502, N'{"response":{"status":{"http":{"code":502}}}}', 2) <> 4
+   OR AIIndexTuner.fn_RetryDelaySec('GET', 404, N'{}', 1) IS NOT NULL
+   OR AIIndexTuner.fn_RetryDelaySec('GET', 401, N'{}', 1) IS NOT NULL
+   OR AIIndexTuner.fn_RetryDelaySec('POST', 429, @Headers, 1) <> 7
+   OR AIIndexTuner.fn_RetryDelaySec('POST', 503, N'{"response":{"headers":{"retry-after-ms":"1500"}}}', 1) <> 2
+   OR AIIndexTuner.fn_RetryDelaySec('POST', 429, N'{"response":{"headers":{"Retry-After":"Wed, 21 Oct 2026 07:28:00 GMT"}}}', 2) <> 4
+   OR AIIndexTuner.fn_RetryDelaySec('POST', 429, N'{"response":{"headers":{"Retry-After":"120"}}}', 1) IS NOT NULL
+   OR AIIndexTuner.fn_RetryDelaySec('POST', 500, N'{}', 1) IS NOT NULL
+   OR AIIndexTuner.fn_RetryDelaySec('POST', NULL, NULL, 1) IS NOT NULL
+   OR AIIndexTuner.fn_RetryDelaySec('GET', 500, N'not json', 1) <> 2
+    THROW 50999, N'FAIL T33: fn_RetryDelaySec retried the wrong failures or waited the wrong time.', 1;
+
+-- An incomplete response names its reason; max_output_tokens is left to the Truncated path.
+IF AIIndexTuner.fn_ResponseError(N'{"result":{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}}')
+       NOT LIKE N'The AI response is incomplete: content\_filter. The deployment''s content filter%' ESCAPE N'\'
+   OR AIIndexTuner.fn_ResponseError(N'{"result":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}') IS NOT NULL
+   OR AIIndexTuner.fn_ResponseError(N'{"result":{"status":"incomplete"}}') <> N'The AI response is incomplete: (no reason given).'
+   OR AIIndexTuner.fn_ResponseError(N'{"result":{"status":"failed","error":{"message":"boom"}}}') <> N'The AI response failed: boom'
+   OR AIIndexTuner.fn_ResponseError(N'{"result":{"status":"completed"}}') IS NOT NULL
+    THROW 50999, N'FAIL T33: fn_ResponseError did not report a failed or incomplete response as expected.', 1;
+
+-- A poll with no response is retried within the deadline: one retry (2 s) fits in 3 s, the next (4 s) does not.
+DECLARE @Response nvarchar(max), @HttpCode int, @Ok bit, @Retries int;
+DECLARE @Deadline datetime2(0) = DATEADD(SECOND, 3, SYSDATETIME());
+EXEC AIIndexTuner.usp_CallEndpoint @Url = N'https://aiindextuner-t33.invalid/openai/v1/responses/resp_t33', @Method = 'GET',
+     @Credential = N'https://aiindextuner-t33.invalid', @Timeout = 5, @Deadline = @Deadline,
+     @Response = @Response OUTPUT, @HttpCode = @HttpCode OUTPUT, @Ok = @Ok OUTPUT, @Retries = @Retries OUTPUT;
+IF @Ok <> 0 OR @HttpCode IS NOT NULL OR @Retries <> 1 OR ISJSON(@Response) = 0 OR JSON_VALUE(@Response, '$.result.error.message') IS NULL
+BEGIN
+    SELECT @Ok AS Ok, @HttpCode AS HttpCode, @Retries AS Retries, @Response AS Response;
+    THROW 50999, N'FAIL T33: a failed poll was not retried once within a 3 second deadline, or its error was not returned as JSON (see the result set above).', 1;
+END;
+
+-- A cancel that fails does not throw, and is logged.
+INSERT AIIndexTuner.Run (Mode) VALUES ('RECOMMEND');
+DECLARE @RunId int = SCOPE_IDENTITY();
+EXEC AIIndexTuner.usp_CancelResponse @Url = N'https://aiindextuner-t33.invalid/openai/v1/responses', @ResponseId = N'resp_t33',
+     @Credential = N'https://aiindextuner-t33.invalid', @Timeout = 5, @RunId = @RunId, @Logging = 1;
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.RunLog WHERE RunId = @RunId AND Collector = N'AI response cancel' AND EndTime IS NOT NULL
+                 AND Message LIKE N'Could not cancel response resp\_t33: HTTP (no response): %' ESCAPE N'\')
+BEGIN
+    SELECT Collector, EndTime, Message FROM AIIndexTuner.RunLog WHERE RunId = @RunId;
+    THROW 50999, N'FAIL T33: a failed cancel was not logged (see the result set above).', 1;
+END;
+DELETE AIIndexTuner.RunLog WHERE RunId = @RunId;
+DELETE AIIndexTuner.Run WHERE RunId = @RunId;
+
+-- MaxWaitSec must be at least 1; a request with no response is not retried and fails with 50003.
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Config)
+BEGIN
+    DECLARE @Err int = 0;
+    BEGIN TRY
+        INSERT AIIndexTuner.Config (ConfigId, Endpoint, Deployment, CredentialName, MaxWaitSec)
+        VALUES (1, N'https://aiindextuner-t33.invalid/', N't33', N'https://aiindextuner-t33.invalid', 0);
+    END TRY
+    BEGIN CATCH
+        SET @Err = ERROR_NUMBER();
+    END CATCH;
+    IF @Err <> 547
+    BEGIN
+        DELETE AIIndexTuner.Config;
+        THROW 50999, N'FAIL T33: MaxWaitSec = 0 was accepted.', 1;
+    END;
+
+    INSERT AIIndexTuner.Config (ConfigId, Endpoint, Deployment, CredentialName)
+    VALUES (1, N'https://aiindextuner-t33.invalid/', N't33', N'https://aiindextuner-t33.invalid');
+    DECLARE @Text nvarchar(max), @ModelUsed nvarchar(128), @InputTokens int, @OutputTokens int, @Truncated bit, @Raw nvarchar(max), @Msg nvarchar(4000);
+    SET @Err = 0;
+    BEGIN TRY
+        EXEC AIIndexTuner.usp_InvokeModel @SystemPrompt = N's', @UserPrompt = N'u', @Text = @Text OUTPUT, @ModelUsed = @ModelUsed OUTPUT,
+             @InputTokens = @InputTokens OUTPUT, @OutputTokens = @OutputTokens OUTPUT, @Truncated = @Truncated OUTPUT, @RawResponse = @Raw OUTPUT;
+    END TRY
+    BEGIN CATCH
+        SELECT @Err = ERROR_NUMBER(), @Msg = ERROR_MESSAGE();
+    END CATCH;
+    DELETE AIIndexTuner.Config;
+    IF @Err <> 50003 OR @Msg NOT LIKE N'The AI endpoint returned HTTP (no response): %' OR @Msg LIKE N'%retries)'
+    BEGIN
+        SELECT @Err AS ErrorNumber, @Msg AS ErrorMessage;
+        THROW 50999, N'FAIL T33: a request with no response did not fail once with 50003 (see the result set above).', 1;
+    END;
+END
+ELSE
+    PRINT 'SKIP T33 MaxWaitSec check and request failure: AIIndexTuner.Config has a row';
+GO
+
+-- Runs left Running: by this session (a client-side timeout), by a session that is gone, and from before
+-- sessions were recorded and over a day old are marked Abandoned by the next run; a run whose session is
+-- still running a request, and a recent one with no session, are left alone.
+DECLARE @MyLogin datetime = (SELECT login_time FROM sys.dm_exec_sessions WHERE session_id = @@SPID),
+        @LiveSession smallint, @LiveLogin datetime;
+SELECT TOP (1) @LiveSession = s.session_id, @LiveLogin = s.login_time
+FROM sys.dm_exec_requests AS q
+INNER JOIN sys.dm_exec_sessions AS s ON s.session_id = q.session_id
+WHERE q.session_id <> @@SPID
+ORDER BY s.session_id;
+
+INSERT AIIndexTuner.Run (Mode, SessionId, SessionLoginTime, StoredResponseId, TableName) VALUES ('RECOMMEND', @@SPID, @MyLogin, N'resp_t33a', N'T33A');
+DECLARE @RunA int = SCOPE_IDENTITY();
+INSERT AIIndexTuner.RunLog (RunId, Collector, StartTime) VALUES (@RunA, N'AI response', SYSDATETIME());
+INSERT AIIndexTuner.Run (Mode, SessionId, SessionLoginTime, TableName) VALUES ('RECOMMEND', 32000, '20000101', N'T33B');
+INSERT AIIndexTuner.Run (Mode, StartedAt, TableName) VALUES ('RECOMMEND', DATEADD(DAY, -2, SYSDATETIME()), N'T33D');
+INSERT AIIndexTuner.Run (Mode, TableName) VALUES ('RECOMMEND', N'T33E');
+IF @LiveSession IS NOT NULL
+    INSERT AIIndexTuner.Run (Mode, SessionId, SessionLoginTime, TableName) VALUES ('RECOMMEND', @LiveSession, @LiveLogin, N'T33C');
+
+EXEC dbo.sp_AIIndexTuner @CollectedData = N'{"t33": true}', @TestResponse = N'{ "summary": "T33.", "recommendations": [] }';
+DECLARE @NewRun int = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
+
+IF (SELECT COUNT(*) FROM AIIndexTuner.Run WHERE TableName IN (N'T33A', N'T33B', N'T33D') AND Status = 'Abandoned' AND CompletedAt IS NOT NULL) <> 3
+   OR EXISTS (SELECT 1 FROM AIIndexTuner.Run WHERE TableName IN (N'T33C', N'T33E') AND Status <> 'Running')
+   OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.Run WHERE RunId = @RunA AND ErrorMessage LIKE N'Abandoned: %resp\_t33a/cancel%' ESCAPE N'\')
+   OR EXISTS (SELECT 1 FROM AIIndexTuner.RunLog WHERE RunId = @RunA AND (EndTime IS NULL OR Message NOT LIKE N'Abandoned: %'))
+   OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.Run WHERE RunId = @NewRun AND Status = 'Succeeded' AND SessionId = @@SPID AND SessionLoginTime = @MyLogin)
+BEGIN
+    SELECT RunId, TableName, SessionId, SessionLoginTime, StartedAt, Status, ErrorMessage FROM AIIndexTuner.Run WHERE RunId >= @RunA;
+    SELECT RunLogId, RunId, Collector, EndTime, Message FROM AIIndexTuner.RunLog WHERE RunId = @RunA;
+    THROW 50999, N'FAIL T33: runs left Running were not marked Abandoned as expected (see the result sets above).', 1;
+END;
+DELETE AIIndexTuner.RunLog WHERE RunId >= @RunA;
+DELETE AIIndexTuner.Run WHERE RunId >= @RunA;
+PRINT CONCAT('PASS T33: polls are retried on transient failures within the deadline and the request only on 429/503, Retry-After is honoured, ',
+             'an incomplete response names its reason, a failed cancel is logged, MaxWaitSec must be at least 1, and runs left Running are marked Abandoned',
+             CASE WHEN @LiveSession IS NULL THEN ' (no other session with a request to check a live run against)' END);
+GO
+
 PRINT 'ALL TESTS PASSED';
 GO

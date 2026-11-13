@@ -33,6 +33,33 @@ recommendations are kept, and it replaces the procedures and functions.
 
 ### Fixed
 
+- **One failed poll aborted the run, and a timed-out background response kept running** (issue
+  #50).
+  - A single HTTP 429 or 5xx, or a network timeout, on any poll ended the run with error 50005,
+    after a collection that can take minutes and while the response was still being generated and
+    billed. A poll is now retried up to 3 times on a network error, a timeout or HTTP 408, 429, 500,
+    502, 503 or 504, after 2, 4 and 8 seconds or the `Retry-After` (or `retry-after-ms`) the
+    endpoint gives, up to 60 seconds, and within `MaxWaitSec`. The request is retried the same way
+    only on HTTP 429 and 503, which the endpoint returns before it starts a response. The rules
+    are in the new function `fn_RetryDelaySec`, and the calls go through the new
+    `usp_CallEndpoint`. The step log shows the retries.
+  - When the run gives up on a background response that is still queued or in progress
+    (`MaxWaitSec` ran out, or a poll kept failing), the new `usp_CancelResponse` cancels it
+    (`POST .../responses/{id}/cancel`) before it is deleted, so it stops using tokens. A later call
+    cannot pick up a response that finished after the deadline, since the stored copy is deleted
+    (issue #48).
+  - A run whose session was killed, hit a client-side query timeout or failed over stayed
+    `Running`, with its step open in `RunLog`. Each run now records its session (`Run.SessionId`,
+    `Run.SessionLoginTime`), and the next run marks such runs `Abandoned`
+    (`usp_MarkAbandonedRuns`) and closes their open steps. A run from the caller's own session is
+    always found; one from another session needs `VIEW SERVER STATE` (`VIEW DATABASE STATE` in
+    Azure SQL Database). The response id is now recorded on the run as soon as the endpoint returns
+    it, so an abandoned run's `ErrorMessage` names the response to cancel and delete.
+  - A response that was `incomplete` for a reason other than `max_output_tokens`, such as a content
+    filter, failed with "did not return the expected JSON". It now fails with error 50006 naming
+    the reason (`fn_ResponseError`).
+  - `MaxWaitSec` has a check constraint (at least 1). An install with 0 or less, which made every
+    background run time out on its first loop, gets the default of 900 on upgrade.
 - **A low-use index drop was applied without checking the index's usage** (issue #45). With
   `@AllowDropIndex = 1`, a `DropIndex` that no other index made redundant was applied once the
   usage statistics covered 7 days; whether the index was little used was taken from the model. A

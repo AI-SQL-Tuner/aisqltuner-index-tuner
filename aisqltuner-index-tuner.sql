@@ -141,11 +141,31 @@ GO
    30 days by default, prompt and answer included; usp_InvokeModel deletes it once the run is done
    with it. StoredResponseDeleted: 1 = deleted, 0 = the delete failed (AIIndexTuner.RunLog says why;
    delete it yourself with DELETE <endpoint>/openai/v1/responses/<StoredResponseId>), NULL = no
-   response was stored (a test response, or the request failed before the endpoint created one). */
+   response was stored (a test response, or the request failed before the endpoint created one), or,
+   with StoredResponseId set, the run has not finished with it yet (or was abandoned before it did;
+   issue #50: the id is recorded as soon as the endpoint returns it). */
 IF COL_LENGTH(N'AIIndexTuner.Run', N'StoredResponseId') IS NULL
     ALTER TABLE AIIndexTuner.Run ADD
         StoredResponseId      nvarchar(200) NULL,
         StoredResponseDeleted bit           NULL;
+GO
+
+/* The session that ran the run (issue #50): a killed session, a client-side query timeout or a failover
+   skips the CATCH block that marks a run Failed, and the row stayed Running. Each new run marks such
+   runs Abandoned (AIIndexTuner.usp_MarkAbandonedRuns); the login time tells a reused session id apart. */
+IF COL_LENGTH(N'AIIndexTuner.Run', N'SessionId') IS NULL
+    ALTER TABLE AIIndexTuner.Run ADD
+        SessionId        smallint NULL,
+        SessionLoginTime datetime NULL;
+GO
+
+/* MaxWaitSec of 0 or less made every background run time out on its first loop (issue #50). An
+   install with such a value gets the default before the check is added. */
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = N'CK_AIIndexTuner_Config_MaxWait' AND parent_object_id = OBJECT_ID(N'AIIndexTuner.Config'))
+BEGIN
+    UPDATE AIIndexTuner.Config SET MaxWaitSec = 900 WHERE MaxWaitSec < 1;
+    ALTER TABLE AIIndexTuner.Config ADD CONSTRAINT CK_AIIndexTuner_Config_MaxWait CHECK (MaxWaitSec >= 1);
+END;
 GO
 
 /* Size limits for builds (issue #49): sp_AIIndexTuner @MaxTableRows, @MaxIndexSizeMB. NULL = no limit. */
@@ -2365,6 +2385,13 @@ GO
     The Responses API stores every response for 30 days by default, prompt included. Once the answer
     is read, or the run gives up on it, the stored response is deleted (usp_DeleteResponse, issue #48).
 
+    Transient failures (issue #50): a poll that fails with a network error, a timeout, or HTTP 408, 429,
+    500, 502, 503 or 504 is retried up to 3 times, honouring Retry-After; the request itself only on
+    429 and 503, which the endpoint returns before it starts a response (fn_RetryDelaySec). When the run
+    gives up on a background response that is still queued or in progress (MaxWaitSec ran out, a poll
+    kept failing), it is cancelled (usp_CancelResponse) before it is deleted, so it stops using tokens.
+    A later call cannot pick up a response that finished after the deadline: it has been deleted.
+
     Only OpenAI models are supported for now.
 */
 /* The Responses API request body. A function so the tests can check it without a network call. */
@@ -2476,6 +2503,154 @@ BEGIN
 END;
 GO
 
+/* How long to wait before retrying a call to the endpoint that failed, in seconds, or NULL to fail now
+   (issue #50). @HttpCode NULL = no HTTP response: a network error or a timeout. A poll (GET) is retried
+   on that and on HTTP 408, 429, 500, 502, 503 and 504. The request (POST) only on 429 and 503, which the
+   endpoint returns before it starts a response, so a retry cannot start, and bill, a second one.
+   @Attempt is the retry about to be made, from 1; there are at most 3. The wait is the one the response
+   asks for (Retry-After in seconds, or retry-after-ms / x-ms-retry-after-ms) and otherwise 2, 4 and 8
+   seconds. A response that asks for more than 60 seconds is not retried: a run should not sit that long.
+   Header names are lower-cased under a fixed collation (see fn_LevelRank). */
+CREATE OR ALTER FUNCTION AIIndexTuner.fn_RetryDelaySec(@Method varchar(10), @HttpCode int, @Response nvarchar(max), @Attempt int)
+RETURNS int
+AS
+BEGIN
+    IF @Attempt IS NULL OR @Attempt NOT BETWEEN 1 AND 3 RETURN NULL;
+    IF NOT (   (@Method = 'GET'  AND (@HttpCode IS NULL OR @HttpCode IN (408, 429, 500, 502, 503, 504)))
+            OR (@Method = 'POST' AND ISNULL(@HttpCode, 0) IN (429, 503)))
+        RETURN NULL;
+
+    DECLARE @Asked decimal(18, 3);
+    IF ISJSON(@Response) = 1
+        SELECT @Asked = MAX(CASE LOWER(h.[key] COLLATE Latin1_General_100_BIN2)
+                                WHEN N'retry-after-ms'      THEN TRY_CAST(h.[value] AS decimal(18, 3)) / 1000
+                                WHEN N'x-ms-retry-after-ms' THEN TRY_CAST(h.[value] AS decimal(18, 3)) / 1000
+                                WHEN N'retry-after'         THEN TRY_CAST(h.[value] AS decimal(18, 3)) END)
+        FROM OPENJSON(@Response, '$.response.headers') AS h;
+
+    IF @Asked > 60 RETURN NULL;
+    RETURN CASE WHEN @Asked > 0 THEN CAST(CEILING(@Asked) AS int) ELSE POWER(2, @Attempt) END;
+END;
+GO
+
+/* Why a response that ended has no usable answer, or NULL (issue #50): failed, cancelled, or incomplete
+   for a reason other than max_output_tokens (which is reported as Truncated). An incomplete response
+   used to fall through to "did not return the expected JSON", hiding a content filter. */
+CREATE OR ALTER FUNCTION AIIndexTuner.fn_ResponseError(@Response nvarchar(max))
+RETURNS nvarchar(4000)
+AS
+BEGIN
+    IF ISJSON(@Response) = 0 RETURN NULL;
+    DECLARE @Status varchar(30) = JSON_VALUE(@Response, '$.result.status'),
+            @Reason nvarchar(400) = JSON_VALUE(@Response, '$.result.incomplete_details.reason');
+
+    RETURN CASE
+        WHEN @Status IN ('failed', 'cancelled')
+            THEN CONCAT(N'The AI response ', @Status, N': ', ISNULL(JSON_VALUE(@Response, '$.result.error.message'), N'(no message)'))
+        WHEN @Status = 'incomplete' AND ISNULL(@Reason, N'') <> N'max_output_tokens'
+            THEN CONCAT(N'The AI response is incomplete: ', ISNULL(@Reason, N'(no reason given)'),
+                        CASE WHEN @Reason = N'content_filter' THEN N'. The deployment''s content filter stopped the answer.' ELSE N'.' END)
+        END;
+END;
+GO
+
+/* One call to the endpoint, retried on a transient failure as fn_RetryDelaySec says (issue #50). Never
+   throws: @Ok = 1 for a 2xx answer. Otherwise @Response holds the last answer, always as JSON: an error
+   raised by sp_invoke_external_rest_endpoint (no HTTP response), or an answer that is not JSON, is put in
+   {"result": {"error": {"message": ...}}}. @Retries returns the retries made; one that would end after
+   @Deadline is not made. */
+CREATE OR ALTER PROCEDURE AIIndexTuner.usp_CallEndpoint
+    @Url        nvarchar(4000),
+    @Method     varchar(10),
+    @Payload    nvarchar(max) = NULL,
+    @Credential sysname,
+    @Timeout    smallint,
+    @Deadline   datetime2(0) = NULL,
+    @Response   nvarchar(max) = NULL OUTPUT,
+    @HttpCode   int = NULL OUTPUT,
+    @Ok         bit = 0 OUTPUT,
+    @Retries    int = 0 OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @rc int, @Wait int, @Delay char(8), @HttpMethod nvarchar(6) = @Method;
+    SELECT @Retries = 0, @Ok = 0;
+
+    WHILE 1 = 1
+    BEGIN
+        SELECT @rc = NULL, @Response = NULL, @HttpCode = NULL;
+        BEGIN TRY
+            IF @Payload IS NULL
+                EXEC @rc = sys.sp_invoke_external_rest_endpoint
+                    @url = @Url, @method = @HttpMethod, @credential = @Credential, @timeout = @Timeout,
+                    @response = @Response OUTPUT;
+            ELSE
+                EXEC @rc = sys.sp_invoke_external_rest_endpoint
+                    @url = @Url, @method = @HttpMethod, @headers = N'{"Content-Type":"application/json"}', @payload = @Payload,
+                    @credential = @Credential, @timeout = @Timeout, @response = @Response OUTPUT;
+
+            IF ISJSON(@Response) = 1
+                SET @HttpCode = TRY_CAST(JSON_VALUE(@Response, '$.response.status.http.code') AS int);
+            ELSE
+                SET @Response = JSON_OBJECT('result': JSON_OBJECT('error': JSON_OBJECT('message': LEFT(ISNULL(@Response, N'(empty response)'), 2000))));
+        END TRY
+        BEGIN CATCH
+            SELECT @rc = NULL, @HttpCode = NULL,
+                   @Response = JSON_OBJECT('result': JSON_OBJECT('error': JSON_OBJECT('message': CONCAT(N'Msg ', ERROR_NUMBER(), N': ', ERROR_MESSAGE()))));
+        END CATCH;
+
+        IF @rc = 0 AND @HttpCode BETWEEN 200 AND 299
+        BEGIN
+            SET @Ok = 1;
+            RETURN;
+        END;
+
+        SET @Wait = AIIndexTuner.fn_RetryDelaySec(@Method, @HttpCode, @Response, @Retries + 1);
+        IF @Wait IS NULL OR DATEADD(SECOND, @Wait, SYSDATETIME()) > @Deadline
+            RETURN;
+        SET @Delay = CONVERT(char(8), DATEADD(SECOND, @Wait, CAST('00:00:00' AS time(0))), 108);
+        WAITFOR DELAY @Delay;
+        SET @Retries += 1;
+    END;
+END;
+GO
+
+/* Cancels a background response that is still queued or in progress (issue #50):
+   POST {endpoint}/openai/v1/responses/{id}/cancel. Without it a response the run gave up on keeps running
+   on the endpoint, using tokens nobody reads. Never throws; with logging on, the outcome goes into
+   AIIndexTuner.RunLog. */
+CREATE OR ALTER PROCEDURE AIIndexTuner.usp_CancelResponse
+    @Url        nvarchar(4000),   -- {endpoint}/openai/v1/responses
+    @ResponseId nvarchar(200),
+    @Credential sysname,
+    @Timeout    smallint,
+    @RunId      int = NULL,
+    @Logging    bit = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+    IF NULLIF(LTRIM(@ResponseId), N'') IS NULL RETURN;
+
+    DECLARE @Response nvarchar(max), @HttpCode int, @Ok bit, @Message nvarchar(4000),
+            @CancelUrl nvarchar(4000) = CONCAT(@Url, N'/', @ResponseId, N'/cancel'),
+            @LogId int, @LogRow int, @LogChars int, @Zero int = 0;
+
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'AI response cancel', @Chars = @Zero, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
+    SET @LogRow = @LogId;
+
+    EXEC AIIndexTuner.usp_CallEndpoint @Url = @CancelUrl, @Method = 'POST', @Credential = @Credential, @Timeout = @Timeout,
+         @Response = @Response OUTPUT, @HttpCode = @HttpCode OUTPUT, @Ok = @Ok OUTPUT;
+
+    SET @Message = CASE WHEN @Ok = 1 THEN CONCAT(N'Cancelled response ', @ResponseId, N'.')
+                        ELSE CONCAT(N'Could not cancel response ', @ResponseId, N': HTTP ', COALESCE(CAST(@HttpCode AS nvarchar(10)), N'(no response)'), N': ',
+                                    ISNULL(JSON_VALUE(@Response, '$.result.error.message'), LEFT(@Response, 2000))) END;
+
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, NULL, @Chars = @Zero, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
+    IF @Logging = 1
+        UPDATE AIIndexTuner.RunLog SET Message = LEFT(@Message, 4000) WHERE RunLogId = @LogRow;
+END;
+GO
+
 CREATE OR ALTER PROCEDURE AIIndexTuner.usp_InvokeModel
     @SystemPrompt nvarchar(max),
     @UserPrompt   nvarchar(max),
@@ -2516,34 +2691,36 @@ BEGIN
 
     DECLARE @Body nvarchar(max) = AIIndexTuner.fn_RequestBody(@Deployment, @Effort, @MaxOutputTokens, @Structured, @Background, @SystemPrompt, @UserPrompt);
 
-    DECLARE @rc int, @Response nvarchar(max), @HttpCode int, @Status varchar(30), @ResponseId nvarchar(200),
+    DECLARE @Response nvarchar(max), @HttpCode int, @Ok bit, @Retries int, @PollRetries int = 0,
+            @Status varchar(30), @ResponseId nvarchar(200), @PollUrl nvarchar(4000),
             @Deadline datetime2(0) = DATEADD(SECOND, @MaxWaitSec, SYSDATETIME()),
             @Delay char(8) = CONCAT('00:00:', RIGHT(CONCAT('0', @PollSec), 2)),
             @Error nvarchar(4000);
 
-    -- AI request: Chars is the length of the request body.
+    -- AI request: Chars is the length of the request body. Retried only on HTTP 429 and 503 (issue #50).
     SET @LogLen = LEN(@Body);
     EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'AI request', @Chars = @Zero, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
-    EXEC @rc = sys.sp_invoke_external_rest_endpoint
-        @url = @Url,
-        @method = N'POST',
-        @headers = N'{"Content-Type":"application/json"}',
-        @payload = @Body,
-        @credential = @Credential,
-        @timeout = @Timeout,
-        @response = @Response OUTPUT;
+    EXEC AIIndexTuner.usp_CallEndpoint @Url = @Url, @Method = 'POST', @Payload = @Body, @Credential = @Credential, @Timeout = @Timeout,
+         @Deadline = @Deadline, @Response = @Response OUTPUT, @HttpCode = @HttpCode OUTPUT, @Ok = @Ok OUTPUT, @Retries = @Retries OUTPUT;
+    IF @Logging = 1 AND @Retries > 0
+        UPDATE AIIndexTuner.RunLog SET Message = CONCAT(@Retries, N' retries after HTTP 429 or 503') WHERE RunLogId = @LogId;
 
-    SET @HttpCode = JSON_VALUE(@Response, '$.response.status.http.code');
-    IF @rc <> 0 OR @HttpCode NOT BETWEEN 200 AND 299
+    IF @Ok = 0
     BEGIN
         SET @RawResponse = @Response;
-        SET @Error = CONCAT(N'The AI endpoint returned HTTP ', @HttpCode, N': ',
-                            ISNULL(JSON_VALUE(@Response, '$.result.error.message'), LEFT(@Response, 2000)));
+        SET @Error = CONCAT(N'The AI endpoint returned HTTP ', COALESCE(CAST(@HttpCode AS nvarchar(10)), N'(no response)'), N': ',
+                            ISNULL(JSON_VALUE(@Response, '$.result.error.message'), LEFT(@Response, 2000)),
+                            CASE WHEN @Retries > 0 THEN CONCAT(N' (after ', @Retries, N' retries)') END);
         THROW 50003, @Error, 1;
     END;
 
     SELECT @Status = JSON_VALUE(@Response, '$.result.status'),
            @ResponseId = JSON_VALUE(@Response, '$.result.id');
+
+    -- Recorded now, not only when it is deleted: a run that is killed while it waits leaves the id of the
+    -- response it left behind (issue #50).
+    IF @RunId IS NOT NULL AND @ResponseId IS NOT NULL
+        UPDATE AIIndexTuner.Run SET StoredResponseId = LEFT(@ResponseId, 200) WHERE RunId = @RunId;
 
     -- AI response: the wait for the answer (background mode polls); Chars is the length of the answer text.
     -- Message shows the polls so far while it waits.
@@ -2551,43 +2728,50 @@ BEGIN
     SET @LogChars = 0;
 
     -- Background mode: poll until the response leaves queued / in_progress.
-    WHILE @Status IN ('queued', 'in_progress')
-    BEGIN
-        IF SYSDATETIME() >= @Deadline
+    BEGIN TRY
+        WHILE @Status IN ('queued', 'in_progress')
         BEGIN
-            SET @RawResponse = @Response;
-            SET @Error = CONCAT(N'The AI response ', @ResponseId, N' was still ', @Status, N' after ', @MaxWaitSec,
-                                N' seconds. Raise AIIndexTuner.Config.MaxWaitSec, lower ReasoningEffort, or narrow the scope.');
-            -- Still running, so the delete may be refused; its outcome is recorded either way.
-            EXEC AIIndexTuner.usp_DeleteResponse @Url, @ResponseId, @Credential, @Timeout, @RunId, @Logging;
-            THROW 50004, @Error, 1;
+            IF SYSDATETIME() >= @Deadline
+            BEGIN
+                SET @Error = CONCAT(N'The AI response ', @ResponseId, N' was still ', @Status, N' after ', @MaxWaitSec,
+                                    N' seconds, so the run gave up and asked the endpoint to cancel it. Raise AIIndexTuner.Config.MaxWaitSec, lower ReasoningEffort, or narrow the scope.');
+                THROW 50004, @Error, 1;
+            END;
+
+            WAITFOR DELAY @Delay;
+            SET @PollCount += 1;
+
+            -- A transient failure is retried (up to 3 times, within the deadline) before the run gives up.
+            SET @PollUrl = CONCAT(@Url, N'/', @ResponseId);
+            EXEC AIIndexTuner.usp_CallEndpoint @Url = @PollUrl, @Method = 'GET', @Credential = @Credential, @Timeout = @Timeout,
+                 @Deadline = @Deadline, @Response = @Response OUTPUT, @HttpCode = @HttpCode OUTPUT, @Ok = @Ok OUTPUT, @Retries = @Retries OUTPUT;
+            SET @PollRetries += @Retries;
+
+            IF @Ok = 0
+            BEGIN
+                SET @Error = CONCAT(N'Polling the AI response returned HTTP ', COALESCE(CAST(@HttpCode AS nvarchar(10)), N'(no response)'), N': ',
+                                    ISNULL(JSON_VALUE(@Response, '$.result.error.message'), LEFT(@Response, 2000)),
+                                    CASE WHEN @Retries > 0 THEN CONCAT(N' (after ', @Retries, N' retries)') END);
+                THROW 50005, @Error, 1;
+            END;
+
+            SET @Status = JSON_VALUE(@Response, '$.result.status');
+            IF @Logging = 1
+                UPDATE AIIndexTuner.RunLog
+                SET Message = CONCAT(@PollCount, N' polls; status ', @Status, CASE WHEN @PollRetries > 0 THEN CONCAT(N'; ', @PollRetries, N' retries') END)
+                WHERE RunLogId = @LogId;
         END;
-
-        WAITFOR DELAY @Delay;
-        SET @PollCount += 1;
-
-        DECLARE @PollUrl nvarchar(4000) = CONCAT(@Url, N'/', @ResponseId);
-        EXEC @rc = sys.sp_invoke_external_rest_endpoint
-            @url = @PollUrl,
-            @method = N'GET',
-            @credential = @Credential,
-            @timeout = @Timeout,
-            @response = @Response OUTPUT;
-
-        SET @HttpCode = JSON_VALUE(@Response, '$.response.status.http.code');
-        IF @rc <> 0 OR @HttpCode NOT BETWEEN 200 AND 299
-        BEGIN
-            SET @RawResponse = @Response;
-            SET @Error = CONCAT(N'Polling the AI response returned HTTP ', @HttpCode, N': ',
-                                ISNULL(JSON_VALUE(@Response, '$.result.error.message'), LEFT(@Response, 2000)));
-            EXEC AIIndexTuner.usp_DeleteResponse @Url, @ResponseId, @Credential, @Timeout, @RunId, @Logging;
-            THROW 50005, @Error, 1;
-        END;
-
-        SET @Status = JSON_VALUE(@Response, '$.result.status');
-        IF @Logging = 1
-            UPDATE AIIndexTuner.RunLog SET Message = CONCAT(@PollCount, N' polls; status ', @Status) WHERE RunLogId = @LogId;
-    END;
+    END TRY
+    BEGIN CATCH
+        SET @RawResponse = @Response;
+        -- The run is giving up on the response. @Status is the last one read, so one that may still be
+        -- running is cancelled first, or it keeps using tokens (issue #50); then the stored copy is
+        -- deleted (issue #48). Neither throws; their outcomes are recorded.
+        IF @Status IN ('queued', 'in_progress')
+            EXEC AIIndexTuner.usp_CancelResponse @Url, @ResponseId, @Credential, @Timeout, @RunId, @Logging;
+        EXEC AIIndexTuner.usp_DeleteResponse @Url, @ResponseId, @Credential, @Timeout, @RunId, @Logging;
+        THROW;
+    END CATCH;
 
     SET @RawResponse = @Response;
 
@@ -2595,11 +2779,10 @@ BEGIN
     -- The Responses API stores every response by default, so this runs in background and foreground mode alike.
     EXEC AIIndexTuner.usp_DeleteResponse @Url, @ResponseId, @Credential, @Timeout, @RunId, @Logging;
 
-    IF @Status IN ('failed', 'cancelled')
-    BEGIN
-        SET @Error = CONCAT(N'The AI response ', @Status, N': ', ISNULL(JSON_VALUE(@Response, '$.result.error.message'), N'(no message)'));
+    -- Failed, cancelled, or incomplete for another reason than the output token limit (issue #50).
+    SET @Error = AIIndexTuner.fn_ResponseError(@Response);
+    IF @Error IS NOT NULL
         THROW 50006, @Error, 1;
-    END;
 
     SELECT @ModelUsed = JSON_VALUE(@Response, '$.result.model'),
            @InputTokens = JSON_VALUE(@Response, '$.result.usage.input_tokens'),
@@ -3417,6 +3600,69 @@ END;
 GO
 
 /*
+    AIIndexTuner.usp_MarkAbandonedRuns (issue #50): a run whose session was killed, timed out on the client
+    or failed over never reaches the CATCH block that marks it Failed, so it stayed Running and its open
+    RunLog step never closed. Each new run first marks such runs Abandoned and closes their open steps.
+    A Running run is known to be over when:
+    - it was started by this session (@@SPID): this session is running the new call now, so whatever it
+      ran before has ended. A client-side query timeout ends the batch but keeps the connection, pooled
+      ones included, and a reused session id belongs to a later login.
+    - its session (id and login time) no longer runs a request: it is gone, logged in again, or idle.
+      Seeing other sessions needs VIEW SERVER STATE (VIEW DATABASE STATE in Azure SQL Database); without
+      it only the first rule applies.
+    - it is from before the session was recorded and started more than a day ago (same permission).
+    Never throws: it is housekeeping, and must not stop the run.
+*/
+CREATE OR ALTER PROCEDURE AIIndexTuner.usp_MarkAbandonedRuns
+AS
+BEGIN
+    SET NOCOUNT ON;
+    BEGIN TRY
+        DECLARE @Now datetime2(3) = SYSDATETIME();
+        DECLARE @Abandoned TABLE (RunId int PRIMARY KEY);
+        DECLARE @SeeAll bit = CASE WHEN CAST(SERVERPROPERTY('EngineEdition') AS int) = 5
+                                   THEN HAS_PERMS_BY_NAME(DB_NAME(), N'DATABASE', N'VIEW DATABASE STATE')
+                                   ELSE HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER STATE') END;
+
+        INSERT @Abandoned (RunId)
+        SELECT RunId FROM AIIndexTuner.Run WHERE Status = 'Running' AND SessionId = @@SPID;
+
+        IF @SeeAll = 1
+            INSERT @Abandoned (RunId)
+            SELECT r.RunId
+            FROM AIIndexTuner.Run AS r
+            WHERE r.Status = 'Running'
+              AND NOT EXISTS (SELECT 1 FROM @Abandoned AS a WHERE a.RunId = r.RunId)
+              AND (   (r.SessionId IS NULL AND r.StartedAt < DATEADD(DAY, -1, @Now))
+                   OR (r.SessionId IS NOT NULL
+                       AND NOT EXISTS (SELECT 1
+                                       FROM sys.dm_exec_sessions AS s
+                                       INNER JOIN sys.dm_exec_requests AS q ON q.session_id = s.session_id
+                                       WHERE s.session_id = r.SessionId AND s.login_time = r.SessionLoginTime)));
+
+        UPDATE r
+        SET Status = 'Abandoned', CompletedAt = @Now,
+            ErrorMessage = LEFT(CONCAT(
+                N'Abandoned: the session that ran it ended or stopped running it before it finished (killed, a client-side query timeout or a failover); found at the start of a later run.',
+                CASE WHEN r.StoredResponseId IS NOT NULL AND r.StoredResponseDeleted IS NULL
+                     THEN CONCAT(N' Its response ', r.StoredResponseId, N' may still be stored, or running, on the endpoint: cancel and delete it with POST <endpoint>/openai/v1/responses/',
+                                 r.StoredResponseId, N'/cancel and DELETE <endpoint>/openai/v1/responses/', r.StoredResponseId, N'.') END), 4000)
+        FROM AIIndexTuner.Run AS r
+        INNER JOIN @Abandoned AS a ON a.RunId = r.RunId;
+
+        UPDATE l
+        SET EndTime = @Now, ElapsedMs = DATEDIFF(MILLISECOND, l.StartTime, @Now),
+            Message = LEFT(CONCAT(l.Message + N'; ', N'Abandoned: the run''s session ended or stopped running it.'), 4000)
+        FROM AIIndexTuner.RunLog AS l
+        INNER JOIN @Abandoned AS a ON a.RunId = l.RunId
+        WHERE l.EndTime IS NULL;
+    END TRY
+    BEGIN CATCH
+    END CATCH;
+END;
+GO
+
+/*
     dbo.sp_AIIndexTuner: AI-assisted index tuning from inside SQL Server.
 
         EXEC dbo.sp_AIIndexTuner;                                      -- whole database, recommend only
@@ -3589,10 +3835,14 @@ BEGIN
         END;
     END;
 
+    -- Runs left Running by a session that is gone or has moved on (issue #50).
+    EXEC AIIndexTuner.usp_MarkAbandonedRuns;
+
     DECLARE @RunId int;
-    INSERT AIIndexTuner.Run (Mode, SchemaName, TableName, Endpoint, Deployment, ApiShape, ReasoningEffort, SystemPromptHash,
+    INSERT AIIndexTuner.Run (SessionId, SessionLoginTime, Mode, SchemaName, TableName, Endpoint, Deployment, ApiShape, ReasoningEffort, SystemPromptHash,
                              AllowColumnstore, AllowDropIndex, MaxNewIndexes, MinPriority, MinConfidence, MaxTableRows, MaxIndexSizeMB)
-    VALUES (@Mode, @SchemaName, @TableName,
+    VALUES (@@SPID, (SELECT login_time FROM sys.dm_exec_sessions WHERE session_id = @@SPID),
+            @Mode, @SchemaName, @TableName,
             CASE WHEN @TestResponse IS NULL THEN @Endpoint END,
             CASE WHEN @TestResponse IS NULL THEN @Deployment END,
             CASE WHEN @TestResponse IS NULL THEN 'OpenAIResponses' ELSE 'Test' END,
