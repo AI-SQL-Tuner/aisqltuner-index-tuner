@@ -1655,17 +1655,25 @@ IF AIIndexTuner.fn_ResponseError(N'{"result":{"status":"incomplete","incomplete_
    OR AIIndexTuner.fn_ResponseError(N'{"result":{"status":"completed"}}') IS NOT NULL
     THROW 50999, N'FAIL T33: fn_ResponseError did not report a failed or incomplete response as expected.', 1;
 
--- A poll with no response is retried within the deadline: one retry (2 s) fits in 3 s, the next (4 s) does not.
+-- A poll with no response is retried only when the wait and the retry's own call (@Timeout = 5 s) fit before
+-- the deadline: with 9 s, the first retry (2 + 5 s) fits and the second (4 + 5 s, 2 s later) does not;
+-- with 6 s, not even the first.
 DECLARE @Response nvarchar(max), @HttpCode int, @Ok bit, @Retries int;
-DECLARE @Deadline datetime2(0) = DATEADD(SECOND, 3, SYSDATETIME());
+DECLARE @Deadline datetime2(0) = DATEADD(SECOND, 9, SYSDATETIME());
 EXEC AIIndexTuner.usp_CallEndpoint @Url = N'https://aiindextuner-t33.invalid/openai/v1/responses/resp_t33', @Method = 'GET',
      @Credential = N'https://aiindextuner-t33.invalid', @Timeout = 5, @Deadline = @Deadline,
      @Response = @Response OUTPUT, @HttpCode = @HttpCode OUTPUT, @Ok = @Ok OUTPUT, @Retries = @Retries OUTPUT;
 IF @Ok <> 0 OR @HttpCode IS NOT NULL OR @Retries <> 1 OR ISJSON(@Response) = 0 OR JSON_VALUE(@Response, '$.result.error.message') IS NULL
 BEGIN
     SELECT @Ok AS Ok, @HttpCode AS HttpCode, @Retries AS Retries, @Response AS Response;
-    THROW 50999, N'FAIL T33: a failed poll was not retried once within a 3 second deadline, or its error was not returned as JSON (see the result set above).', 1;
+    THROW 50999, N'FAIL T33: a failed poll was not retried once within a 9 second deadline, or its error was not returned as JSON (see the result set above).', 1;
 END;
+SET @Deadline = DATEADD(SECOND, 6, SYSDATETIME());
+EXEC AIIndexTuner.usp_CallEndpoint @Url = N'https://aiindextuner-t33.invalid/openai/v1/responses/resp_t33', @Method = 'GET',
+     @Credential = N'https://aiindextuner-t33.invalid', @Timeout = 5, @Deadline = @Deadline,
+     @Response = @Response OUTPUT, @HttpCode = @HttpCode OUTPUT, @Ok = @Ok OUTPUT, @Retries = @Retries OUTPUT;
+IF @Ok <> 0 OR @Retries <> 0
+    THROW 50999, N'FAIL T33: a retry was made although its wait and request timeout (7 s) did not fit in a 6 second deadline.', 1;
 
 -- A cancel that fails does not throw, and is logged.
 INSERT AIIndexTuner.Run (Mode) VALUES ('RECOMMEND');

@@ -39,7 +39,8 @@ recommendations are kept, and it replaces the procedures and functions.
     after a collection that can take minutes and while the response was still being generated and
     billed. A poll is now retried up to 3 times on a network error, a timeout or HTTP 408, 429, 500,
     502, 503 or 504, after 2, 4 and 8 seconds or the `Retry-After` (or `retry-after-ms`) the
-    endpoint gives, up to 60 seconds, and within `MaxWaitSec`. The request is retried the same way
+    endpoint gives, up to 60 seconds, when the wait and the retry's own call (up to
+    `RequestTimeoutSec`) still fit in `MaxWaitSec`. The request is retried the same way
     only on HTTP 429 and 503, which the endpoint returns before it starts a response. The rules
     are in the new function `fn_RetryDelaySec`, and the calls go through the new
     `usp_CallEndpoint`. The step log shows the retries.

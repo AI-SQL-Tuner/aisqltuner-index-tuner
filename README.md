@@ -128,7 +128,7 @@ can apply what it finds.
    instead of an HTML report, and the response schema enforces that shape. A poll of a background
    response that fails with a network error, a timeout or HTTP 408, 429, 500, 502, 503 or 504 is
    retried up to 3 times (after 2, 4 and 8 seconds, or the `Retry-After` the endpoint gives, up to
-   60), within `MaxWaitSec`; the request itself is retried the same way, but only on HTTP 429 and
+   60), when the wait and the retry's own call (up to `RequestTimeoutSec`) fit in `MaxWaitSec`; the request itself is retried the same way, but only on HTTP 429 and
    503, so a retry never starts a second, billed response. When the run gives up on a response
    that is still running (`MaxWaitSec` ran out, or a poll kept failing), it cancels the response
    before deleting it, so it stops using tokens. An incomplete response names its reason, such as

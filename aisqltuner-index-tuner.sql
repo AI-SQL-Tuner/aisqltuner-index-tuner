@@ -2557,8 +2557,8 @@ GO
 /* One call to the endpoint, retried on a transient failure as fn_RetryDelaySec says (issue #50). Never
    throws: @Ok = 1 for a 2xx answer. Otherwise @Response holds the last answer, always as JSON: an error
    raised by sp_invoke_external_rest_endpoint (no HTTP response), or an answer that is not JSON, is put in
-   {"result": {"error": {"message": ...}}}. @Retries returns the retries made; one that would end after
-   @Deadline is not made. */
+   {"result": {"error": {"message": ...}}}. @Retries returns the retries made; one whose wait plus its
+   own call (up to @Timeout seconds) could end after @Deadline is not made. */
 CREATE OR ALTER PROCEDURE AIIndexTuner.usp_CallEndpoint
     @Url        nvarchar(4000),
     @Method     varchar(10),
@@ -2606,7 +2606,8 @@ BEGIN
         END;
 
         SET @Wait = AIIndexTuner.fn_RetryDelaySec(@Method, @HttpCode, @Response, @Retries + 1);
-        IF @Wait IS NULL OR DATEADD(SECOND, @Wait, SYSDATETIME()) > @Deadline
+        -- The wait and the retry's own call (up to @Timeout) must both fit before @Deadline.
+        IF @Wait IS NULL OR DATEADD(SECOND, @Wait + @Timeout, SYSDATETIME()) > @Deadline
             RETURN;
         SET @Delay = CONVERT(char(8), DATEADD(SECOND, @Wait, CAST('00:00:00' AS time(0))), 108);
         WAITFOR DELAY @Delay;
