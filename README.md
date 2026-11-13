@@ -85,7 +85,12 @@ can apply what it finds.
      session, a trace or an audit, so run it where nothing is capturing statement text.
 3. Smoke test: `EXEC dbo.sp_AIIndexTuner;`, then check that the latest `AIIndexTuner.Run` row has
    `Status = 'Succeeded'`. If it failed, `ErrorMessage` names the part to look at: the HTTP status,
-   the credential, or polling.
+   the credential, or polling. A run whose session was killed, hit a client-side query timeout or
+   failed over cannot mark itself `Failed`; the next run marks it `Abandoned` and closes its open
+   step in `AIIndexTuner.RunLog`. It finds those runs from the session id and login time recorded
+   on each run (`SessionId`, `SessionLoginTime`). A run from your own session is always found;
+   finding one from another session needs `VIEW SERVER STATE` (`VIEW DATABASE STATE` in Azure
+   SQL Database).
 
 ## What it does
 
@@ -120,7 +125,14 @@ can apply what it finds.
    confirmed from the plan XML. If that fails, they fall back to a plan-text match, then to module
    dependencies. The section says which one it used.
 2. **Asks the model** with AI SQL Tuner's Index Tuning prompt. The prompt asks for a JSON object
-   instead of an HTML report, and the response schema enforces that shape.
+   instead of an HTML report, and the response schema enforces that shape. A poll of a background
+   response that fails with a network error, a timeout or HTTP 408, 429, 500, 502, 503 or 504 is
+   retried up to 3 times (after 2, 4 and 8 seconds, or the `Retry-After` the endpoint gives, up to
+   60), when the wait and the retry's own call (up to `RequestTimeoutSec`) fit in `MaxWaitSec`; the request itself is retried the same way, but only on HTTP 429 and
+   503, so a retry never starts a second, billed response. When the run gives up on a response
+   that is still running (`MaxWaitSec` ran out, or a poll kept failing), it cancels the response
+   before deleting it, so it stops using tokens. An incomplete response names its reason, such as
+   `content_filter`.
 3. **Stores** a row in `AIIndexTuner.Run` and one row per recommendation in
    `AIIndexTuner.Recommendation`:
    - category (`CreateIndex`, `DropIndex`, `ConsolidateIndex`, `RebuildIndex`, `Constraint`,
@@ -332,7 +344,7 @@ WHERE ep.name = N'AIIndexTuner';
 | `MaxOutputTokens` | 32000 | |
 | `RequestTimeoutSec` | 230 | Per HTTP call; 230 is the `sp_invoke_external_rest_endpoint` maximum |
 | `UseBackgroundMode` | 1 | Send the request with `"background": true` and poll it, so a long reasoning run is not cut off at 230 seconds |
-| `MaxWaitSec` / `PollIntervalSec` | 900 / 5 | Polling limits in background mode |
+| `MaxWaitSec` / `PollIntervalSec` | 900 / 5 | Polling limits in background mode; `MaxWaitSec` must be at least 1 |
 | `UseStructuredOutput` | 1 | Schema-constrained JSON; set 0 for a model that rejects it |
 | `IncludeQueryText` | 1 | 0 leaves plan cache query text out of the prompt |
 | `KeepRunDetail` | 1 | Keep the collected data and raw response on each run |
@@ -400,7 +412,9 @@ all of the query text and predicates above; it does not affect the column values
   `AIIndexTuner.usp_DeleteResponse` deletes the stored response. `AIIndexTuner.Run` records the
   response id (`StoredResponseId`) and whether the delete succeeded (`StoredResponseDeleted`); when
   it is 0, `AIIndexTuner.RunLog` says why, and you can delete it yourself with
-  `DELETE <endpoint>/openai/v1/responses/<StoredResponseId>`. What Azure keeps for abuse monitoring
+  `DELETE <endpoint>/openai/v1/responses/<StoredResponseId>`. The id is recorded as soon as the
+  endpoint returns it, so a run that is `Abandoned` while it waits still names its response, and
+  its `ErrorMessage` says how to cancel and delete it. What Azure keeps for abuse monitoring
   is set on the Azure OpenAI resource, not by this tool.
 - In the database: with `KeepRunDetail = 1` (the default), `AIIndexTuner.Run` keeps the full
   payload (`CollectedData`) and the raw response (`RawResponse`) of every run, and

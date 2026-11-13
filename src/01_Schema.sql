@@ -127,11 +127,31 @@ GO
    30 days by default, prompt and answer included; usp_InvokeModel deletes it once the run is done
    with it. StoredResponseDeleted: 1 = deleted, 0 = the delete failed (AIIndexTuner.RunLog says why;
    delete it yourself with DELETE <endpoint>/openai/v1/responses/<StoredResponseId>), NULL = no
-   response was stored (a test response, or the request failed before the endpoint created one). */
+   response was stored (a test response, or the request failed before the endpoint created one), or,
+   with StoredResponseId set, the run has not finished with it yet (or was abandoned before it did;
+   issue #50: the id is recorded as soon as the endpoint returns it). */
 IF COL_LENGTH(N'AIIndexTuner.Run', N'StoredResponseId') IS NULL
     ALTER TABLE AIIndexTuner.Run ADD
         StoredResponseId      nvarchar(200) NULL,
         StoredResponseDeleted bit           NULL;
+GO
+
+/* The session that ran the run (issue #50): a killed session, a client-side query timeout or a failover
+   skips the CATCH block that marks a run Failed, and the row stayed Running. Each new run marks such
+   runs Abandoned (AIIndexTuner.usp_MarkAbandonedRuns); the login time tells a reused session id apart. */
+IF COL_LENGTH(N'AIIndexTuner.Run', N'SessionId') IS NULL
+    ALTER TABLE AIIndexTuner.Run ADD
+        SessionId        smallint NULL,
+        SessionLoginTime datetime NULL;
+GO
+
+/* MaxWaitSec of 0 or less made every background run time out on its first loop (issue #50). An
+   install with such a value gets the default before the check is added. */
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = N'CK_AIIndexTuner_Config_MaxWait' AND parent_object_id = OBJECT_ID(N'AIIndexTuner.Config'))
+BEGIN
+    UPDATE AIIndexTuner.Config SET MaxWaitSec = 900 WHERE MaxWaitSec < 1;
+    ALTER TABLE AIIndexTuner.Config ADD CONSTRAINT CK_AIIndexTuner_Config_MaxWait CHECK (MaxWaitSec >= 1);
+END;
 GO
 
 /* Size limits for builds (issue #49): sp_AIIndexTuner @MaxTableRows, @MaxIndexSizeMB. NULL = no limit. */

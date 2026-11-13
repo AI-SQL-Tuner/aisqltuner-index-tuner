@@ -22,6 +22,69 @@ END;
 GO
 
 /*
+    AIIndexTuner.usp_MarkAbandonedRuns (issue #50): a run whose session was killed, timed out on the client
+    or failed over never reaches the CATCH block that marks it Failed, so it stayed Running and its open
+    RunLog step never closed. Each new run first marks such runs Abandoned and closes their open steps.
+    A Running run is known to be over when:
+    - it was started by this session (@@SPID): this session is running the new call now, so whatever it
+      ran before has ended. A client-side query timeout ends the batch but keeps the connection, pooled
+      ones included, and a reused session id belongs to a later login.
+    - its session (id and login time) no longer runs a request: it is gone, logged in again, or idle.
+      Seeing other sessions needs VIEW SERVER STATE (VIEW DATABASE STATE in Azure SQL Database); without
+      it only the first rule applies.
+    - it is from before the session was recorded and started more than a day ago (same permission).
+    Never throws: it is housekeeping, and must not stop the run.
+*/
+CREATE OR ALTER PROCEDURE AIIndexTuner.usp_MarkAbandonedRuns
+AS
+BEGIN
+    SET NOCOUNT ON;
+    BEGIN TRY
+        DECLARE @Now datetime2(3) = SYSDATETIME();
+        DECLARE @Abandoned TABLE (RunId int PRIMARY KEY);
+        DECLARE @SeeAll bit = CASE WHEN CAST(SERVERPROPERTY('EngineEdition') AS int) = 5
+                                   THEN HAS_PERMS_BY_NAME(DB_NAME(), N'DATABASE', N'VIEW DATABASE STATE')
+                                   ELSE HAS_PERMS_BY_NAME(NULL, NULL, N'VIEW SERVER STATE') END;
+
+        INSERT @Abandoned (RunId)
+        SELECT RunId FROM AIIndexTuner.Run WHERE Status = 'Running' AND SessionId = @@SPID;
+
+        IF @SeeAll = 1
+            INSERT @Abandoned (RunId)
+            SELECT r.RunId
+            FROM AIIndexTuner.Run AS r
+            WHERE r.Status = 'Running'
+              AND NOT EXISTS (SELECT 1 FROM @Abandoned AS a WHERE a.RunId = r.RunId)
+              AND (   (r.SessionId IS NULL AND r.StartedAt < DATEADD(DAY, -1, @Now))
+                   OR (r.SessionId IS NOT NULL
+                       AND NOT EXISTS (SELECT 1
+                                       FROM sys.dm_exec_sessions AS s
+                                       INNER JOIN sys.dm_exec_requests AS q ON q.session_id = s.session_id
+                                       WHERE s.session_id = r.SessionId AND s.login_time = r.SessionLoginTime)));
+
+        UPDATE r
+        SET Status = 'Abandoned', CompletedAt = @Now,
+            ErrorMessage = LEFT(CONCAT(
+                N'Abandoned: the session that ran it ended or stopped running it before it finished (killed, a client-side query timeout or a failover); found at the start of a later run.',
+                CASE WHEN r.StoredResponseId IS NOT NULL AND r.StoredResponseDeleted IS NULL
+                     THEN CONCAT(N' Its response ', r.StoredResponseId, N' may still be stored, or running, on the endpoint: cancel and delete it with POST <endpoint>/openai/v1/responses/',
+                                 r.StoredResponseId, N'/cancel and DELETE <endpoint>/openai/v1/responses/', r.StoredResponseId, N'.') END), 4000)
+        FROM AIIndexTuner.Run AS r
+        INNER JOIN @Abandoned AS a ON a.RunId = r.RunId;
+
+        UPDATE l
+        SET EndTime = @Now, ElapsedMs = DATEDIFF(MILLISECOND, l.StartTime, @Now),
+            Message = LEFT(CONCAT(l.Message + N'; ', N'Abandoned: the run''s session ended or stopped running it.'), 4000)
+        FROM AIIndexTuner.RunLog AS l
+        INNER JOIN @Abandoned AS a ON a.RunId = l.RunId
+        WHERE l.EndTime IS NULL;
+    END TRY
+    BEGIN CATCH
+    END CATCH;
+END;
+GO
+
+/*
     dbo.sp_AIIndexTuner: AI-assisted index tuning from inside SQL Server.
 
         EXEC dbo.sp_AIIndexTuner;                                      -- whole database, recommend only
@@ -194,10 +257,14 @@ BEGIN
         END;
     END;
 
+    -- Runs left Running by a session that is gone or has moved on (issue #50).
+    EXEC AIIndexTuner.usp_MarkAbandonedRuns;
+
     DECLARE @RunId int;
-    INSERT AIIndexTuner.Run (Mode, SchemaName, TableName, Endpoint, Deployment, ApiShape, ReasoningEffort, SystemPromptHash,
+    INSERT AIIndexTuner.Run (SessionId, SessionLoginTime, Mode, SchemaName, TableName, Endpoint, Deployment, ApiShape, ReasoningEffort, SystemPromptHash,
                              AllowColumnstore, AllowDropIndex, MaxNewIndexes, MinPriority, MinConfidence, MaxTableRows, MaxIndexSizeMB)
-    VALUES (@Mode, @SchemaName, @TableName,
+    VALUES (@@SPID, (SELECT login_time FROM sys.dm_exec_sessions WHERE session_id = @@SPID),
+            @Mode, @SchemaName, @TableName,
             CASE WHEN @TestResponse IS NULL THEN @Endpoint END,
             CASE WHEN @TestResponse IS NULL THEN @Deployment END,
             CASE WHEN @TestResponse IS NULL THEN 'OpenAIResponses' ELSE 'Test' END,
