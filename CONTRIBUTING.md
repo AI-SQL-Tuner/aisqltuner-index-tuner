@@ -83,7 +83,7 @@ If your change could affect the quality of the recommendations or what applying 
 - **Target SQL Server 2025 and the Azure platforms listed in the README's *Requirements*.** Don't add a dependency on a feature those platforms lack.
 - **Quote every name** that comes from the catalog or the model with `QUOTENAME`, and check it against the catalog before it goes into dynamic SQL. Treat plan cache and Query Store text as untrusted input.
 - **Keep collection sections independent.** Each collector section runs in its own `TRY...CATCH`, so a failed section is reported and skipped rather than failing the run. Cap the rows a new section reads, because T-SQL has no per-statement timeout.
-- **Write for every collation, not just your own.** Compare catalog and DMV text with an explicit `COLLATE` where the two can differ (see issue #42), and test on a non-default collation such as Turkish (see issue #44).
+- **Write for every collation, not just your own.** Compare catalog and DMV text with an explicit `COLLATE` where the two can differ (see issue #42). Under a Turkish collation `UPPER('index')` gives `İNDEX`, so change the case of keywords under `Latin1_General_100_BIN2` (see pull request #44), and test on a non-default collation such as Turkish.
 - **Make setup and re-installs safe to repeat.** The install script is re-run to upgrade an existing install: add new columns with `ALTER TABLE ... ADD` guarded by an existence check, so earlier runs and recommendations are kept.
 - Comment non-obvious logic. Keep comments short and explain intent, not what the code already says.
 
