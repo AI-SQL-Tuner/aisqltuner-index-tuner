@@ -1809,6 +1809,23 @@ PRINT CONCAT('PASS T33: polls are retried on transient failures within the deadl
              CASE WHEN @LiveSession IS NULL THEN ' (no other session with a request to check a live run against)' END);
 GO
 
+/* ----- T34: the installed build carries its version (issue #53) ----- */
+DECLARE @Version varchar(32) = AIIndexTuner.fn_Version();
+IF @Version IS NULL OR @Version LIKE '%[_][_]AIINDEXTUNER%' OR @Version NOT LIKE '[0-9]%.[0-9]%.[0-9]%'
+    THROW 50999, N'FAIL T34: AIIndexTuner.fn_Version() does not return a stamped version; install the script build.ps1 generates.', 1;
+EXEC dbo.sp_AIIndexTuner @CollectedData = N'{"t34": true}', @TestResponse = N'{ "summary": "T34.", "recommendations": [] }';
+DECLARE @T34Run int = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Run WHERE RunId = @T34Run AND Version = @Version)
+    THROW 50999, N'FAIL T34: the run did not record AIIndexTuner.fn_Version().', 1;
+-- The first result set cannot be read here (INSERT ... EXEC would nest the collector's own) or described
+-- (the collector uses temp tables), so check the statement that returns it.
+IF OBJECT_DEFINITION(OBJECT_ID(N'dbo.sp_AIIndexTuner')) NOT LIKE N'%SELECT r.RunId, r.Version, r.Status AS RunStatus,%'
+    THROW 50999, N'FAIL T34: the first result set of sp_AIIndexTuner does not start with RunId, Version.', 1;
+DELETE AIIndexTuner.RunLog WHERE RunId = @T34Run;
+DELETE AIIndexTuner.Run WHERE RunId = @T34Run;
+PRINT CONCAT('PASS T34: fn_Version() returns ', @Version, ', each run records it, and sp_AIIndexTuner returns it after RunId');
+GO
+
 /* ----- T35: applies hold the run's lock, and a doomed transaction keeps its error (issue #51) -----
    A unique index on dbo.AuditLog (EventType), a heap with three event types, fails on duplicate keys (error 1505). Inside a caller's
    transaction with XACT_ABORT ON, that error dooms the transaction; recording Failed would raise 3930
