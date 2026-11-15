@@ -176,6 +176,17 @@ IF COL_LENGTH(N'AIIndexTuner.Config', N'LockTimeoutSec') IS NULL
         BuildMaxDop       tinyint NULL CONSTRAINT CK_AIIndexTuner_Config_MaxDop CHECK (BuildMaxDop BETWEEN 1 AND 64);
 GO
 
+/* The two collector sections that read pages, HEAP TABLE ANALYSIS and INDEX PAGE DENSITY, run
+   sys.dm_db_index_physical_stats (SAMPLED) per table (issue #52). CollectPhysicalStats = 0 skips both.
+   PhysicalStatsMaxPages: a table with more reserved pages is skipped and listed as skipped (NULL = no
+   limit; the default, 1,280,000 pages, is 10 GB). WITH VALUES gives existing installs the defaults too. */
+IF COL_LENGTH(N'AIIndexTuner.Config', N'CollectPhysicalStats') IS NULL
+    ALTER TABLE AIIndexTuner.Config ADD
+        CollectPhysicalStats  bit    NOT NULL CONSTRAINT DF_AIIndexTuner_Config_PhysStats DEFAULT (1) WITH VALUES,
+        PhysicalStatsMaxPages bigint NULL     CONSTRAINT DF_AIIndexTuner_Config_PhysStatsMax DEFAULT (1280000) WITH VALUES
+                                              CONSTRAINT CK_AIIndexTuner_Config_PhysStatsMax CHECK (PhysicalStatsMaxPages >= 1);
+GO
+
 /* Step logging (issue #38): sp_AIIndexTuner @Logging, NULL = this default. On by default, since a
    run writes only about 30 small rows. WITH VALUES gives existing installs the default too. */
 IF COL_LENGTH(N'AIIndexTuner.Config', N'EnableLogging') IS NULL
