@@ -68,7 +68,11 @@ try {
     Invoke-Sql (Join-Path $PSScriptRoot '06_Check-ConcurrentApply.sql') $Database
     Write-Host 'PASS concurrent apply: a second session gets error 50102 and changes nothing while another holds the run''s lock'
 } finally {
-    $held = $holder | Wait-Job -Timeout 60 | Receive-Job
+    # The holder waits 20 seconds; 60 allows for a slow start. Wait-Job returns nothing on a timeout.
+    $finished = $holder | Wait-Job -Timeout 60
+    $held = $holder | Receive-Job
+    $holderState = $holder.State
     $holder | Remove-Job -Force
 }
+if (-not $finished) { $held | Write-Host; throw "The lock holder session was still running after 60 seconds (job state: $holderState)." }
 if (($held | Select-Object -Last 1) -ne 'exit 0') { $held | Write-Host; throw 'The lock holder session failed.' }
