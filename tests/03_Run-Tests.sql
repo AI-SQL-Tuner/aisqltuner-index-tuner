@@ -425,6 +425,7 @@ GO
      - its temp-table writes do not name its schema, and the write mix gives only counts, so two
        more collector runs must leave the write mix unchanged.
    The search strings are split so that this batch's own text does not match them. */
+DROP TABLE IF EXISTS dbo.T13Wide;   -- left by a failed run, when the tests are rerun in the same database
 CREATE TABLE dbo.T13Wide (Id int IDENTITY PRIMARY KEY, GroupId int NOT NULL, CustomerId int NOT NULL, Wide nvarchar(300) NULL);
 INSERT dbo.T13Wide (GroupId, CustomerId, Wide)
 SELECT TOP (100000) n % 500, 1 + n % 20000, CASE WHEN n % 4 = 0 THEN CONCAT(N'Wide note ', n) END
@@ -1768,15 +1769,16 @@ GO
 -- Runs left Running: by this session (a client-side timeout), by a session that is gone, and from before
 -- sessions were recorded and over a day old are marked Abandoned by the next run; a run whose session is
 -- still running a request, and a recent one with no session, are left alone. The live session is the
--- longest-running one: a background task started with the instance (such as LOG WRITER) keeps its
--- request; a short system task, or another client's query, can end before the check.
+-- one whose request has run longest, in practice a background task started with the instance (such as
+-- LOG WRITER), which keeps its request; a short system task, or another client's query, can end before
+-- the check.
 DECLARE @MyLogin datetime = (SELECT login_time FROM sys.dm_exec_sessions WHERE session_id = @@SPID),
         @LiveSession smallint, @LiveLogin datetime;
 SELECT TOP (1) @LiveSession = s.session_id, @LiveLogin = s.login_time
 FROM sys.dm_exec_requests AS q
 INNER JOIN sys.dm_exec_sessions AS s ON s.session_id = q.session_id
 WHERE q.session_id <> @@SPID
-ORDER BY s.is_user_process, q.start_time, s.session_id;
+ORDER BY q.start_time, s.session_id;
 
 INSERT AIIndexTuner.Run (Mode, SessionId, SessionLoginTime, StoredResponseId, TableName) VALUES ('RECOMMEND', @@SPID, @MyLogin, N'resp_t33a', N'T33A');
 DECLARE @RunA int = SCOPE_IDENTITY();
