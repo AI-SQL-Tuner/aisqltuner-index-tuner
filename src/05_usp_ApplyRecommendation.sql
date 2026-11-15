@@ -332,15 +332,17 @@ BEGIN
                 CROSS APPLY (SELECT STRING_AGG(CONCAT(ic.column_id, CASE WHEN ic.is_descending_key = 1 THEN 'D' ELSE 'A' END), ',') WITHIN GROUP (ORDER BY ic.key_ordinal) AS sig
                              FROM sys.index_columns AS ic
                              WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0) AS k
-                WHERE i.object_id = @ObjectId AND i.index_id <> @IndexId AND i.type IN (1, 2) AND i.is_disabled = 0 AND i.is_hypothetical = 0
+                -- Only another nonclustered index (issue #52). The clustered index has every column, but a narrow
+                -- nonclustered index on its leading keys is a common way to make counts and range scans read far
+                -- fewer pages than the full rows; dropping it is a low-use decision, with the usage checks below.
+                WHERE i.object_id = @ObjectId AND i.index_id <> @IndexId AND i.type = 2 AND i.is_disabled = 0 AND i.is_hypothetical = 0
                   AND (i.has_filter = 0 OR i.filter_definition = @DropFilter)
                   AND (k.sig = @Sig OR LEFT(k.sig, LEN(@Sig) + 1) = @Sig + ',')
                   AND (@DropUnique = 0 OR (i.is_unique = 1 AND k.sig = @Sig))
-                  AND (i.type = 1   -- the clustered index covers every column
-                       OR NOT EXISTS (SELECT 1 FROM sys.index_columns AS inc
-                                      WHERE inc.object_id = @ObjectId AND inc.index_id = @IndexId AND inc.is_included_column = 1
-                                        AND NOT EXISTS (SELECT 1 FROM sys.index_columns AS ic
-                                                        WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.column_id = inc.column_id)))
+                  AND NOT EXISTS (SELECT 1 FROM sys.index_columns AS inc
+                                  WHERE inc.object_id = @ObjectId AND inc.index_id = @IndexId AND inc.is_included_column = 1
+                                    AND NOT EXISTS (SELECT 1 FROM sys.index_columns AS ic
+                                                    WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.column_id = inc.column_id))
                 ORDER BY i.index_id;
 
             IF @Redundant IS NOT NULL

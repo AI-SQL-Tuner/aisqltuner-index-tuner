@@ -179,8 +179,14 @@ BEGIN
         THROW 50201, N'@Mode must be RECOMMEND or CREATE.', 1;
     IF @TableName IS NOT NULL AND @SchemaName IS NULL
         THROW 50202, N'@SchemaName is required when @TableName is specified.', 1;
+    -- master, tempdb, model and msdb, and databases that SQL Server features own (issue #52): the
+    -- replication distribution database, the SSIS catalog and Reporting Services catalogs.
     IF DB_ID() <= 4
-        THROW 50203, N'Run sp_AIIndexTuner in a user database, not a system database.', 1;
+       OR EXISTS (SELECT 1 FROM sys.databases WHERE database_id = DB_ID() AND is_distributor = 1)
+       OR DB_NAME() IN (N'distribution', N'SSISDB')
+       OR (OBJECT_ID(N'dbo.ExecutionLogStorage', N'U') IS NOT NULL AND OBJECT_ID(N'dbo.Catalog', N'U') IS NOT NULL)   -- a report server catalog, whatever its name
+       OR (OBJECT_ID(N'dbo.PersistedStream', N'U') IS NOT NULL AND OBJECT_ID(N'dbo.SessionData', N'U') IS NOT NULL)   -- a report server temp database
+        THROW 50203, N'Run sp_AIIndexTuner in a user database, not a system database or one that a SQL Server feature owns (distribution, SSISDB, a report server catalog or report server temp database).', 1;
     IF @SchemaName IS NOT NULL AND SCHEMA_ID(@SchemaName) IS NULL
         THROW 50204, N'The schema in @SchemaName does not exist in this database.', 1;
     IF @TableName IS NOT NULL AND OBJECT_ID(QUOTENAME(@SchemaName) + N'.' + QUOTENAME(@TableName), N'U') IS NULL

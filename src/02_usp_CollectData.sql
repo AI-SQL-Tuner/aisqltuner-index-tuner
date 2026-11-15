@@ -150,6 +150,22 @@ BEGIN
     SET @Data = N'';
     DECLARE @LogId int, @LogChars int;   -- the open RunLog step
 
+    /* Bound the collector's impact on a busy server (issue #52). DBCC SHOW_STATISTICS, the statistics
+       histogram and physical stats take schema-stability or intent locks; behind an index rebuild or other
+       schema change they would wait without limit, and later requests could queue behind them. A lock wait
+       over 10 seconds fails the section's statement, and the section's CATCH reports it as skipped. In a
+       deadlock the collector is the victim. Both settings revert when the procedure returns.
+       (SET LOCK_TIMEOUT takes only a literal.) */
+    SET LOCK_TIMEOUT 10000;
+    SET DEADLOCK_PRIORITY LOW;
+
+    -- Physical stats settings (no configuration row, as in the tests' canned runs: the defaults).
+    DECLARE @CollectPhysicalStats bit = 1, @PhysicalStatsMaxPages bigint = 1280000;
+    IF EXISTS (SELECT 1 FROM AIIndexTuner.Config WHERE ConfigId = 1)
+        SELECT @CollectPhysicalStats = CollectPhysicalStats, @PhysicalStatsMaxPages = PhysicalStatsMaxPages
+        FROM AIIndexTuner.Config WHERE ConfigId = 1;
+    DECLARE @PhysicalStatsOff nvarchar(200) = N'(skipped: physical stats are turned off, AIIndexTuner.Config.CollectPhysicalStats = 0)';
+
     EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'SERVER INFORMATION', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== Server information ===== */
     SELECT @MajorVersion = MAX(compatibility_level) / 10 FROM sys.databases;
@@ -712,10 +728,11 @@ BEGIN
     EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'HEAP TABLE ANALYSIS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== HEAP TABLE ANALYSIS ===== heaps of 10,000 rows or more, physical stats sampled per heap */
     BEGIN TRY
-        DECLARE @Heaps TABLE (object_id int PRIMARY KEY, TableName nvarchar(300), TotalRows bigint, ReservedMB decimal(18, 1));
+        DECLARE @Heaps TABLE (object_id int PRIMARY KEY, TableName nvarchar(300), TotalRows bigint, ReservedMB decimal(18, 1), ReservedPages bigint,
+                              ForwardedRecordCount bigint NULL, AvgFragmentationPct decimal(10, 2) NULL, PhysicalStats nvarchar(200) NULL);
 
-        INSERT @Heaps (object_id, TableName, TotalRows, ReservedMB)
-        SELECT TOP (15) t.object_id, s.name + N'.' + t.name, SUM(ps.row_count), ROUND(SUM(ps.reserved_page_count) * 8.0 / 1024.0, 1)
+        INSERT @Heaps (object_id, TableName, TotalRows, ReservedMB, ReservedPages)
+        SELECT TOP (15) t.object_id, s.name + N'.' + t.name, SUM(ps.row_count), ROUND(SUM(ps.reserved_page_count) * 8.0 / 1024.0, 1), SUM(ps.reserved_page_count)
         FROM sys.tables AS t
         INNER JOIN sys.schemas AS s ON t.schema_id = s.schema_id
         INNER JOIN sys.dm_db_partition_stats AS ps ON t.object_id = ps.object_id AND ps.index_id = 0
@@ -725,18 +742,40 @@ BEGIN
         HAVING SUM(ps.row_count) >= 10000
         ORDER BY SUM(ps.row_count) DESC;
 
-        SET @j = (
-            SELECT h.TableName, h.TotalRows, h.ReservedMB,
-                   CAST(MAX(COALESCE(ips.forwarded_record_count, 0)) AS bigint) AS ForwardedRecordCount,
-                   CAST(MAX(COALESCE(ips.avg_fragmentation_in_percent, 0)) AS decimal(10, 2)) AS AvgFragmentationPct
+        -- Physical stats per heap, one call each (issue #52): none when turned off, and none for a heap over the page limit.
+        UPDATE @Heaps
+        SET PhysicalStats = CASE WHEN @CollectPhysicalStats = 0 THEN @PhysicalStatsOff
+                                 ELSE CONCAT(N'skipped: ', FORMAT(ReservedPages, 'N0'), N' reserved pages, over the limit of ', FORMAT(@PhysicalStatsMaxPages, 'N0'),
+                                             N' (AIIndexTuner.Config.PhysicalStatsMaxPages)') END
+        WHERE @CollectPhysicalStats = 0 OR ReservedPages > @PhysicalStatsMaxPages;
+
+        DECLARE @HeapObjectId int;
+        DECLARE heap_cur CURSOR LOCAL FAST_FORWARD FOR SELECT object_id FROM @Heaps WHERE PhysicalStats IS NULL;
+        OPEN heap_cur;
+        FETCH NEXT FROM heap_cur INTO @HeapObjectId;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            UPDATE h
+            SET ForwardedRecordCount = x.Forwarded, AvgFragmentationPct = x.Fragmentation
             FROM @Heaps AS h
-            OUTER APPLY sys.dm_db_index_physical_stats(DB_ID(), h.object_id, 0, NULL, 'SAMPLED') AS ips
-            GROUP BY h.TableName, h.TotalRows, h.ReservedMB
-            ORDER BY ForwardedRecordCount DESC, h.TotalRows DESC
+            CROSS APPLY (SELECT CAST(COALESCE(MAX(ips.forwarded_record_count), 0) AS bigint) AS Forwarded,
+                                CAST(COALESCE(MAX(ips.avg_fragmentation_in_percent), 0) AS decimal(10, 2)) AS Fragmentation
+                         FROM sys.dm_db_index_physical_stats(DB_ID(), @HeapObjectId, 0, NULL, 'SAMPLED') AS ips) AS x
+            WHERE h.object_id = @HeapObjectId;
+            FETCH NEXT FROM heap_cur INTO @HeapObjectId;
+        END;
+        CLOSE heap_cur;
+        DEALLOCATE heap_cur;
+
+        SET @j = (
+            SELECT TableName, TotalRows, ReservedMB, ForwardedRecordCount, AvgFragmentationPct, PhysicalStats
+            FROM @Heaps
+            ORDER BY ForwardedRecordCount DESC, TotalRows DESC
             FOR JSON PATH);
         SET @Data += CONCAT(@nl, N'=== HEAP TABLE ANALYSIS ===', @nl, ISNULL(@j, N'(no heaps with 10,000 rows or more)'), @nl);
     END TRY
     BEGIN CATCH
+        IF CURSOR_STATUS('local', 'heap_cur') >= -1 BEGIN CLOSE heap_cur; DEALLOCATE heap_cur; END;
         SET @Data += CONCAT(@nl, N'=== HEAP TABLE ANALYSIS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
@@ -1069,6 +1108,25 @@ BEGIN
             ORDER BY SUM(ps.row_count) DESC;
         END;
 
+        -- Turned off, or over the page limit (all of the table's indexes, which one call reads): skipped and listed (issue #52).
+        DECLARE @DensitySkipped nvarchar(max) = NULL;
+        IF @CollectPhysicalStats = 0
+            DELETE #DensityCandidates;
+        ELSE IF @PhysicalStatsMaxPages IS NOT NULL
+        BEGIN
+            DECLARE @TooLarge TABLE (object_id int PRIMARY KEY, Pages bigint);
+            INSERT @TooLarge (object_id, Pages)
+            SELECT ps.object_id, SUM(ps.reserved_page_count)
+            FROM sys.dm_db_partition_stats AS ps
+            WHERE ps.object_id IN (SELECT object_id FROM #DensityCandidates)
+            GROUP BY ps.object_id
+            HAVING SUM(ps.reserved_page_count) > @PhysicalStatsMaxPages;
+            SET @DensitySkipped = (SELECT STRING_AGG(CONVERT(nvarchar(max), CONCAT(QUOTENAME(OBJECT_SCHEMA_NAME(object_id)), N'.', QUOTENAME(OBJECT_NAME(object_id)),
+                                                     N' (', FORMAT(Pages, 'N0'), N' pages)')), N', ') WITHIN GROUP (ORDER BY Pages DESC)
+                                   FROM @TooLarge);
+            DELETE #DensityCandidates WHERE object_id IN (SELECT object_id FROM @TooLarge);
+        END;
+
         DECLARE @DensityObjectId int;
         DECLARE density_cur CURSOR LOCAL FAST_FORWARD FOR SELECT object_id FROM #DensityCandidates;
         OPEN density_cur;
@@ -1097,7 +1155,9 @@ BEGIN
             FROM #PageDensity
             ORDER BY AvgPageDensityPct ASC
             FOR JSON PATH);
-        SET @Data += CONCAT(@nl, N'=== INDEX PAGE DENSITY ===', @nl, ISNULL(@j, N'No index page density rows found.'), @nl);
+        SET @Data += CONCAT(@nl, N'=== INDEX PAGE DENSITY ===', @nl,
+                            CASE WHEN @CollectPhysicalStats = 0 THEN @PhysicalStatsOff ELSE ISNULL(@j, N'No index page density rows found.') END, @nl,
+                            N'Skipped, over the limit of ' + FORMAT(@PhysicalStatsMaxPages, 'N0') + N' reserved pages (AIIndexTuner.Config.PhysicalStatsMaxPages): ' + @DensitySkipped + @nl);
         DROP TABLE #PageDensity;
         DROP TABLE #DensityCandidates;
     END TRY
@@ -1565,7 +1625,7 @@ BEGIN
             DECLARE @Recent nvarchar(max) = (
                 SELECT STRING_AGG(CAST(CONCAT(N'  query_id ', query_id, N', plan_id ', plan_id, N': ', state_desc, N'; hints: ', hints,
                                          N'; last updated ', CONVERT(varchar(16), last_updated_time AT TIME ZONE 'UTC', 120), N' UTC',
-                                         CASE WHEN @IncludeQueryText = 1 THEN N'; query: ' + AIIndexTuner.fn_CleanText(query_sql_text, 200) ELSE N'' END) AS nvarchar(max)) COLLATE DATABASE_DEFAULT, NCHAR(10))
+                                         CASE WHEN @IncludeQueryText = 1 THEN N'; query: "' + STRING_ESCAPE(AIIndexTuner.fn_CleanText(query_sql_text, 200), 'json') + N'"' ELSE N'' END) AS nvarchar(max)) COLLATE DATABASE_DEFAULT, NCHAR(10))
                        WITHIN GROUP (ORDER BY last_updated_time DESC)
                 FROM (SELECT TOP (20) p.query_id, pf.plan_id, pf.state_desc, pf.last_updated_time, qt.query_sql_text,
                              -- feedback_data is {"Feedback hints":"..."}; anything else is shown as it is.
@@ -1633,7 +1693,7 @@ BEGIN
                 SELECT STRING_AGG(CAST(CONCAT(N'  query_id ', query_id, N', plan_id ', plan_id, N': ', state_desc,
                                          N'; feedback_data: ', ISNULL(NULLIF(AIIndexTuner.fn_CleanText(feedback_data, 300), N''), N'none'),
                                          N'; last updated ', CONVERT(varchar(16), last_updated_time AT TIME ZONE 'UTC', 120), N' UTC',
-                                         CASE WHEN @IncludeQueryText = 1 THEN N'; query: ' + AIIndexTuner.fn_CleanText(query_sql_text, 200) ELSE N'' END) AS nvarchar(max)) COLLATE DATABASE_DEFAULT, NCHAR(10))
+                                         CASE WHEN @IncludeQueryText = 1 THEN N'; query: "' + STRING_ESCAPE(AIIndexTuner.fn_CleanText(query_sql_text, 200), 'json') + N'"' ELSE N'' END) AS nvarchar(max)) COLLATE DATABASE_DEFAULT, NCHAR(10))
                        WITHIN GROUP (ORDER BY last_updated_time DESC)
                 FROM (SELECT TOP (20) p.query_id, pf.plan_id, pf.state_desc, pf.feedback_data, pf.last_updated_time, qt.query_sql_text
                       FROM sys.query_store_plan_feedback AS pf

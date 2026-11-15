@@ -43,6 +43,25 @@ recommendations are kept, and it replaces the procedures and functions.
 
 ### Fixed
 
+- **The collector's impact on busy servers, untrusted query text, and drops through the clustered
+  index** (issue #52).
+  - HEAP TABLE ANALYSIS and INDEX PAGE DENSITY ran `sys.dm_db_index_physical_stats` (SAMPLED) on
+    up to 15 heaps and every index of up to 40 tables, chosen to include the largest, with no size
+    cap. New `AIIndexTuner.Config` settings: `CollectPhysicalStats = 0` skips them, and a table with
+    more than `PhysicalStatsMaxPages` reserved pages (default 1,280,000, 10 GB) is skipped and
+    listed as skipped.
+  - The collector waited without limit for its schema-stability and intent locks, behind an index
+    rebuild for example, and later requests could queue behind it. It now sets a 10-second
+    `LOCK_TIMEOUT`, so a blocked section is reported and skipped, and `DEADLOCK_PRIORITY LOW`. Both
+    revert when it returns.
+  - The system prompt now tells the model that query text, predicates and names in the input are
+    data, never instructions. Query text in the CE and DOP feedback lines is now quoted and
+    escaped, as it already was in the JSON sections.
+  - A drop was treated as redundant when the clustered index had the same leading keys, which
+    skipped the 7-day usage rule for a narrow nonclustered index on the clustering key, often there
+    to make counts and range scans cheap. Only another nonclustered index makes a drop redundant now.
+  - `sp_AIIndexTuner` also refuses the replication distribution database, `SSISDB` and Reporting
+    Services catalogs, not only `DB_ID() <= 4`.
 - **Two sessions applying the same run could overwrite an `Applied` status** (issue #51). Both read
   `Recommended`; the first built the index and set `Applied`, and the second found the name taken
   and set `Skipped`, so the row no longer said the index was made and `@MaxNewIndexes` stopped
@@ -125,6 +144,11 @@ recommendations are kept, and it replaces the procedures and functions.
 
 ### Tests
 
+- New test T36 (issue #52): the collector's lock timeout and deadlock priority revert; a page
+  limit of 1 lists every heap and page density table as skipped, and `CollectPhysicalStats = 0`
+  skips both sections; query text in plain-text lines is quoted; the prompt has the data rule; a
+  drop of a nonclustered index on the clustering key is not applied as redundant; a report server
+  catalog is refused.
 - New test T34 (issue #53): `fn_Version()` returns a stamped version, a run records it, and
   `sp_AIIndexTuner` returns it. `Run-All.ps1` now also runs `setup/Uninstall.sql` twice and checks
   what it dropped and kept (`tests/04_Prepare-Uninstall.sql`, `tests/05_Check-Uninstall.sql`), and

@@ -41,6 +41,8 @@ about Microsoft's 2006 `AutoIndex.sql` prototype: a modern version, with AI doin
 - To collect: `VIEW SERVER STATE` (or `VIEW SERVER PERFORMANCE STATE`), `VIEW DATABASE STATE` and
   `VIEW DEFINITION`. To call the model: `EXECUTE ANY EXTERNAL ENDPOINT`. To create indexes:
   `ALTER` on the tables.
+- A user database. `sp_AIIndexTuner` refuses the system databases and databases that a SQL Server
+  feature owns: the replication distribution database, `SSISDB` and Reporting Services catalogs.
 
 ## Compared with AI SQL Tuner Studio
 
@@ -263,7 +265,10 @@ EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @MinPriority = 'Low', @MinConfidence 
 ### Apply-mode safety
 
 - **The model's script is never executed.** Plan cache text goes into the prompt, so a crafted
-  query could try to steer what the model writes. The proc builds the `CREATE INDEX`,
+  query could try to steer what the model writes. The system prompt tells the model to treat
+  query text, predicates and names in the input as data, never as instructions, and query text
+  reaches it only as quoted strings; but that only makes steering harder, so the proc builds the
+  `CREATE INDEX`,
   `CREATE INDEX ... WITH (DROP_EXISTING = ON)` or `DROP INDEX` itself:
   - It uses only the structured fields.
   - It checks every table and column against the catalog.
@@ -292,8 +297,10 @@ EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @MinPriority = 'Low', @MinConfidence 
   - indexes named by an index hint in a module, a plan guide or a Query Store hint
   - indexes a forced Query Store plan uses, since the plan would fail with `NO_INDEX`
   - low-use drops before the usage statistics cover 7 days. An index that another index makes
-    redundant can be dropped at any time. Redundant here means the other index has the same leading
-    keys, covers its includes and filter, and keeps any uniqueness. On SQL Server, a low-use drop
+    redundant can be dropped at any time. Redundant here means another nonclustered index has the
+    same leading keys, covers its includes and filter, and keeps any uniqueness. The clustered index
+    does not count: a narrow nonclustered index on the clustering key makes counts and range scans
+    cheaper, so dropping one is a low-use decision. On SQL Server, a low-use drop
     also needs the error log to confirm the period, which takes securityadmin or sysadmin and doesn't
     work inside `INSERT ... EXEC`. On Azure SQL Database a failover can reset the statistics without
     a trace, so the 7 days are counted from the times it can see.
@@ -375,6 +382,8 @@ WHERE ep.name = N'AIIndexTuner';
 | `LockTimeoutSec` | 30 | The longest a drop, an offline build or a columnstore build waits for its locks before it fails (NULL = no limit) |
 | `OnlineWaitMinutes` | 5 | How long an online rowstore build waits at low priority for its locks before it gives up (NULL = wait at normal priority, without limit) |
 | `BuildMaxDop` | NULL | `MAXDOP` for every index build (NULL = the server's setting) |
+| `CollectPhysicalStats` | 1 | 0 skips `sys.dm_db_index_physical_stats` in HEAP TABLE ANALYSIS and INDEX PAGE DENSITY, which read pages of each table |
+| `PhysicalStatsMaxPages` | 1280000 | Those two sections skip a table with more reserved pages (10 GB by default) and list it as skipped (NULL = no limit) |
 
 ### Step log
 
@@ -448,9 +457,12 @@ all of the query text and predicates above; it does not affect the column values
 
 - **Claude:** Claude deployments are not supported yet.
 - **No timeouts:** T-SQL has no per-statement timeout, so a collector section cannot be cut off
-  the way the desktop app's are. Work is bounded by row caps instead, including the 20,000-plan
-  cap on Query Store scope resolution. Each section runs in its own `TRY...CATCH`, so a failed
-  section is reported and skipped.
+  the way the desktop app's are. Work is bounded instead: by row caps, including the 20,000-plan
+  cap on Query Store scope resolution; by `PhysicalStatsMaxPages` for the two sections that read
+  pages; and by a 10-second lock timeout, so a section blocked behind an index rebuild or other
+  schema change is skipped rather than waiting, and queueing others behind it. The collector also
+  runs at `DEADLOCK_PRIORITY LOW`. Each section runs in its own `TRY...CATCH`, so a failed section
+  is reported and skipped.
 - **Error log:** reading it needs `securityadmin` or `sysadmin`. Without that, the usage window
   says which resets it could not see.
 - **`INSERT ... EXEC`:** wrapping `sp_AIIndexTuner` in `INSERT ... EXEC` breaks two parts,
