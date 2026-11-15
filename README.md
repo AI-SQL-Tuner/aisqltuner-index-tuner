@@ -254,6 +254,13 @@ EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @MinPriority = 'Low', @MinConfidence 
   - It checks every table and column against the catalog.
   - It quotes every name with `QUOTENAME`.
   - It allows only known option values.
+- **One session at a time applies a run's recommendations.** CREATE mode and
+  `sp_AIIndexTuner_Apply` take an exclusive application lock on the run. A second session that
+  tries to apply the same run (a manual apply while an Agent job is still building, say) fails at
+  once with error 50102 and changes nothing; apply again when the first is done. A recommendation
+  already `Applied` is never marked `Skipped` or `Failed` afterwards. Inside your own transaction,
+  a build error that makes the transaction uncommittable comes back to you as itself, and the
+  recommendation is left as it was.
 - **Recommendations it skips, each with a reason:**
   - an existing index already has the same leading keys and covers the includes, which also makes
     reruns safe

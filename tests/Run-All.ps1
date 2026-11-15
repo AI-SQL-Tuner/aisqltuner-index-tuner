@@ -58,3 +58,17 @@ $out = Join-Path ([IO.Path]::GetTempPath()) 'aisqltuner-index-tuner-tests.txt'
 $code = $LASTEXITCODE
 Get-Content $out -Encoding utf8 | Where-Object { $_ -match '^(PASS|FAIL|SKIP|ALL TESTS)|^Msg ' } | ForEach-Object { Write-Host $_ }
 if ($code -ne 0) { Write-Host "Tests failed. Full output: $out"; exit 1 }
+
+# Two sessions applying one run (issue #51): a background session holds the run's apply lock while
+# this one tries to apply it.
+Write-Host 'Checking concurrent applies...'
+$holderArgs = @('-S', $Server, '-E', '-C', '-f', '65001', '-b', '-d', $Database, '-v', 'HoldSeconds=20', '-i', (Join-Path $PSScriptRoot '06_Hold-ApplyLock.sql'))
+$holder = Start-Job -ScriptBlock { param($a) & sqlcmd @a 2>&1; "exit $LASTEXITCODE" } -ArgumentList (,$holderArgs)
+try {
+    Invoke-Sql (Join-Path $PSScriptRoot '06_Check-ConcurrentApply.sql') $Database
+    Write-Host 'PASS concurrent apply: a second session gets error 50102 and changes nothing while another holds the run''s lock'
+} finally {
+    $held = $holder | Wait-Job -Timeout 60 | Receive-Job
+    $holder | Remove-Job -Force
+}
+if (($held | Select-Object -Last 1) -ne 'exit 0') { $held | Write-Host; throw 'The lock holder session failed.' }
