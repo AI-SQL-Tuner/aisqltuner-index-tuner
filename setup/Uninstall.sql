@@ -3,7 +3,7 @@
 
     Run in the database where you installed aisqltuner-index-tuner.sql. It drops:
 
-        - dbo.sp_AIIndexTuner and dbo.sp_AIIndexTuner_Apply
+        - dbo.sp_AIIndexTuner, dbo.sp_AIIndexTuner_Apply and dbo.sp_AIIndexTuner_Purge
         - every object in the AIIndexTuner schema (tables, with all runs and recommendations, and
           the procedures and functions), then the schema
         - the database scoped credential named in AIIndexTuner.Config, if DropCredential is 1 below
@@ -35,6 +35,7 @@ SELECT @DropCredential = DropCredential, @RemoveIndexTags = RemoveIndexTags FROM
 IF SCHEMA_ID(N'AIIndexTuner') IS NULL
    AND OBJECT_ID(N'dbo.sp_AIIndexTuner', N'P') IS NULL
    AND OBJECT_ID(N'dbo.sp_AIIndexTuner_Apply', N'P') IS NULL
+   AND OBJECT_ID(N'dbo.sp_AIIndexTuner_Purge', N'P') IS NULL
 BEGIN
     PRINT N'aisqltuner-index-tuner is not installed in ' + QUOTENAME(DB_NAME()) + N'. Nothing was changed.';
     RETURN;
@@ -90,7 +91,8 @@ BEGIN
     DEALLOCATE tag_cur;
 END;
 
-/* The two dbo procedures. */
+/* The dbo procedures. */
+IF OBJECT_ID(N'dbo.sp_AIIndexTuner_Purge', N'P') IS NOT NULL BEGIN DROP PROCEDURE dbo.sp_AIIndexTuner_Purge; SET @Dropped += 1; END;
 IF OBJECT_ID(N'dbo.sp_AIIndexTuner_Apply', N'P') IS NOT NULL BEGIN DROP PROCEDURE dbo.sp_AIIndexTuner_Apply; SET @Dropped += 1; END;
 IF OBJECT_ID(N'dbo.sp_AIIndexTuner', N'P') IS NOT NULL BEGIN DROP PROCEDURE dbo.sp_AIIndexTuner; SET @Dropped += 1; END;
 

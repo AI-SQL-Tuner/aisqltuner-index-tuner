@@ -187,6 +187,18 @@ IF COL_LENGTH(N'AIIndexTuner.Config', N'CollectPhysicalStats') IS NULL
                                               CONSTRAINT CK_AIIndexTuner_Config_PhysStatsMax CHECK (PhysicalStatsMaxPages >= 1);
 GO
 
+/* Run history retention (issue #55), in days; NULL = keep forever, as before. RetainRunDays: runs
+   completed longer ago are deleted with their RunLog rows and recommendations, except a run's Applied
+   recommendations, the record of what changed and how to undo it. RetainRunDetailDays: runs completed
+   longer ago lose only CollectedData and RawResponse, the large columns that hold query text and
+   histogram values. With either set, each sp_AIIndexTuner run purges first; sp_AIIndexTuner_Purge
+   does it on demand. */
+IF COL_LENGTH(N'AIIndexTuner.Config', N'RetainRunDays') IS NULL
+    ALTER TABLE AIIndexTuner.Config ADD
+        RetainRunDays       int NULL CONSTRAINT CK_AIIndexTuner_Config_RetainRuns CHECK (RetainRunDays >= 1),
+        RetainRunDetailDays int NULL CONSTRAINT CK_AIIndexTuner_Config_RetainDetail CHECK (RetainRunDetailDays >= 1);
+GO
+
 /* Step logging (issue #38): sp_AIIndexTuner @Logging, NULL = this default. On by default, since a
    run writes only about 30 small rows. WITH VALUES gives existing installs the default too. */
 IF COL_LENGTH(N'AIIndexTuner.Config', N'EnableLogging') IS NULL

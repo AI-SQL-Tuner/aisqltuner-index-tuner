@@ -11,6 +11,19 @@ recommendations are kept, and it replaces the procedures and functions.
 
 ### Added
 
+- **Run history retention and `sp_AIIndexTuner_Purge`** (issue #55). Nothing deleted runs before,
+  so a scheduled job grew `AIIndexTuner.Run`, `RunLog` and `Recommendation` without limit, with up
+  to `MaxPayloadChars` of collected data per run.
+  - New `AIIndexTuner.Config` settings, both NULL (keep forever, as before) by default:
+    `RetainRunDays` deletes runs completed longer ago with their step log and recommendations, and
+    `RetainRunDetailDays` clears only `CollectedData` and `RawResponse`. With either set, each
+    `sp_AIIndexTuner` run purges first and logs a `Purge run history` step.
+  - New `dbo.sp_AIIndexTuner_Purge @OlderThanDays, @DetailOnly, @IncludeApplied, @WhatIf` runs the
+    purge on demand and returns what it removed, or would remove.
+  - `Applied` recommendations, and the run rows they belong to, are kept unless
+    `@IncludeApplied = 1`. Running runs are never touched, and a run another session is applying
+    is skipped.
+  - `setup/Uninstall.sql` drops the new procedure too.
 - **Version stamp, uninstall script and CI** (issue #53).
   - `build.ps1` stamps the version in the new `VERSION` file into the install script's header and
     into the new `AIIndexTuner.fn_Version()`. Each run records it in the new `Run.Version` column,
@@ -144,6 +157,10 @@ recommendations are kept, and it replaces the procedures and functions.
 
 ### Tests
 
+- New test T37 (issue #55): old runs are deleted with their child rows and newer ones kept; Applied
+  recommendations are kept unless `@IncludeApplied = 1`; `@DetailOnly` clears only the two
+  columns; `@WhatIf` changes nothing; refusals; `sp_AIIndexTuner` applies the configured retention.
+  The concurrent-apply check also confirms the purge skips a run another session is applying.
 - New test T36 (issue #52): the collector's lock timeout and deadlock priority revert; a page
   limit of 1 lists every heap and page density table as skipped, and `CollectPhysicalStats = 0`
   skips both sections; query text in plain-text lines is quoted; the prompt has the data rule; a

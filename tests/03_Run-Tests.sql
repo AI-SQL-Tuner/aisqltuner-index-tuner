@@ -1965,5 +1965,143 @@ END;
 PRINT 'PASS T36: the collector''s lock settings revert, physical stats are skipped over the page limit or when turned off, query text is quoted, the prompt says the input is data, only a nonclustered index makes another redundant, and a report server catalog is refused';
 GO
 
+/* ----- T37: run history retention and purge (issue #55) ----- */
+DECLARE @T37Problems nvarchar(max) = N'', @T37Now datetime2(0) = SYSDATETIME(), @T37Error int;
+DECLARE @T37Old int, @T37Failed int, @T37Recent int, @T37Running int;
+INSERT AIIndexTuner.Run (Mode, Status, StartedAt, CompletedAt, Summary, CollectedData, RawResponse)
+VALUES ('CREATE', 'Succeeded', DATEADD(DAY, -41, @T37Now), DATEADD(DAY, -40, @T37Now), N'T37 old', N'payload', N'response');
+SET @T37Old = SCOPE_IDENTITY();
+INSERT AIIndexTuner.Run (Mode, Status, StartedAt, CompletedAt, Summary, CollectedData)
+VALUES ('RECOMMEND', 'Failed', DATEADD(DAY, -41, @T37Now), DATEADD(DAY, -40, @T37Now), N'T37 failed', N'payload');
+SET @T37Failed = SCOPE_IDENTITY();
+INSERT AIIndexTuner.Run (Mode, Status, StartedAt, CompletedAt, Summary, CollectedData, RawResponse)
+VALUES ('RECOMMEND', 'Succeeded', DATEADD(DAY, -10, @T37Now), DATEADD(DAY, -10, @T37Now), N'T37 recent', N'payload', N'response');
+SET @T37Recent = SCOPE_IDENTITY();
+INSERT AIIndexTuner.Run (Mode, Status, StartedAt, Summary, CollectedData)
+VALUES ('RECOMMEND', 'Running', DATEADD(DAY, -40, @T37Now), N'T37 running', N'payload');
+SET @T37Running = SCOPE_IDENTITY();
+INSERT AIIndexTuner.Recommendation (RunId, Category, Status)
+VALUES (@T37Old, 'CreateIndex', 'Applied'), (@T37Old, 'CreateIndex', 'Recommended'), (@T37Failed, 'CreateIndex', 'Skipped'), (@T37Recent, 'CreateIndex', 'Recommended');
+INSERT AIIndexTuner.RunLog (RunId, Collector, StartTime)
+VALUES (@T37Old, N'T37', DATEADD(DAY, -40, @T37Now)), (@T37Old, N'T37', DATEADD(DAY, -40, @T37Now)), (@T37Failed, N'T37', DATEADD(DAY, -40, @T37Now)),
+       (@T37Running, N'T37', DATEADD(DAY, -40, @T37Now)),
+       (NULL, N'T37 collect only, old', DATEADD(DAY, -40, @T37Now)), (NULL, N'T37 collect only, new', @T37Now);
+
+-- @WhatIf: the plan, and nothing changed.
+CREATE TABLE #T37 (RunId int NULL, StartedAt datetime2(0) NULL, CompletedAt datetime2(0) NULL, RunStatus varchar(20) NULL, Action varchar(30) NOT NULL,
+                   RunLogRows int NOT NULL, RecommendationRows int NOT NULL, AppliedKept int NOT NULL, DetailChars bigint NOT NULL, Outcome nvarchar(2048) NULL);
+INSERT #T37 EXEC dbo.sp_AIIndexTuner_Purge @OlderThanDays = 30, @WhatIf = 1;
+IF (SELECT COUNT(*) FROM #T37) <> 3
+   OR NOT EXISTS (SELECT 1 FROM #T37 WHERE RunId = @T37Old AND Action = 'Delete except Applied' AND RunLogRows = 2 AND RecommendationRows = 1 AND AppliedKept = 1 AND DetailChars = 15 AND Outcome = N'WhatIf: not changed')
+   OR NOT EXISTS (SELECT 1 FROM #T37 WHERE RunId = @T37Failed AND Action = 'Delete' AND RunLogRows = 1 AND RecommendationRows = 1 AND AppliedKept = 0 AND DetailChars = 7)
+   OR NOT EXISTS (SELECT 1 FROM #T37 WHERE RunId IS NULL AND Action = 'Delete' AND RunLogRows = 1 AND Outcome LIKE N'WhatIf: not changed (RunLog rows of @CollectOnly calls%')
+    SET @T37Problems += N' @WhatIf did not list the two old runs and the old RunLog row without a run as expected;';
+IF (SELECT COUNT(*) FROM AIIndexTuner.Run WHERE RunId IN (@T37Old, @T37Failed, @T37Recent, @T37Running) AND CollectedData IS NOT NULL) <> 4
+   OR (SELECT COUNT(*) FROM AIIndexTuner.Recommendation WHERE RunId IN (@T37Old, @T37Failed, @T37Recent)) <> 4
+   OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.RunLog WHERE Collector = N'T37 collect only, old')
+    SET @T37Problems += N' @WhatIf changed something;';
+
+-- Older than 30 days: the failed run goes whole; the old run keeps only its row (without detail) and its
+-- Applied recommendation; the newer run, the Running one and the new RunLog row without a run stay.
+EXEC dbo.sp_AIIndexTuner_Purge @OlderThanDays = 30;
+IF EXISTS (SELECT 1 FROM AIIndexTuner.Run WHERE RunId = @T37Failed) OR EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RunId = @T37Failed)
+   OR EXISTS (SELECT 1 FROM AIIndexTuner.RunLog WHERE RunId = @T37Failed)
+    SET @T37Problems += N' the old run without Applied recommendations was not deleted with its child rows;';
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Run WHERE RunId = @T37Old AND CollectedData IS NULL AND RawResponse IS NULL)
+   OR (SELECT COUNT(*) FROM AIIndexTuner.Recommendation WHERE RunId = @T37Old) <> 1
+   OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RunId = @T37Old AND Status = 'Applied')
+   OR EXISTS (SELECT 1 FROM AIIndexTuner.RunLog WHERE RunId = @T37Old)
+    SET @T37Problems += N' the old run with an Applied recommendation was not kept with only that recommendation;';
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Run WHERE RunId = @T37Recent AND CollectedData IS NOT NULL AND RawResponse IS NOT NULL)
+   OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RunId = @T37Recent)
+   OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.Run WHERE RunId = @T37Running AND CollectedData IS NOT NULL)
+   OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.RunLog WHERE RunId = @T37Running)
+    SET @T37Problems += N' a newer or Running run was changed;';
+IF EXISTS (SELECT 1 FROM AIIndexTuner.RunLog WHERE Collector = N'T37 collect only, old')
+   OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.RunLog WHERE Collector = N'T37 collect only, new')
+    SET @T37Problems += N' RunLog rows without a run were not purged by age;';
+
+-- A run trimmed to its Applied recommendations is not listed again.
+TRUNCATE TABLE #T37;
+INSERT #T37 EXEC dbo.sp_AIIndexTuner_Purge @OlderThanDays = 30, @WhatIf = 1;
+IF EXISTS (SELECT 1 FROM #T37 WHERE RunId = @T37Old)
+    SET @T37Problems += N' a run already trimmed to its Applied recommendations was listed again;';
+
+-- @DetailOnly clears only the two columns.
+EXEC dbo.sp_AIIndexTuner_Purge @OlderThanDays = 5, @DetailOnly = 1;
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Run WHERE RunId = @T37Recent AND CollectedData IS NULL AND RawResponse IS NULL AND Summary = N'T37 recent')
+   OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RunId = @T37Recent)
+    SET @T37Problems += N' @DetailOnly did not clear only CollectedData and RawResponse;';
+
+-- @IncludeApplied deletes the Applied recommendations too.
+EXEC dbo.sp_AIIndexTuner_Purge @OlderThanDays = 30, @IncludeApplied = 1;
+IF EXISTS (SELECT 1 FROM AIIndexTuner.Run WHERE RunId = @T37Old) OR EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RunId = @T37Old)
+    SET @T37Problems += N' @IncludeApplied = 1 did not delete the run with its Applied recommendation;';
+
+-- Refusals: a negative age, and a purge inside a transaction.
+SET @T37Error = NULL;
+BEGIN TRY EXEC dbo.sp_AIIndexTuner_Purge @OlderThanDays = -1; END TRY BEGIN CATCH SET @T37Error = ERROR_NUMBER(); END CATCH;
+IF ISNULL(@T37Error, 0) <> 50401 SET @T37Problems += CONCAT(N' @OlderThanDays = -1 gave error ', ISNULL(CONVERT(varchar(12), @T37Error), 'none'), N', not 50401;');
+SET @T37Error = NULL;
+BEGIN TRANSACTION;
+BEGIN TRY EXEC dbo.sp_AIIndexTuner_Purge @OlderThanDays = 30; END TRY BEGIN CATCH SET @T37Error = ERROR_NUMBER(); END CATCH;
+IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+IF ISNULL(@T37Error, 0) <> 50402 SET @T37Problems += CONCAT(N' a purge inside a transaction gave error ', ISNULL(CONVERT(varchar(12), @T37Error), 'none'), N', not 50402;');
+
+-- The retention settings: none by default; with them set, each sp_AIIndexTuner run purges first.
+IF COLUMNPROPERTY(OBJECT_ID(N'AIIndexTuner.Config'), N'RetainRunDays', 'AllowsNull') <> 1
+   OR COLUMNPROPERTY(OBJECT_ID(N'AIIndexTuner.Config'), N'RetainRunDetailDays', 'AllowsNull') <> 1
+   OR EXISTS (SELECT 1 FROM sys.default_constraints WHERE parent_object_id = OBJECT_ID(N'AIIndexTuner.Config')
+              AND parent_column_id IN (COLUMNPROPERTY(OBJECT_ID(N'AIIndexTuner.Config'), N'RetainRunDays', 'ColumnId'),
+                                       COLUMNPROPERTY(OBJECT_ID(N'AIIndexTuner.Config'), N'RetainRunDetailDays', 'ColumnId')))
+    SET @T37Problems += N' the retention settings are not nullable columns without a default;';
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Config)
+BEGIN
+    SET @T37Error = NULL;
+    BEGIN TRY EXEC dbo.sp_AIIndexTuner_Purge; END TRY BEGIN CATCH SET @T37Error = ERROR_NUMBER(); END CATCH;
+    IF ISNULL(@T37Error, 0) <> 50403 SET @T37Problems += CONCAT(N' a purge with no retention set gave error ', ISNULL(CONVERT(varchar(12), @T37Error), 'none'), N', not 50403;');
+
+    DECLARE @T37Expired int, @T37Aging int, @T37Run int;
+    INSERT AIIndexTuner.Run (Mode, Status, StartedAt, CompletedAt, Summary, CollectedData)
+    VALUES ('RECOMMEND', 'Succeeded', DATEADD(DAY, -41, @T37Now), DATEADD(DAY, -40, @T37Now), N'T37 expired', N'payload');
+    SET @T37Expired = SCOPE_IDENTITY();
+    INSERT AIIndexTuner.Run (Mode, Status, StartedAt, CompletedAt, Summary, CollectedData)
+    VALUES ('RECOMMEND', 'Succeeded', DATEADD(DAY, -10, @T37Now), DATEADD(DAY, -10, @T37Now), N'T37 aging', N'payload');
+    SET @T37Aging = SCOPE_IDENTITY();
+    INSERT AIIndexTuner.Config (ConfigId, Endpoint, Deployment, CredentialName, RetainRunDays, RetainRunDetailDays)
+    VALUES (1, N'https://t37.invalid/', N't37', N'https://t37.invalid', 30, 5);
+    EXEC dbo.sp_AIIndexTuner @CollectedData = N'{"t37": true}', @TestResponse = N'{ "summary": "T37 auto purge.", "recommendations": [] }';
+    SET @T37Run = (SELECT MAX(RunId) FROM AIIndexTuner.Run WHERE Summary = N'T37 auto purge.');
+    IF EXISTS (SELECT 1 FROM AIIndexTuner.Run WHERE RunId = @T37Expired)
+       OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.Run WHERE RunId = @T37Aging AND CollectedData IS NULL)
+       OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.Run WHERE RunId = @T37Run AND Status = 'Succeeded' AND CollectedData IS NOT NULL)
+       OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.RunLog WHERE RunId = @T37Run AND Collector = N'Purge run history' AND EndTime IS NOT NULL
+                      AND Message LIKE N'Runs deleted: 1;%detail cleared: 1;%')
+        SET @T37Problems += N' sp_AIIndexTuner did not purge by the configured retention and log it;';
+
+    SET @T37Error = NULL;
+    BEGIN TRY UPDATE AIIndexTuner.Config SET RetainRunDays = 0; END TRY BEGIN CATCH SET @T37Error = ERROR_NUMBER(); END CATCH;
+    IF ISNULL(@T37Error, 0) <> 547 SET @T37Problems += N' RetainRunDays = 0 was accepted;';
+
+    DELETE AIIndexTuner.Config;
+    DELETE AIIndexTuner.RunLog WHERE RunId IN (@T37Run, @T37Aging);
+    DELETE AIIndexTuner.Run WHERE RunId IN (@T37Run, @T37Aging);
+END
+ELSE
+    PRINT 'SKIP T37 configured retention: AIIndexTuner.Config has a row';
+
+DELETE AIIndexTuner.RunLog WHERE RunId IN (@T37Recent, @T37Running) OR Collector = N'T37 collect only, new';
+DELETE AIIndexTuner.Recommendation WHERE RunId IN (@T37Recent, @T37Running);
+DELETE AIIndexTuner.Run WHERE RunId IN (@T37Recent, @T37Running);
+DROP TABLE #T37;
+
+IF @T37Problems <> N''
+BEGIN
+    DECLARE @T37Msg nvarchar(2048) = LEFT(N'FAIL T37:' + @T37Problems, 2048);
+    THROW 50999, @T37Msg, 1;
+END;
+PRINT 'PASS T37: the purge deletes old runs with their child rows, keeps Applied recommendations unless asked, clears only the detail with @DetailOnly, changes nothing with @WhatIf, and sp_AIIndexTuner applies the configured retention';
+GO
+
 PRINT 'ALL TESTS PASSED';
 GO

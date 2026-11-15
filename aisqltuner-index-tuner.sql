@@ -201,6 +201,18 @@ IF COL_LENGTH(N'AIIndexTuner.Config', N'CollectPhysicalStats') IS NULL
                                               CONSTRAINT CK_AIIndexTuner_Config_PhysStatsMax CHECK (PhysicalStatsMaxPages >= 1);
 GO
 
+/* Run history retention (issue #55), in days; NULL = keep forever, as before. RetainRunDays: runs
+   completed longer ago are deleted with their RunLog rows and recommendations, except a run's Applied
+   recommendations, the record of what changed and how to undo it. RetainRunDetailDays: runs completed
+   longer ago lose only CollectedData and RawResponse, the large columns that hold query text and
+   histogram values. With either set, each sp_AIIndexTuner run purges first; sp_AIIndexTuner_Purge
+   does it on demand. */
+IF COL_LENGTH(N'AIIndexTuner.Config', N'RetainRunDays') IS NULL
+    ALTER TABLE AIIndexTuner.Config ADD
+        RetainRunDays       int NULL CONSTRAINT CK_AIIndexTuner_Config_RetainRuns CHECK (RetainRunDays >= 1),
+        RetainRunDetailDays int NULL CONSTRAINT CK_AIIndexTuner_Config_RetainDetail CHECK (RetainRunDetailDays >= 1);
+GO
+
 /* Step logging (issue #38): sp_AIIndexTuner @Logging, NULL = this default. On by default, since a
    run writes only about 30 small rows. WITH VALUES gives existing installs the default too. */
 IF COL_LENGTH(N'AIIndexTuner.Config', N'EnableLogging') IS NULL
@@ -3826,6 +3838,164 @@ END;
 GO
 
 /*
+    AIIndexTuner.usp_PurgeRuns (issue #55): removes run history. sp_AIIndexTuner_Purge and, when
+    AIIndexTuner.Config sets a retention, each sp_AIIndexTuner run call it.
+    - @DeleteBefore: a run completed before it is deleted with its RunLog rows and recommendations.
+      Unless @IncludeApplied = 1, a run with Applied recommendations keeps its row and those
+      recommendations (the AppliedDDL and UndoDDL that record what changed); its other
+      recommendations, its RunLog rows and its detail go. RunLog rows of @CollectOnly calls (no run)
+      that started before it go too.
+    - @DetailBefore: a run completed before it, and not deleted, loses CollectedData and RawResponse.
+    A run still Running has no CompletedAt and is never touched. Each run is changed in its own
+    transaction, holding the run's apply lock (AIIndexTuner.Apply.Run.<RunId>, see
+    usp_ApplyRecommendation), so a run another session is applying is skipped, not changed under it.
+    @WhatIf = 1 changes nothing and reports what would be done. @Results = 1 returns one row per run
+    (and one for the RunLog rows without a run); the counts are what was, or would be, removed.
+    Must run outside a transaction, except with @WhatIf = 1: each run's changes commit on their own.
+*/
+CREATE OR ALTER PROCEDURE AIIndexTuner.usp_PurgeRuns
+    @DeleteBefore   datetime2(0) = NULL,
+    @DetailBefore   datetime2(0) = NULL,
+    @IncludeApplied bit = 0,
+    @WhatIf         bit = 0,
+    @Results        bit = 1,
+    @RunsDeleted    int = NULL OUTPUT,   -- runs deleted whole
+    @RunsTrimmed    int = NULL OUTPUT,   -- runs kept for their Applied recommendations, the rest removed
+    @DetailCleared  int = NULL OUTPUT,   -- runs that lost only CollectedData and RawResponse
+    @RunsSkipped    int = NULL OUTPUT    -- runs another session was applying, or whose change failed
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT OFF;
+    SELECT @RunsDeleted = 0, @RunsTrimmed = 0, @DetailCleared = 0, @RunsSkipped = 0, @IncludeApplied = ISNULL(@IncludeApplied, 0), @WhatIf = ISNULL(@WhatIf, 0);
+
+    IF @@TRANCOUNT > 0 AND @WhatIf = 0
+        THROW 50402, N'Run the purge outside a transaction: each run''s changes commit on their own. @WhatIf = 1 may run inside one.', 1;
+
+    DECLARE @Plan TABLE (
+        RunId int NULL, StartedAt datetime2(0) NULL, CompletedAt datetime2(0) NULL, RunStatus varchar(20) NULL,
+        Action varchar(30) NOT NULL, RunLogRows int NOT NULL, RecommendationRows int NOT NULL, AppliedKept int NOT NULL,
+        DetailChars bigint NOT NULL, Outcome nvarchar(2048) NULL);
+
+    -- The runs old enough for either cutoff, then their RunLog and recommendation counts, each
+    -- aggregated once over those runs and joined, not looked up per run.
+    DECLARE @Candidates TABLE (RunId int PRIMARY KEY);
+    INSERT @Candidates (RunId)
+    SELECT RunId FROM AIIndexTuner.Run
+    WHERE CompletedAt < @DeleteBefore
+       OR (CompletedAt < @DetailBefore AND (CollectedData IS NOT NULL OR RawResponse IS NOT NULL));
+
+    -- A run completed before @DeleteBefore is listed unless it was already trimmed to its Applied
+    -- recommendations (nothing left to remove); one before @DetailBefore only while it has detail.
+    INSERT @Plan (RunId, StartedAt, CompletedAt, RunStatus, Action, RunLogRows, RecommendationRows, AppliedKept, DetailChars)
+    SELECT r.RunId, r.StartedAt, r.CompletedAt, r.Status, a.Action,
+           CASE WHEN a.Action = 'Clear detail' THEN 0 ELSE ISNULL(l.Logs, 0) END,
+           CASE a.Action WHEN 'Delete' THEN ISNULL(c.Recs, 0) WHEN 'Delete except Applied' THEN c.Recs - c.Applied ELSE 0 END,
+           CASE WHEN a.Action = 'Delete except Applied' THEN c.Applied ELSE 0 END,
+           ISNULL(DATALENGTH(r.CollectedData), 0) / 2 + ISNULL(DATALENGTH(r.RawResponse), 0) / 2
+    FROM @Candidates AS cand
+    INNER JOIN AIIndexTuner.Run AS r ON r.RunId = cand.RunId
+    LEFT JOIN (SELECT rl.RunId, COUNT(*) AS Logs
+               FROM AIIndexTuner.RunLog AS rl INNER JOIN @Candidates AS x ON x.RunId = rl.RunId
+               GROUP BY rl.RunId) AS l ON l.RunId = r.RunId
+    LEFT JOIN (SELECT rec.RunId, COUNT(*) AS Recs, COUNT(CASE WHEN rec.Status = 'Applied' THEN 1 END) AS Applied
+               FROM AIIndexTuner.Recommendation AS rec INNER JOIN @Candidates AS x ON x.RunId = rec.RunId
+               GROUP BY rec.RunId) AS c ON c.RunId = r.RunId
+    CROSS APPLY (SELECT CASE WHEN r.CompletedAt < @DeleteBefore
+                             THEN CASE WHEN @IncludeApplied = 0 AND c.Applied > 0 THEN 'Delete except Applied' ELSE 'Delete' END
+                             ELSE 'Clear detail' END AS Action) AS a
+    WHERE (r.CompletedAt < @DeleteBefore
+           AND (a.Action = 'Delete' OR c.Recs > c.Applied OR l.Logs > 0 OR r.CollectedData IS NOT NULL OR r.RawResponse IS NOT NULL))
+       OR (r.CompletedAt < @DetailBefore AND (r.CollectedData IS NOT NULL OR r.RawResponse IS NOT NULL));
+
+    DECLARE @RunId int, @Action varchar(30), @Lock nvarchar(255), @Got int, @Logs int, @Recs int, @Outcome nvarchar(2048);
+    IF @WhatIf = 1
+        UPDATE @Plan SET Outcome = N'WhatIf: not changed';
+    ELSE
+    BEGIN
+        DECLARE purge_cur CURSOR LOCAL FAST_FORWARD FOR SELECT RunId, Action FROM @Plan ORDER BY RunId;
+        OPEN purge_cur;
+        FETCH NEXT FROM purge_cur INTO @RunId, @Action;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            SELECT @Logs = 0, @Recs = 0, @Outcome = NULL, @Lock = CONCAT(N'AIIndexTuner.Apply.Run.', @RunId);
+            BEGIN TRY
+                BEGIN TRANSACTION;
+                EXEC @Got = sys.sp_getapplock @Resource = @Lock, @LockMode = 'Exclusive', @LockOwner = 'Transaction', @LockTimeout = 0;
+                IF @Got < 0
+                BEGIN
+                    ROLLBACK TRANSACTION;
+                    SET @Outcome = N'Skipped: another session is applying this run''s recommendations. The next purge tries again.';
+                END
+                ELSE
+                BEGIN
+                    IF @Action IN ('Delete', 'Delete except Applied')
+                    BEGIN
+                        DELETE AIIndexTuner.RunLog WHERE RunId = @RunId;
+                        SET @Logs = @@ROWCOUNT;
+                        DELETE AIIndexTuner.Recommendation WHERE RunId = @RunId AND (@IncludeApplied = 1 OR Status <> 'Applied');
+                        SET @Recs = @@ROWCOUNT;
+                    END;
+                    -- Re-checked in the transaction: a recommendation applied since the plan keeps its run.
+                    IF @Action = 'Delete' AND NOT EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RunId = @RunId)
+                        DELETE AIIndexTuner.Run WHERE RunId = @RunId;
+                    ELSE
+                    BEGIN
+                        IF @Action = 'Delete' SET @Action = 'Delete except Applied';
+                        UPDATE AIIndexTuner.Run SET CollectedData = NULL, RawResponse = NULL
+                        WHERE RunId = @RunId AND (CollectedData IS NOT NULL OR RawResponse IS NOT NULL);
+                    END;
+                    COMMIT TRANSACTION;
+                    SET @Outcome = N'Done';
+                END;
+            END TRY
+            BEGIN CATCH
+                IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+                SELECT @Logs = 0, @Recs = 0, @Outcome = LEFT(CONCAT(N'Skipped: ', ERROR_MESSAGE()), 2048);
+            END CATCH;
+
+            UPDATE @Plan
+            SET Outcome = @Outcome, Action = @Action, RunLogRows = @Logs, RecommendationRows = @Recs,
+                AppliedKept = CASE WHEN @Action = 'Delete except Applied'
+                                   THEN (SELECT COUNT(*) FROM AIIndexTuner.Recommendation WHERE RunId = @RunId) ELSE 0 END,
+                DetailChars = CASE WHEN @Outcome = N'Done' THEN DetailChars ELSE 0 END
+            WHERE RunId = @RunId;
+            FETCH NEXT FROM purge_cur INTO @RunId, @Action;
+        END;
+        CLOSE purge_cur;
+        DEALLOCATE purge_cur;
+    END;
+
+    -- RunLog rows of @CollectOnly calls, which create no run.
+    IF @DeleteBefore IS NOT NULL
+    BEGIN
+        IF @WhatIf = 1
+            SET @Logs = (SELECT COUNT(*) FROM AIIndexTuner.RunLog WHERE RunId IS NULL AND StartTime < @DeleteBefore);
+        ELSE
+        BEGIN
+            DELETE AIIndexTuner.RunLog WHERE RunId IS NULL AND StartTime < @DeleteBefore;
+            SET @Logs = @@ROWCOUNT;
+        END;
+        IF @Logs > 0
+            INSERT @Plan (RunId, Action, RunLogRows, RecommendationRows, AppliedKept, DetailChars, Outcome)
+            VALUES (NULL, 'Delete', @Logs, 0, 0, 0, CASE WHEN @WhatIf = 1 THEN N'WhatIf: not changed' ELSE N'Done' END
+                    + N' (RunLog rows of @CollectOnly calls, which have no run)');
+    END;
+
+    SELECT @RunsDeleted   = COUNT(CASE WHEN RunId IS NOT NULL AND Action = 'Delete' AND Outcome NOT LIKE N'Skipped%' THEN 1 END),
+           @RunsTrimmed   = COUNT(CASE WHEN Action = 'Delete except Applied' AND Outcome NOT LIKE N'Skipped%' THEN 1 END),
+           @DetailCleared = COUNT(CASE WHEN Action = 'Clear detail' AND Outcome NOT LIKE N'Skipped%' THEN 1 END),
+           @RunsSkipped   = COUNT(CASE WHEN Outcome LIKE N'Skipped%' THEN 1 END)
+    FROM @Plan;
+
+    IF @Results = 1
+        SELECT RunId, StartedAt, CompletedAt, RunStatus, Action, RunLogRows, RecommendationRows, AppliedKept, DetailChars, Outcome
+        FROM @Plan
+        ORDER BY CASE WHEN RunId IS NULL THEN 1 ELSE 0 END, RunId;
+END;
+GO
+
+/*
     dbo.sp_AIIndexTuner: AI-assisted index tuning from inside SQL Server.
 
         EXEC dbo.sp_AIIndexTuner;                                      -- whole database, recommend only
@@ -3934,10 +4104,11 @@ BEGIN
         THROW 50205, N'The table in @SchemaName.@TableName does not exist in this database.', 1;
 
     DECLARE @IncludeQueryText bit = 1, @KeepDetail bit = 1, @Endpoint nvarchar(400), @Deployment nvarchar(128), @Effort varchar(10),
-            @MaxPayloadChars int, @CredentialName sysname, @ConfigLogging bit;
+            @MaxPayloadChars int, @CredentialName sysname, @ConfigLogging bit, @RetainRunDays int, @RetainRunDetailDays int;
     SELECT @IncludeQueryText = IncludeQueryText, @KeepDetail = KeepRunDetail,
            @Endpoint = Endpoint, @Deployment = Deployment, @Effort = ReasoningEffort, @MaxPayloadChars = MaxPayloadChars,
-           @CredentialName = CredentialName, @ConfigLogging = EnableLogging
+           @CredentialName = CredentialName, @ConfigLogging = EnableLogging,
+           @RetainRunDays = RetainRunDays, @RetainRunDetailDays = RetainRunDetailDays
     FROM AIIndexTuner.Config WHERE ConfigId = 1;
     SET @Logging = COALESCE(@Logging, @ConfigLogging, 1);
 
@@ -4020,6 +4191,40 @@ BEGIN
             @AllowColumnstore, @AllowDropIndex, @MaxNewIndexes, @MinPriority, @MinConfidence, @MaxTableRows, @MaxIndexSizeMB,
             AIIndexTuner.fn_Version());
     SET @RunId = SCOPE_IDENTITY();
+
+    /* Run history retention (issue #55): with AIIndexTuner.Config.RetainRunDays or RetainRunDetailDays
+       set, each run first purges older history, so a scheduled job needs no second step. This run is not
+       complete, so it is never purged. It never stops the run: an error is only logged. Inside a caller's
+       transaction it is not run, since each purged run commits on its own. */
+    IF @RetainRunDays IS NOT NULL OR @RetainRunDetailDays IS NOT NULL
+    BEGIN
+        DECLARE @PurgeLogId int, @PurgeLogChars int, @PurgeLogRow int, @PurgeMsg nvarchar(4000), @PurgeNow datetime2(0) = SYSDATETIME(),
+                @PurgeDeleteBefore datetime2(0), @PurgeDetailBefore datetime2(0),
+                @PurgeDeleted int, @PurgeTrimmed int, @PurgeCleared int, @PurgeSkipped int;
+        SELECT @PurgeDeleteBefore = DATEADD(DAY, -@RetainRunDays, @PurgeNow), @PurgeDetailBefore = DATEADD(DAY, -@RetainRunDetailDays, @PurgeNow);
+        EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'Purge run history', @LogId = @PurgeLogId OUTPUT, @CharsAtStart = @PurgeLogChars OUTPUT;
+        SET @PurgeLogRow = @PurgeLogId;
+        IF @@TRANCOUNT > 0
+            SET @PurgeMsg = N'Not run: sp_AIIndexTuner was called inside a transaction. Run sp_AIIndexTuner_Purge outside one.';
+        ELSE
+        BEGIN
+            BEGIN TRY
+                EXEC AIIndexTuner.usp_PurgeRuns @DeleteBefore = @PurgeDeleteBefore, @DetailBefore = @PurgeDetailBefore, @Results = 0,
+                                                @RunsDeleted = @PurgeDeleted OUTPUT, @RunsTrimmed = @PurgeTrimmed OUTPUT,
+                                                @DetailCleared = @PurgeCleared OUTPUT, @RunsSkipped = @PurgeSkipped OUTPUT;
+                SET @PurgeMsg = CONCAT(N'Runs deleted: ', @PurgeDeleted, N'; kept for their Applied recommendations, the rest removed: ', @PurgeTrimmed,
+                                       N'; detail cleared: ', @PurgeCleared, N'; skipped: ', @PurgeSkipped,
+                                       CASE WHEN @PurgeSkipped > 0 THEN N' (being applied, or failed; see EXEC dbo.sp_AIIndexTuner_Purge @WhatIf = 1)' END);
+            END TRY
+            BEGIN CATCH
+                IF XACT_STATE() <> 0 AND @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+                SET @PurgeMsg = LEFT(CONCAT(N'Failed: ', ERROR_MESSAGE()), 4000);
+            END CATCH;
+        END;
+        EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, NULL, @LogId = @PurgeLogId OUTPUT, @CharsAtStart = @PurgeLogChars OUTPUT;
+        IF @Logging = 1
+            UPDATE AIIndexTuner.RunLog SET Message = @PurgeMsg WHERE RunLogId = @PurgeLogRow;
+    END;
 
     BEGIN TRY
         DECLARE @Started datetime2(7) = SYSDATETIME();
@@ -4291,5 +4496,55 @@ BEGIN
     FROM AIIndexTuner.Recommendation AS r
     INNER JOIN @Ids AS i ON i.RecommendationId = r.RecommendationId
     ORDER BY r.Priority, r.RecommendationId;
+END;
+GO
+
+/*
+    dbo.sp_AIIndexTuner_Purge: delete old run history (issue #55).
+
+        EXEC dbo.sp_AIIndexTuner_Purge @WhatIf = 1;                       -- what the configured retention would remove
+        EXEC dbo.sp_AIIndexTuner_Purge;                                   -- apply the configured retention
+        EXEC dbo.sp_AIIndexTuner_Purge @OlderThanDays = 90;               -- delete runs completed over 90 days ago
+        EXEC dbo.sp_AIIndexTuner_Purge @OlderThanDays = 7, @DetailOnly = 1;   -- only clear their CollectedData and RawResponse
+
+    @OlderThanDays NULL (the default) uses AIIndexTuner.Config: RetainRunDays deletes runs, and
+    RetainRunDetailDays clears the detail of newer ones; @DetailOnly = 1 uses only RetainRunDetailDays.
+    Given, it is the one cutoff: runs completed more than that many days ago are deleted, or with
+    @DetailOnly = 1 only lose CollectedData and RawResponse. 0 means every completed run.
+
+    A deleted run takes its AIIndexTuner.RunLog rows and recommendations with it, except that a run
+    with Applied recommendations keeps its row and those recommendations, the record of what changed
+    and its UndoDDL; @IncludeApplied = 1 deletes them too. Runs still Running are never touched, and
+    a run another session is applying is skipped. RunLog rows of @CollectOnly calls older than the
+    cutoff are deleted as well.
+
+    Returns one row per run: the action, the rows and characters removed (or that would be, with
+    @WhatIf = 1), and the outcome. Run it outside a transaction, except with @WhatIf = 1.
+*/
+CREATE OR ALTER PROCEDURE dbo.sp_AIIndexTuner_Purge
+    @OlderThanDays  int = NULL,
+    @DetailOnly     bit = 0,
+    @IncludeApplied bit = 0,
+    @WhatIf         bit = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+    IF @OlderThanDays < 0
+        THROW 50401, N'@OlderThanDays must be 0 or more, or NULL for the retention in AIIndexTuner.Config.', 1;
+
+    DECLARE @DeleteDays int, @DetailDays int, @Now datetime2(0) = SYSDATETIME(), @DeleteBefore datetime2(0), @DetailBefore datetime2(0);
+    IF @OlderThanDays IS NOT NULL
+        SELECT @DeleteDays = CASE WHEN ISNULL(@DetailOnly, 0) = 0 THEN @OlderThanDays END,
+               @DetailDays = CASE WHEN @DetailOnly = 1 THEN @OlderThanDays END;
+    ELSE
+        SELECT @DeleteDays = CASE WHEN ISNULL(@DetailOnly, 0) = 0 THEN RetainRunDays END, @DetailDays = RetainRunDetailDays
+        FROM AIIndexTuner.Config WHERE ConfigId = 1;
+
+    IF @DeleteDays IS NULL AND @DetailDays IS NULL
+        THROW 50403, N'No retention is set: pass @OlderThanDays, or set RetainRunDays or RetainRunDetailDays in AIIndexTuner.Config (RetainRunDetailDays when @DetailOnly = 1).', 1;
+
+    SELECT @DeleteBefore = DATEADD(DAY, -@DeleteDays, @Now), @DetailBefore = DATEADD(DAY, -@DetailDays, @Now);
+    EXEC AIIndexTuner.usp_PurgeRuns @DeleteBefore = @DeleteBefore, @DetailBefore = @DetailBefore,
+                                    @IncludeApplied = @IncludeApplied, @WhatIf = @WhatIf, @Results = 1;
 END;
 GO

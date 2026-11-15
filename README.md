@@ -68,7 +68,7 @@ can apply what it finds.
 
 1. Run [aisqltuner-index-tuner.sql](aisqltuner-index-tuner.sql) in the user database you want to
    tune. It creates the `AIIndexTuner` schema with its tables and procedures, plus
-   `dbo.sp_AIIndexTuner` and `dbo.sp_AIIndexTuner_Apply`. Install it in each database you tune,
+   `dbo.sp_AIIndexTuner`, `dbo.sp_AIIndexTuner_Apply` and `dbo.sp_AIIndexTuner_Purge`. Install it in each database you tune,
    because the endpoint credential is a database scoped credential.
 2. Fill in step 0 of [setup/Configure-Endpoint.sql](setup/Configure-Endpoint.sql) and run the
    whole script. It creates the database master key and the credential, named from the endpoint
@@ -102,7 +102,7 @@ when you report a problem.
 ### Uninstall
 
 Run [setup/Uninstall.sql](setup/Uninstall.sql) in the database. It drops `dbo.sp_AIIndexTuner`,
-`dbo.sp_AIIndexTuner_Apply`, the `AIIndexTuner` schema with everything in it (including all runs
+`dbo.sp_AIIndexTuner_Apply`, `dbo.sp_AIIndexTuner_Purge`, the `AIIndexTuner` schema with everything in it (including all runs
 and recommendations) and the database scoped credential named in `AIIndexTuner.Config`. Indexes the
 tool created or widened are kept; set `RemoveIndexTags = 1` in its step 0 to also remove their
 `AIIndexTuner` extended property, or `DropCredential = 0` to keep the credential. It leaves the
@@ -384,6 +384,8 @@ WHERE ep.name = N'AIIndexTuner';
 | `BuildMaxDop` | NULL | `MAXDOP` for every index build (NULL = the server's setting) |
 | `CollectPhysicalStats` | 1 | 0 skips `sys.dm_db_index_physical_stats` in HEAP TABLE ANALYSIS and INDEX PAGE DENSITY, which read pages of each table |
 | `PhysicalStatsMaxPages` | 1280000 | Those two sections skip a table with more reserved pages (10 GB by default) and list it as skipped (NULL = no limit) |
+| `RetainRunDays` | NULL | Delete runs completed more than this many days ago, with their step log and recommendations, except Applied recommendations (NULL = keep forever). See [Run history retention](#run-history-retention) |
+| `RetainRunDetailDays` | NULL | Clear `CollectedData` and `RawResponse` of runs completed more than this many days ago, keeping the rest of the run (NULL = keep them forever) |
 
 ### Step log
 
@@ -406,6 +408,43 @@ ORDER BY l.RunLogId;
 ```
 
 `@CollectOnly = 1` creates no run, so its rows have a NULL `RunId`.
+
+### Run history retention
+
+Runs, their step log and their recommendations are kept until something deletes them. Set a
+retention in `AIIndexTuner.Config`, and each `sp_AIIndexTuner` run purges older history before it
+starts, so a scheduled CREATE-mode job stays bounded without a second job step. The purge is the
+`Purge run history` step in `AIIndexTuner.RunLog`, whose `Message` gives the counts. It never fails
+the run, and it is not run when `sp_AIIndexTuner` is called inside a transaction.
+
+```sql
+UPDATE AIIndexTuner.Config SET RetainRunDays = 90, RetainRunDetailDays = 14 WHERE ConfigId = 1;
+```
+
+- `RetainRunDays`: a run completed more than that many days ago is deleted, with its
+  `AIIndexTuner.RunLog` rows and its recommendations. A run with `Applied` recommendations keeps its
+  row and those recommendations, with their `AppliedDDL` and `UndoDDL`, the record of what changed
+  in the schema and how to reverse it; its other recommendations, its step log and its detail go.
+  Step log rows of `@CollectOnly` calls older than that are deleted too.
+- `RetainRunDetailDays`: a newer run completed more than that many days ago keeps everything but
+  `CollectedData` and `RawResponse`, the two large columns, which hold query text and histogram
+  values (see [Data disclosure](#data-disclosure)).
+
+A run still `Running` is never touched, and a run another session is applying (it holds the run's
+apply lock) is skipped until the next purge. `sp_AIIndexTuner_Purge` runs the same purge on demand,
+and returns one row per run with what it removed:
+
+```sql
+EXEC dbo.sp_AIIndexTuner_Purge @WhatIf = 1;                           -- what the configured retention would remove
+EXEC dbo.sp_AIIndexTuner_Purge;                                       -- apply the configured retention
+EXEC dbo.sp_AIIndexTuner_Purge @OlderThanDays = 90;                   -- runs completed over 90 days ago
+EXEC dbo.sp_AIIndexTuner_Purge @OlderThanDays = 7, @DetailOnly = 1;   -- only their CollectedData and RawResponse
+EXEC dbo.sp_AIIndexTuner_Purge @OlderThanDays = 365, @IncludeApplied = 1;   -- Applied recommendations too
+```
+
+`@OlderThanDays` replaces the configured retention for that call (0 means every completed run).
+Each run is purged in its own transaction, so run it outside a transaction, except with
+`@WhatIf = 1`.
 
 ## Data disclosure
 
@@ -449,9 +488,11 @@ all of the query text and predicates above; it does not affect the column values
   is set on the Azure OpenAI resource, not by this tool.
 - In the database: with `KeepRunDetail = 1` (the default), `AIIndexTuner.Run` keeps the full
   payload (`CollectedData`) and the raw response (`RawResponse`) of every run, and
-  `AIIndexTuner.Recommendation` keeps the model's rationale and scripts. Nothing deletes them;
-  set `KeepRunDetail = 0` to stop keeping the payload and raw response, and delete old runs
-  yourself. A retention setting and purge procedure are tracked in issue #55.
+  `AIIndexTuner.Recommendation` keeps the model's rationale and scripts. They are kept until
+  deleted: set `RetainRunDetailDays` to clear the payload and raw response after that many days,
+  and `RetainRunDays` to delete whole runs (see [Run history retention](#run-history-retention)),
+  or set `KeepRunDetail = 0` to stop keeping the payload and raw response at all.
+  `sp_AIIndexTuner_Purge` deletes old history on demand.
 
 ## Known limitations
 
