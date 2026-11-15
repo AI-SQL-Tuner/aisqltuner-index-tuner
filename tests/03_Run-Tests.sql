@@ -416,15 +416,41 @@ GO
    By now the tests have run sp_AIIndexTuner many times, so its statements are in the plan cache
    and Query Store. A search for "AIIndexTuner" does not find all of them:
      - its dynamic SQL, the width sampling of wide INCLUDE columns, has no object_id there, so the
-       check also looks for that statement's own text. The workload's Notes query set it off in
-       T1's collection (T3's indexes on dbo.Orders have since cleared the suggestion), so it must
-       be in the plan cache and Query Store for the check to mean anything;
+       check also looks for that statement's own text. The sampling runs only when a missing-index
+       suggestion includes a wide column, and the workload's Notes query does not always leave one,
+       so this test makes its own on dbo.T13Wide and checks it is there. A collector run then
+       samples the column, and the sampling must be in the plan cache and Query Store, as dynamic
+       SQL with no object_id, for the check to mean anything. (usp_CollectData's own text holds
+       the statement too, so a plan cache search that took any object_id would always match.);
      - its temp-table writes do not name its schema, and the write mix gives only counts, so two
        more collector runs must leave the write mix unchanged.
    The search strings are split so that this batch's own text does not match them. */
+CREATE TABLE dbo.T13Wide (Id int IDENTITY PRIMARY KEY, GroupId int NOT NULL, CustomerId int NOT NULL, Wide nvarchar(300) NULL);
+INSERT dbo.T13Wide (GroupId, CustomerId, Wide)
+SELECT TOP (100000) n % 500, 1 + n % 20000, CASE WHEN n % 4 = 0 THEN CONCAT(N'Wide note ', n) END
+FROM (SELECT ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n FROM sys.all_columns AS a CROSS JOIN sys.all_columns AS b) AS x;
+GO
+DECLARE @i int = 0, @w nvarchar(300), @c int;
+WHILE @i < 20
+BEGIN
+    SELECT @w = MAX(t.Wide), @c = MAX(c.CustomerId)
+    FROM dbo.T13Wide AS t INNER JOIN dbo.Customers AS c ON c.CustomerId = t.CustomerId
+    WHERE t.GroupId = @i;
+    SET @i += 1;
+END;
+IF NOT EXISTS (SELECT 1 FROM sys.dm_db_missing_index_details
+               WHERE database_id = DB_ID() AND object_id = OBJECT_ID(N'dbo.T13Wide') AND included_columns LIKE N'%\[Wide\]%' ESCAPE N'\')
+    THROW 50999, N'FAIL T13: the query on dbo.T13Wide left no missing-index suggestion that includes the wide column, so the collector has nothing to sample.', 1;
+GO
 DECLARE @Data nvarchar(max), @Mix nvarchar(max), @Before bigint, @After bigint, @Sampling nvarchar(40) = N'%DATALENGTH' + N'(v)%';
-IF NOT EXISTS (SELECT 1 FROM sys.dm_exec_query_stats AS qs CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st WHERE st.text LIKE @Sampling)
-   OR NOT EXISTS (SELECT 1 FROM sys.query_store_query_text WHERE query_sql_text LIKE @Sampling)
+EXEC AIIndexTuner.usp_CollectData @Data = @Data OUTPUT;
+EXEC sys.sp_query_store_flush_db;
+-- sys.dm_exec_sql_text gives dynamic SQL no dbid, so its database is taken from the plan attributes.
+IF NOT EXISTS (SELECT 1 FROM sys.dm_exec_query_stats AS qs CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
+               CROSS APPLY sys.dm_exec_plan_attributes(qs.plan_handle) AS pa
+               WHERE st.objectid IS NULL AND st.text LIKE @Sampling AND pa.attribute = N'dbid' AND CAST(pa.value AS int) = DB_ID())
+   OR NOT EXISTS (SELECT 1 FROM sys.query_store_query_text AS qt INNER JOIN sys.query_store_query AS q ON q.query_text_id = qt.query_text_id
+                  WHERE q.object_id = 0 AND qt.query_sql_text LIKE @Sampling)
     THROW 50999, N'FAIL T13: the width sampling is not in the plan cache and Query Store, so the dynamic SQL check proves nothing.', 1;
 EXEC AIIndexTuner.usp_CollectData @Data = @Data OUTPUT;
 DECLARE @PlanCache nvarchar(max) = SUBSTRING(@Data, CHARINDEX(N'=== PLAN CACHE QUERY STATISTICS ===', @Data), CHARINDEX(N'=== HEAP TABLE ANALYSIS ===', @Data) - CHARINDEX(N'=== PLAN CACHE QUERY STATISTICS ===', @Data)),
@@ -453,6 +479,7 @@ BEGIN
     DECLARE @Msg nvarchar(400) = CONCAT(N'FAIL T13: two collector runs changed the write mix from ', @Before, N' to ', @After, N' executions, so it counts the collector''s own writes.');
     THROW 50999, @Msg, 1;
 END;
+DROP TABLE dbo.T13Wide;
 PRINT 'PASS T13: the plan cache, Query Store workload and write mix leave out this tool''s own statements, including its dynamic SQL and temp-table writes';
 GO
 
@@ -883,11 +910,21 @@ BEGIN
     SET @i += 1;
 END;
 GO
-DECLARE @Parent bigint, @Variants int;
-SELECT @Parent = MAX(qv.parent_query_id), @Variants = COUNT(*)
-FROM sys.query_store_query_variant AS qv
-INNER JOIN sys.query_store_query AS pq ON pq.query_id = qv.parent_query_id
-WHERE pq.object_id = OBJECT_ID(N'dbo.usp_T23FindOrders');
+-- sys.query_store_query_variant can lag the executions: right after the loop it sometimes holds one
+-- of the two variants. Flush Query Store, then wait up to 10 seconds for both.
+DECLARE @Parent bigint, @Variants int, @Tries int = 0;
+EXEC sys.sp_query_store_flush_db;
+WHILE 1 = 1
+BEGIN
+    SELECT @Parent = MAX(qv.parent_query_id), @Variants = COUNT(*)
+    FROM sys.query_store_query_variant AS qv
+    INNER JOIN sys.query_store_query AS pq ON pq.query_id = qv.parent_query_id
+    WHERE pq.object_id = OBJECT_ID(N'dbo.usp_T23FindOrders');
+    IF @Variants >= 2 OR @Tries >= 10 BREAK;
+    SET @Tries += 1;
+    WAITFOR DELAY '00:00:01';
+    EXEC sys.sp_query_store_flush_db;
+END;
 IF @Variants < 2
     THROW 50999, N'FAIL T23: OPPO made no query variants for the catch-all procedure, so the check proves nothing.', 1;
 
@@ -1730,14 +1767,16 @@ GO
 
 -- Runs left Running: by this session (a client-side timeout), by a session that is gone, and from before
 -- sessions were recorded and over a day old are marked Abandoned by the next run; a run whose session is
--- still running a request, and a recent one with no session, are left alone.
+-- still running a request, and a recent one with no session, are left alone. The live session is the
+-- longest-running one: a background task started with the instance (such as LOG WRITER) keeps its
+-- request; a short system task, or another client's query, can end before the check.
 DECLARE @MyLogin datetime = (SELECT login_time FROM sys.dm_exec_sessions WHERE session_id = @@SPID),
         @LiveSession smallint, @LiveLogin datetime;
 SELECT TOP (1) @LiveSession = s.session_id, @LiveLogin = s.login_time
 FROM sys.dm_exec_requests AS q
 INNER JOIN sys.dm_exec_sessions AS s ON s.session_id = q.session_id
 WHERE q.session_id <> @@SPID
-ORDER BY s.session_id;
+ORDER BY s.is_user_process, q.start_time, s.session_id;
 
 INSERT AIIndexTuner.Run (Mode, SessionId, SessionLoginTime, StoredResponseId, TableName) VALUES ('RECOMMEND', @@SPID, @MyLogin, N'resp_t33a', N'T33A');
 DECLARE @RunA int = SCOPE_IDENTITY();

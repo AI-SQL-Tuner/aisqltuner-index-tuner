@@ -107,6 +107,16 @@ recommendations are kept, and it replaces the procedures and functions.
 
 ### Tests
 
+- T13 and T23 no longer fail at random on a precondition. T13 depended on the workload's `Notes`
+  query leaving a missing-index suggestion with a wide INCLUDE column, which it did not always do, so
+  the collector's width sampling sometimes never ran; its plan cache check still matched, but only on
+  `usp_CollectData`'s own text. T13 now makes its own suggestion on a new table, checks it is there,
+  and looks for the sampling only as dynamic SQL (no object_id). T23 read
+  `sys.query_store_query_variant` right after the workload, when it sometimes held one of the two
+  OPPO variants; it now flushes Query Store and waits up to 10 seconds for both. T33 took the
+  lowest-numbered session with a request as one still running, and a short system task there could
+  end before the check; it now takes the session whose request has run longest, a background task
+  started with the instance.
 - New test T32 (issue #49): the two size limits skip a build with a reason and a later call with a
   higher limit builds it; `@MaxMinutes = 0` starts nothing; `BuildMaxDop` and `OnlineWaitMinutes`
   reach the DDL. The lock timeout and the low-priority wait giving up need a blocking session and are
