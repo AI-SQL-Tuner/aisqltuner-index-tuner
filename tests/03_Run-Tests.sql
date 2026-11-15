@@ -1826,5 +1826,57 @@ DELETE AIIndexTuner.Run WHERE RunId = @T34Run;
 PRINT CONCAT('PASS T34: fn_Version() returns ', @Version, ', each run records it, and sp_AIIndexTuner returns it after RunId');
 GO
 
+/* ----- T35: applies hold the run's lock, and a doomed transaction keeps its error (issue #51) -----
+   A unique index on dbo.AuditLog (EventType), a heap with three event types, fails on duplicate keys (error 1505). Inside a caller's
+   transaction with XACT_ABORT ON, that error dooms the transaction; recording Failed would raise 3930
+   and hide it, so the original error must come back. Either way the run's lock is released. Contention
+   between two sessions is checked by 06_Check-ConcurrentApply.sql, which needs a second connection. */
+EXEC dbo.sp_AIIndexTuner @CollectedData = N'{"t35": true}', @TestResponse = N'{ "summary": "T35.", "recommendations": [
+  { "priority": 1, "category": "CreateIndex", "title": "Unique EventType", "schema_name": "dbo", "table_name": "AuditLog", "index_name": "UX_AuditLog_T35",
+    "key_columns": [ { "column": "EventType", "descending": false } ], "include_columns": [], "filter_predicate": null, "is_unique": true,
+    "fill_factor": null, "data_compression": null, "estimated_size_mb": 1, "confidence": "High", "rationale": "t", "benefiting_queries": [],
+    "script": "CREATE UNIQUE INDEX UX_AuditLog_T35 ON dbo.AuditLog (EventType);" } ] }';
+DECLARE @T35Run int = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
+DECLARE @T35Rec int = (SELECT RecommendationId FROM AIIndexTuner.Recommendation WHERE RunId = @T35Run);
+DECLARE @T35Lock nvarchar(255) = CONCAT(N'AIIndexTuner.Apply.Run.', @T35Run), @T35Error int = NULL;
+
+SET XACT_ABORT ON;
+BEGIN TRY
+    BEGIN TRANSACTION;
+    EXEC AIIndexTuner.usp_ApplyRecommendation @RecommendationId = @T35Rec;
+    COMMIT;
+END TRY
+BEGIN CATCH
+    SET @T35Error = ERROR_NUMBER();
+    IF XACT_STATE() <> 0 ROLLBACK;
+END CATCH;
+SET XACT_ABORT OFF;
+IF ISNULL(@T35Error, 0) <> 1505
+BEGIN
+    DECLARE @T35Msg nvarchar(400) = CONCAT(N'FAIL T35: a build that dooms the caller''s transaction returned error ', ISNULL(CONVERT(varchar(12), @T35Error), 'none'), N', not 1505 (duplicate key).');
+    THROW 50999, @T35Msg, 1;
+END;
+IF APPLOCK_MODE(N'public', @T35Lock, N'Session') <> N'NoLock'
+    THROW 50999, N'FAIL T35: the run lock was kept after the error.', 1;
+
+-- Outside a transaction the failure is recorded, and the lock released.
+EXEC AIIndexTuner.usp_ApplyRecommendation @RecommendationId = @T35Rec;
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RecommendationId = @T35Rec AND Status = 'Failed' AND StatusReason LIKE N'%duplicate key%')
+    THROW 50999, N'FAIL T35: the failed build was not recorded as Failed.', 1;
+IF APPLOCK_MODE(N'public', @T35Lock, N'Session') <> N'NoLock'
+    THROW 50999, N'FAIL T35: the run lock was kept after a recorded failure.', 1;
+
+-- An Applied recommendation is not overwritten by a later Skipped (the index name is now taken).
+UPDATE AIIndexTuner.Recommendation SET Status = 'Applied' WHERE RecommendationId = @T35Rec;
+EXEC AIIndexTuner.usp_ApplyRecommendation @RecommendationId = @T35Rec;
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RecommendationId = @T35Rec AND Status = 'Applied')
+    THROW 50999, N'FAIL T35: an Applied recommendation was overwritten.', 1;
+
+DELETE AIIndexTuner.Recommendation WHERE RunId = @T35Run;
+DELETE AIIndexTuner.RunLog WHERE RunId = @T35Run;
+DELETE AIIndexTuner.Run WHERE RunId = @T35Run;
+PRINT 'PASS T35: a build error that dooms the caller''s transaction comes back as itself, a failure outside one is recorded, the run lock is released either way, and Applied is kept';
+GO
+
 PRINT 'ALL TESTS PASSED';
 GO

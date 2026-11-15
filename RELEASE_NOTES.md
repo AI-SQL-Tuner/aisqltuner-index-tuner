@@ -43,6 +43,14 @@ recommendations are kept, and it replaces the procedures and functions.
 
 ### Fixed
 
+- **Two sessions applying the same run could overwrite an `Applied` status** (issue #51). Both read
+  `Recommended`; the first built the index and set `Applied`, and the second found the name taken
+  and set `Skipped`, so the row no longer said the index was made and `@MaxNewIndexes` stopped
+  counting it. Two sessions applying different recommendations of one run could also both pass the
+  `@MaxNewIndexes` count. Applying now holds an exclusive application lock on the run; a second
+  session fails at once with error 50102 and changes nothing. `Skipped` and `Failed` never replace
+  `Applied`. In a caller's transaction that a build error makes uncommittable, recording `Failed`
+  raised error 3930 and hid the build error; the build error is now rethrown.
 - **One failed poll aborted the run, and a timed-out background response kept running** (issue
   #50).
   - A single HTTP 429 or 5xx, or a network timeout, on any poll ended the run with error 50005,
@@ -121,6 +129,12 @@ recommendations are kept, and it replaces the procedures and functions.
   `sp_AIIndexTuner` returns it. `Run-All.ps1` now also runs `setup/Uninstall.sql` twice and checks
   what it dropped and kept (`tests/04_Prepare-Uninstall.sql`, `tests/05_Check-Uninstall.sql`), and
   takes `-User` for SQL authentication.
+- New test T35 (issue #51): a build error that dooms the caller's transaction (a unique index on
+  duplicate keys, under `XACT_ABORT ON`) comes back as error 1505, a failure outside a transaction
+  is recorded as `Failed`, the run lock is released either way, and `Applied` is not overwritten.
+  `Run-All.ps1` also holds a run's lock from a background session and checks that applying it from
+  another gets error 50102 and changes nothing (`tests/06_Hold-ApplyLock.sql`,
+  `tests/06_Check-ConcurrentApply.sql`).
 - T13 and T23 no longer fail at random on a precondition. T13 depended on the workload's `Notes`
   query leaving a missing-index suggestion with a wide INCLUDE column, which it did not always do, so
   the collector's width sampling sometimes never ran; its plan cache check still matched, but only on

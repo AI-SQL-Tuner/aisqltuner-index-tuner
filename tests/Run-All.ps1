@@ -70,6 +70,24 @@ $code = $LASTEXITCODE
 Get-Content $out -Encoding utf8 | Where-Object { $_ -match '^(PASS|FAIL|SKIP|ALL TESTS)|^Msg ' } | ForEach-Object { Write-Host $_ }
 if ($code -ne 0) { Write-Host "Tests failed. Full output: $out"; exit 1 }
 
+# Two sessions applying one run (issue #51): a background session holds the run's apply lock while
+# this one tries to apply it.
+Write-Host 'Checking concurrent applies...'
+$holderArgs = @('-S', $Server) + $auth + @('-C', '-f', '65001', '-b', '-d', $Database, '-v', 'HoldSeconds=20', '-i', (Join-Path $PSScriptRoot '06_Hold-ApplyLock.sql'))
+$holder = Start-Job -ScriptBlock { param($a) & sqlcmd @a 2>&1; "exit $LASTEXITCODE" } -ArgumentList (,$holderArgs)
+try {
+    Invoke-Sql (Join-Path $PSScriptRoot '06_Check-ConcurrentApply.sql') $Database
+    Write-Host 'PASS concurrent apply: a second session gets error 50102 and changes nothing while another holds the run''s lock'
+} finally {
+    # The holder waits 20 seconds; 60 allows for a slow start. Wait-Job returns nothing on a timeout.
+    $finished = $holder | Wait-Job -Timeout 60
+    $held = $holder | Receive-Job
+    $holderState = $holder.State
+    $holder | Remove-Job -Force
+}
+if (-not $finished) { $held | Write-Host; throw "The lock holder session was still running after 60 seconds (job state: $holderState)." }
+if (($held | Select-Object -Last 1) -ne 'exit 0') { $held | Write-Host; throw 'The lock holder session failed.' }
+
 Write-Host 'Checking the uninstall...'
 Invoke-Sql (Join-Path $PSScriptRoot '04_Prepare-Uninstall.sql') $Database
 Invoke-Sql (Join-Path $root 'setup/Uninstall.sql') $Database

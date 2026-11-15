@@ -150,8 +150,11 @@ GO
     and any filtered index, is left for review. The outcome is written to the recommendation row: Applied (with the DDL and
     the DDL that reverses it), Skipped (with the reason) or Failed (with the error). Skipped and
     Failed recommendations can be applied again, for example with a setting that allows them.
+
+    This is the body of AIIndexTuner.usp_ApplyRecommendation (below), which runs it holding the
+    recommendation's run lock. Do not call it directly.
 */
-CREATE OR ALTER PROCEDURE AIIndexTuner.usp_ApplyRecommendation
+CREATE OR ALTER PROCEDURE AIIndexTuner.usp_ApplyRecommendationCore
     @RecommendationId int,
     @AllowColumnstore bit = NULL,
     @AllowDropIndex   bit = NULL,
@@ -305,6 +308,7 @@ BEGIN
                     SET @Reason = CONCAT(QUOTENAME(@IndexName), N' is named by ', @Ref, N', which would fail without it.');
             END TRY
             BEGIN CATCH
+                IF XACT_STATE() = -1 THROW;   -- an uncommittable transaction takes no writes (issue #51)
                 SET @Reason = CONCAT(N'Could not check what references ', QUOTENAME(@IndexName), N': ', ERROR_MESSAGE());
             END CATCH;
         END;
@@ -353,6 +357,7 @@ BEGIN
                                                      @ErrorLogsSearched = @ErrorLogsSearched OUTPUT, @HasInstanceLogs = @HasInstanceLogs OUTPUT;
                 END TRY
                 BEGIN CATCH
+                    IF XACT_STATE() = -1 THROW;   -- an uncommittable transaction takes no writes (issue #51)
                     SET @Since = NULL;
                 END CATCH;
 
@@ -379,6 +384,7 @@ BEGIN
                         FROM AIIndexTuner.fn_IndexUseCheck(@ObjectId, @IndexId, @Since);
                     END TRY
                     BEGIN CATCH
+                        IF XACT_STATE() = -1 THROW;   -- an uncommittable transaction takes no writes (issue #51)
                         SET @UseReason = CONCAT(N'No other index covers ', QUOTENAME(@IndexName), N', and its reads could not be read from sys.dm_db_index_usage_stats ',
                                                 N'(that needs VIEW SERVER STATE or VIEW SERVER PERFORMANCE STATE), so it is not dropped for low use: ', ERROR_MESSAGE());
                     END CATCH;
@@ -399,7 +405,7 @@ BEGIN
 
         IF @Reason IS NOT NULL
         BEGIN
-            UPDATE AIIndexTuner.Recommendation SET Status = 'Skipped', StatusReason = @Reason WHERE RecommendationId = @RecommendationId;
+            UPDATE AIIndexTuner.Recommendation SET Status = 'Skipped', StatusReason = @Reason WHERE RecommendationId = @RecommendationId AND Status <> 'Applied';
             RETURN;
         END;
 
@@ -416,11 +422,12 @@ BEGIN
             EXEC sys.sp_executesql @DropExec;
         END TRY
         BEGIN CATCH
+            IF XACT_STATE() = -1 THROW;   -- an uncommittable transaction takes no writes (issue #51)
             UPDATE AIIndexTuner.Recommendation
             SET Status = 'Failed', AppliedDDL = @Ddl,
                 StatusReason = LEFT(CONCAT(ERROR_MESSAGE(), CASE WHEN ERROR_NUMBER() = 1222 AND @LockTimeoutSec IS NOT NULL
                     THEN CONCAT(N' The drop waited ', @LockTimeoutSec, N' seconds (AIIndexTuner.Config.LockTimeoutSec) for its lock. Apply it again when the table is quieter.') END), 4000)
-            WHERE RecommendationId = @RecommendationId;
+            WHERE RecommendationId = @RecommendationId AND Status <> 'Applied';
             RETURN;
         END CATCH;
 
@@ -621,7 +628,7 @@ BEGIN
 
     IF @Reason IS NOT NULL
     BEGIN
-        UPDATE AIIndexTuner.Recommendation SET Status = 'Skipped', StatusReason = @Reason WHERE RecommendationId = @RecommendationId;
+        UPDATE AIIndexTuner.Recommendation SET Status = 'Skipped', StatusReason = @Reason WHERE RecommendationId = @RecommendationId AND Status <> 'Applied';
         RETURN;
     END;
 
@@ -718,6 +725,7 @@ BEGIN
         EXEC sys.sp_executesql @BuildExec;
     END TRY
     BEGIN CATCH
+        IF XACT_STATE() = -1 THROW;   -- an uncommittable transaction takes no writes (issue #51)
         UPDATE AIIndexTuner.Recommendation
         SET Status = 'Failed', AppliedDDL = @Ddl,
             -- Error 1222 for both ways of giving up: the lock timeout, and the end of a low-priority wait (ABORT_AFTER_WAIT = SELF).
@@ -726,7 +734,7 @@ BEGIN
                 -- Only when this tool set the timeout: a caller's own SET LOCK_TIMEOUT also raises 1222.
                 WHEN ERROR_NUMBER() = 1222 AND @LockTimeoutSec IS NOT NULL AND @LowPriority = 0
                 THEN CONCAT(N' The build waited ', @LockTimeoutSec, N' seconds (AIIndexTuner.Config.LockTimeoutSec) for its lock. Apply it again when the table is quieter.') END), 4000)
-        WHERE RecommendationId = @RecommendationId;
+        WHERE RecommendationId = @RecommendationId AND Status <> 'Applied';
         RETURN;
     END CATCH;
 
@@ -751,6 +759,7 @@ BEGIN
                 @level2type = N'INDEX', @level2name = @IndexName;
     END TRY
     BEGIN CATCH
+        IF XACT_STATE() = -1 THROW;   -- an uncommittable transaction takes no writes (issue #51)
         SET @Note = CONCAT(@Note + N' ', N'Index ', CASE WHEN @IsWidening = 1 THEN N'widened' ELSE N'created' END, N', but tagging it failed: ', ERROR_MESSAGE());
     END CATCH;
 
@@ -758,5 +767,66 @@ BEGIN
     SET Status = 'Applied', StatusReason = @Note, IndexName = @IndexName, IndexType = @IndexType, AppliedDDL = @Ddl, UndoDDL = @Undo,
         AppliedAt = SYSDATETIME(), AppliedBy = ORIGINAL_LOGIN()
     WHERE RecommendationId = @RecommendationId;
+END;
+GO
+
+/*
+    AIIndexTuner.usp_ApplyRecommendation: applies one recommendation (see usp_ApplyRecommendationCore,
+    above, for what is applied and how), holding an exclusive application lock on its run (issue #51).
+
+    Without the lock, two sessions applying the same recommendation (a CREATE-mode Agent job and a manual
+    sp_AIIndexTuner_Apply, say) both read Recommended; the first built the index and set Applied, and the
+    second found the name taken and overwrote it with Skipped. Two sessions applying different
+    recommendations of one run could both pass the @MaxNewIndexes count. With the lock, one session at a
+    time applies a run's recommendations, and the core reads the status after the lock is granted.
+
+    The lock is owned by the session, so it needs no transaction, and is not waited for: a build can take
+    a long time, so a second session fails at once with error 50102 and changes nothing. Apply again when
+    the other session is done.
+*/
+CREATE OR ALTER PROCEDURE AIIndexTuner.usp_ApplyRecommendation
+    @RecommendationId int,
+    @AllowColumnstore bit = NULL,
+    @AllowDropIndex   bit = NULL,
+    @MaxNewIndexes    int = NULL,
+    @MinPriority      varchar(10) = NULL,
+    @MinConfidence    varchar(10) = NULL,
+    @MaxTableRows     bigint = NULL,
+    @MaxIndexSizeMB   int = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @RunId int = (SELECT RunId FROM AIIndexTuner.Recommendation WHERE RecommendationId = @RecommendationId);
+    IF @RunId IS NULL
+        THROW 50101, N'No recommendation with that RecommendationId.', 1;
+
+    DECLARE @Lock nvarchar(255) = CONCAT(N'AIIndexTuner.Apply.Run.', @RunId), @Got int;
+    EXEC @Got = sys.sp_getapplock @Resource = @Lock, @LockMode = 'Exclusive', @LockOwner = 'Session', @LockTimeout = 0;
+    IF @Got < 0
+    BEGIN
+        DECLARE @Msg nvarchar(2048) = CONCAT(N'Another session is applying recommendations of run ', @RunId,
+                                             N', so recommendation ', @RecommendationId, N' was not applied and is unchanged. Apply it again when that session is done.');
+        THROW 50102, @Msg, 1;
+    END;
+
+    BEGIN TRY
+        EXEC AIIndexTuner.usp_ApplyRecommendationCore @RecommendationId = @RecommendationId, @AllowColumnstore = @AllowColumnstore,
+                                                      @AllowDropIndex = @AllowDropIndex, @MaxNewIndexes = @MaxNewIndexes,
+                                                      @MinPriority = @MinPriority, @MinConfidence = @MinConfidence,
+                                                      @MaxTableRows = @MaxTableRows, @MaxIndexSizeMB = @MaxIndexSizeMB;
+    END TRY
+    BEGIN CATCH
+        -- Release, then rethrow the original error. Releasing can itself fail in a doomed transaction;
+        -- the lock then lasts until the session ends, and only blocks other sessions.
+        BEGIN TRY
+            EXEC sys.sp_releaseapplock @Resource = @Lock, @LockOwner = 'Session';
+        END TRY
+        BEGIN CATCH
+        END CATCH;
+        THROW;
+    END CATCH;
+
+    EXEC sys.sp_releaseapplock @Resource = @Lock, @LockOwner = 'Session';
 END;
 GO
