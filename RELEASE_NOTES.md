@@ -11,6 +11,16 @@ recommendations are kept, and it replaces the procedures and functions.
 
 ### Added
 
+- **Version stamp, uninstall script and CI** (issue #53).
+  - `build.ps1` stamps the version in the new `VERSION` file into the install script's header and
+    into the new `AIIndexTuner.fn_Version()`. Each run records it in the new `Run.Version` column,
+    and `sp_AIIndexTuner` returns it as the second column of its first result set, after `RunId`.
+    Code that reads that result set by position must allow for the new column.
+  - New [setup/Uninstall.sql](setup/Uninstall.sql) drops the two `dbo` procedures, the
+    `AIIndexTuner` schema and everything in it, and the credential named in `AIIndexTuner.Config`.
+    It keeps the indexes the tool built and, unless told otherwise, their `AIIndexTuner` tag.
+  - GitHub Actions runs the tests on every pull request in two collations, and fails one whose
+    install script does not match `src/`.
 - **Build limits and lock handling for CREATE mode and `sp_AIIndexTuner_Apply`** (issue #49).
   - `@MaxTableRows` and `@MaxIndexSizeMB` skip a new or widened index on a larger table, or one
     estimated (an upper bound from the catalog) at more MB. They are stored on the run, and
@@ -107,6 +117,10 @@ recommendations are kept, and it replaces the procedures and functions.
 
 ### Tests
 
+- New test T34 (issue #53): `fn_Version()` returns a stamped version, a run records it, and
+  `sp_AIIndexTuner` returns it. `Run-All.ps1` now also runs `setup/Uninstall.sql` twice and checks
+  what it dropped and kept (`tests/04_Prepare-Uninstall.sql`, `tests/05_Check-Uninstall.sql`), and
+  takes `-User` for SQL authentication.
 - New test T32 (issue #49): the two size limits skip a build with a reason and a later call with a
   higher limit builds it; `@MaxMinutes = 0` starts nothing; `BuildMaxDop` and `OnlineWaitMinutes`
   reach the DDL. The lock timeout and the low-priority wait giving up need a blocking session and are
