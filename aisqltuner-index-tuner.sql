@@ -3877,23 +3877,35 @@ BEGIN
         Action varchar(30) NOT NULL, RunLogRows int NOT NULL, RecommendationRows int NOT NULL, AppliedKept int NOT NULL,
         DetailChars bigint NOT NULL, Outcome nvarchar(2048) NULL);
 
+    -- The runs old enough for either cutoff, then their RunLog and recommendation counts, each
+    -- aggregated once over those runs and joined, not looked up per run.
+    DECLARE @Candidates TABLE (RunId int PRIMARY KEY);
+    INSERT @Candidates (RunId)
+    SELECT RunId FROM AIIndexTuner.Run
+    WHERE CompletedAt < @DeleteBefore
+       OR (CompletedAt < @DetailBefore AND (CollectedData IS NOT NULL OR RawResponse IS NOT NULL));
+
     -- A run completed before @DeleteBefore is listed unless it was already trimmed to its Applied
     -- recommendations (nothing left to remove); one before @DetailBefore only while it has detail.
     INSERT @Plan (RunId, StartedAt, CompletedAt, RunStatus, Action, RunLogRows, RecommendationRows, AppliedKept, DetailChars)
     SELECT r.RunId, r.StartedAt, r.CompletedAt, r.Status, a.Action,
-           CASE WHEN a.Action = 'Clear detail' THEN 0 ELSE (SELECT COUNT(*) FROM AIIndexTuner.RunLog AS l WHERE l.RunId = r.RunId) END,
-           CASE a.Action WHEN 'Delete' THEN c.Recs WHEN 'Delete except Applied' THEN c.Recs - c.Applied ELSE 0 END,
+           CASE WHEN a.Action = 'Clear detail' THEN 0 ELSE ISNULL(l.Logs, 0) END,
+           CASE a.Action WHEN 'Delete' THEN ISNULL(c.Recs, 0) WHEN 'Delete except Applied' THEN c.Recs - c.Applied ELSE 0 END,
            CASE WHEN a.Action = 'Delete except Applied' THEN c.Applied ELSE 0 END,
            ISNULL(DATALENGTH(r.CollectedData), 0) / 2 + ISNULL(DATALENGTH(r.RawResponse), 0) / 2
-    FROM AIIndexTuner.Run AS r
-    CROSS APPLY (SELECT COUNT(*) AS Recs, COUNT(CASE WHEN rec.Status = 'Applied' THEN 1 END) AS Applied
-                 FROM AIIndexTuner.Recommendation AS rec WHERE rec.RunId = r.RunId) AS c
+    FROM @Candidates AS cand
+    INNER JOIN AIIndexTuner.Run AS r ON r.RunId = cand.RunId
+    LEFT JOIN (SELECT rl.RunId, COUNT(*) AS Logs
+               FROM AIIndexTuner.RunLog AS rl INNER JOIN @Candidates AS x ON x.RunId = rl.RunId
+               GROUP BY rl.RunId) AS l ON l.RunId = r.RunId
+    LEFT JOIN (SELECT rec.RunId, COUNT(*) AS Recs, COUNT(CASE WHEN rec.Status = 'Applied' THEN 1 END) AS Applied
+               FROM AIIndexTuner.Recommendation AS rec INNER JOIN @Candidates AS x ON x.RunId = rec.RunId
+               GROUP BY rec.RunId) AS c ON c.RunId = r.RunId
     CROSS APPLY (SELECT CASE WHEN r.CompletedAt < @DeleteBefore
                              THEN CASE WHEN @IncludeApplied = 0 AND c.Applied > 0 THEN 'Delete except Applied' ELSE 'Delete' END
                              ELSE 'Clear detail' END AS Action) AS a
     WHERE (r.CompletedAt < @DeleteBefore
-           AND (a.Action = 'Delete' OR c.Recs > c.Applied OR r.CollectedData IS NOT NULL OR r.RawResponse IS NOT NULL
-                OR EXISTS (SELECT 1 FROM AIIndexTuner.RunLog AS l WHERE l.RunId = r.RunId)))
+           AND (a.Action = 'Delete' OR c.Recs > c.Applied OR l.Logs > 0 OR r.CollectedData IS NOT NULL OR r.RawResponse IS NOT NULL))
        OR (r.CompletedAt < @DetailBefore AND (r.CollectedData IS NOT NULL OR r.RawResponse IS NOT NULL));
 
     DECLARE @RunId int, @Action varchar(30), @Lock nvarchar(255), @Got int, @Logs int, @Recs int, @Outcome nvarchar(2048);

@@ -385,7 +385,7 @@ WHERE ep.name = N'AIIndexTuner';
 | `CollectPhysicalStats` | 1 | 0 skips `sys.dm_db_index_physical_stats` in HEAP TABLE ANALYSIS and INDEX PAGE DENSITY, which read pages of each table |
 | `PhysicalStatsMaxPages` | 1280000 | Those two sections skip a table with more reserved pages (10 GB by default) and list it as skipped (NULL = no limit) |
 | `RetainRunDays` | NULL | Delete runs completed more than this many days ago, with their step log and recommendations, except Applied recommendations (NULL = keep forever). See [Run history retention](#run-history-retention) |
-| `RetainRunDetailDays` | NULL | Clear `CollectedData` and `RawResponse` of runs completed more than this many days ago, keeping the rest of the run (NULL = keep) |
+| `RetainRunDetailDays` | NULL | Clear `CollectedData` and `RawResponse` of runs completed more than this many days ago, keeping the rest of the run (NULL = keep them forever) |
 
 ### Step log
 
