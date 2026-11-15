@@ -186,7 +186,7 @@ BEGIN
        OR DB_NAME() IN (N'distribution', N'SSISDB')
        OR (OBJECT_ID(N'dbo.ExecutionLogStorage', N'U') IS NOT NULL AND OBJECT_ID(N'dbo.Catalog', N'U') IS NOT NULL)   -- a report server catalog, whatever its name
        OR (OBJECT_ID(N'dbo.PersistedStream', N'U') IS NOT NULL AND OBJECT_ID(N'dbo.SessionData', N'U') IS NOT NULL)   -- a report server temp database
-        THROW 50203, N'Run sp_AIIndexTuner in a user database, not a system database or one that a SQL Server feature owns (distribution, SSISDB, a report server catalog).', 1;
+        THROW 50203, N'Run sp_AIIndexTuner in a user database, not a system database or one that a SQL Server feature owns (distribution, SSISDB, a report server catalog or report server temp database).', 1;
     IF @SchemaName IS NOT NULL AND SCHEMA_ID(@SchemaName) IS NULL
         THROW 50204, N'The schema in @SchemaName does not exist in this database.', 1;
     IF @TableName IS NOT NULL AND OBJECT_ID(QUOTENAME(@SchemaName) + N'.' + QUOTENAME(@TableName), N'U') IS NULL
