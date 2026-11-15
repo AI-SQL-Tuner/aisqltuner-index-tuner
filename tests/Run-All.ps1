@@ -78,6 +78,7 @@ $holder = Start-Job -ScriptBlock { param($a) & sqlcmd @a 2>&1; "exit $LASTEXITCO
 try {
     Invoke-Sql (Join-Path $PSScriptRoot '06_Check-ConcurrentApply.sql') $Database
     Write-Host 'PASS concurrent apply: a second session gets error 50102 and changes nothing while another holds the run''s lock'
+    Write-Host 'PASS concurrent purge: the purge skips a run another session is applying'
 } finally {
     # The holder waits 20 seconds; 60 allows for a slow start. Wait-Job returns nothing on a timeout.
     $finished = $holder | Wait-Job -Timeout 60

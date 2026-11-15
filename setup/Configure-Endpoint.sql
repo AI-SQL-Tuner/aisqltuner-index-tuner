@@ -216,6 +216,8 @@ UPDATE AIIndexTuner.Config SET
     EnableLogging       = 1,         -- log each step of a run to AIIndexTuner.RunLog
     LockTimeoutSec      = 30,        -- longest wait for locks by a drop, offline or columnstore build; NULL = no limit
     OnlineWaitMinutes   = 5,         -- low-priority wait of an online rowstore build before it gives up; NULL = normal wait
-    BuildMaxDop         = NULL       -- MAXDOP for index builds; NULL = the server's setting
+    BuildMaxDop         = NULL,      -- MAXDOP for index builds; NULL = the server's setting
+    RetainRunDays       = NULL,      -- each run deletes runs completed more than this many days ago (Applied recommendations kept); NULL = keep forever
+    RetainRunDetailDays = NULL       -- each run clears CollectedData and RawResponse of runs completed more than this many days ago; NULL = keep
 WHERE ConfigId = 1;
 */
