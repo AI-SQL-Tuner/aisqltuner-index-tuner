@@ -64,7 +64,7 @@ END;
 GO
 
 -- A query that returns Notes, an nvarchar(200) column: 400 bytes is wide, so its missing-index
--- suggestion makes the collector sample Notes' width with dynamic SQL, which T13 checks it leaves out.
+-- suggestion makes the collector sample Notes' width with dynamic SQL in T1 (T13 sets up its own wide suggestion).
 DECLARE @i int = 0, @notes nvarchar(200), @cust int;
 WHILE @i < 50
 BEGIN
