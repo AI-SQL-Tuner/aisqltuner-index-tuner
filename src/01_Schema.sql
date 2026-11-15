@@ -261,6 +261,21 @@ IF COL_LENGTH(N'AIIndexTuner.Recommendation', N'ScriptWarning') IS NULL
         ScriptWarning nvarchar(4000) NULL;   -- set when Script targets another table than SchemaName.TableName (issue #41)
 GO
 
+IF COL_LENGTH(N'AIIndexTuner.Run', N'Version') IS NULL
+    ALTER TABLE AIIndexTuner.Run ADD
+        Version varchar(32) NULL;   -- AIIndexTuner.fn_Version() of the build that made the run (issue #53)
+GO
+
+/* The version of the installed build (issue #53). build.ps1 replaces the placeholder with the
+   contents of VERSION; installing from src/ directly returns the placeholder. */
+CREATE OR ALTER FUNCTION AIIndexTuner.fn_Version()
+RETURNS varchar(32)
+AS
+BEGIN
+    RETURN '__AIINDEXTUNER_VERSION__';
+END;
+GO
+
 /* ===== Helpers ===== */
 
 /* Ends the open step, if any, and starts @Step, if given; @Step NULL only ends. Chars is the growth

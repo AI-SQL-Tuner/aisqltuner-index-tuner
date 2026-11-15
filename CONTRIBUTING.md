@@ -18,7 +18,8 @@ This project is released under the [MIT license](LICENSE). By contributing, you 
 |---|---|
 | `src/` | The source: one object or group per file, numbered in install order |
 | `aisqltuner-index-tuner.sql` | The single-file install script. **Generated** by `build.ps1` from `src/` |
-| `build.ps1` | Concatenates `src/*.sql` into the install script |
+| `build.ps1` | Concatenates `src/*.sql` into the install script and stamps the version from `VERSION` |
+| `VERSION` | The version of the next release, for example `0.3.0-dev` |
 | `setup/Configure-Endpoint.sql` | Credential and configuration template |
 | `tests/` | Test database, workload, tests and the `Run-All.ps1` runner |
 | `bench/` | Benchmark: challenge database, workload, rubric, cases and results |
@@ -64,6 +65,7 @@ Build limits, lock handling and @MaxMinutes for CREATE mode and sp_AIIndexTuner_
 .\tests\Run-All.ps1 -Server sql01                 # another server
 .\tests\Run-All.ps1 -Database AIIndexTunerTest2   # another test database
 .\tests\Run-All.ps1 -Collation Turkish_100_CI_AS  # a test database in that collation
+.\tests\Run-All.ps1 -User sa                      # SQL authentication; password from $env:SQLCMDPASSWORD
 ```
 
 The runner rebuilds the install script, **drops and recreates the test database** (`AIIndexTunerTest` by default), installs the tool, runs a workload, and then runs [tests/03_Run-Tests.sql](tests/03_Run-Tests.sql). It stops if the test database has a database scoped credential, because recreating it would delete your endpoint setup. Use `-Database` to point it at another database, and pass `-Force` only when you mean it.
@@ -107,6 +109,29 @@ Code and documentation change in the same pull request.
 - If you change the schema, the procedures or the recommendation types, update the matching diagrams in `diagrams/` (SVG and PNG).
 - Don't rewrite unrelated documentation.
 
+## CI
+
+[.github/workflows/ci.yml](.github/workflows/ci.yml) runs on every pull request and push to `main`:
+
+- **Install script matches `src/`:** it runs `build.ps1` and fails if `aisqltuner-index-tuner.sql`
+  changes. If it fails, run `.\build.ps1` and commit the result.
+- **Tests:** `tests/Run-All.ps1` against the SQL Server 2025 container image, once with the default
+  (a collation other than the instance's) and once with `-Collation Turkish_100_CI_AS`. The test
+  output is kept as a workflow artifact.
+
+## Versions and releases
+
+`VERSION` holds the version of the next release with a `-dev` suffix. `build.ps1` stamps it into
+the install script's header and into `AIIndexTuner.fn_Version()`. It is not a commit hash: the
+committed install script could not contain the hash of its own commit.
+
+To release:
+
+1. Set `VERSION` to the release version (drop `-dev`), run `.\build.ps1`, and rename *Unreleased*
+   in `RELEASE_NOTES.md` to the version and date.
+2. Merge that, then tag the merge commit `v<version>` and push the tag.
+3. Set `VERSION` to the next version with `-dev`.
+
 ## Sensitive data
 
 - **Never commit** API keys, endpoint credentials, master key passwords or a filled-in `setup/Configure-Endpoint.sql`. Keep your local copy as `setup/Configure-Endpoint-DEV.sql`, which `.gitignore` excludes.
@@ -116,7 +141,7 @@ Code and documentation change in the same pull request.
 ## Pull request checklist
 
 - [ ] The change is made in `src/`, and `aisqltuner-index-tuner.sql` is regenerated with `.\build.ps1`
-- [ ] `.\tests\Run-All.ps1` passes
+- [ ] `.\tests\Run-All.ps1` passes locally, and CI passes on the pull request
 - [ ] New or changed behavior has a test
 - [ ] README and `RELEASE_NOTES.md` are updated
 - [ ] No secrets, real names or customer data are included

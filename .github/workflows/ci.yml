@@ -1,0 +1,77 @@
+# Checks every pull request and push to main (issue #53):
+#   - the committed install script matches what build.ps1 makes from src/ and VERSION;
+#   - the tests pass on SQL Server 2025 in a test database collated differently from the instance,
+#     and in one collated Turkish_100_CI_AS (issues #42 and #44 were both collation defects).
+# The tests use canned model answers, so no AI endpoint or key is needed.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Install script matches src/
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rebuild the install script
+        shell: pwsh
+        run: ./build.ps1
+      - name: Fail if it differs from the committed one
+        run: |
+          if ! git diff --exit-code -- aisqltuner-index-tuner.sql; then
+            echo "::error file=aisqltuner-index-tuner.sql::aisqltuner-index-tuner.sql does not match src/ and VERSION. Run ./build.ps1 and commit the result."
+            exit 1
+          fi
+
+  test:
+    name: Tests (${{ matrix.collation }} collation)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        collation: [Different, Turkish_100_CI_AS]
+    services:
+      sql:
+        image: mcr.microsoft.com/mssql/server:2025-latest
+        env:
+          ACCEPT_EULA: Y
+          MSSQL_PID: Developer
+          MSSQL_SA_PASSWORD: CI-only-Passw0rd!   # a throwaway password; the container lives only for this job
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' -b -o /dev/null"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      SQLCMDPASSWORD: CI-only-Passw0rd!   # the service's sa password, read by sqlcmd -U
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install sqlcmd
+        run: |
+          # The runner image usually has the Microsoft package repository already; add it only if not.
+          if ! grep -rqs "packages.microsoft.com/ubuntu/24.04/prod" /etc/apt/sources.list /etc/apt/sources.list.d/; then
+            curl -sSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/24.04/prod noble main" | sudo tee /etc/apt/sources.list.d/mssql-release.list
+          fi
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
+          echo /opt/mssql-tools18/bin >> "$GITHUB_PATH"
+      - name: Build, install and run the tests
+        shell: pwsh
+        run: ./tests/Run-All.ps1 -Server 'localhost,1433' -User sa -Collation '${{ matrix.collation }}' -Force
+      - name: Keep the test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-${{ matrix.collation }}
+          path: /tmp/aisqltuner-index-tuner-*.txt   # where Run-All.ps1 writes it ([IO.Path]::GetTempPath())
+          if-no-files-found: ignore

@@ -262,7 +262,7 @@ BEGIN
 
     DECLARE @RunId int;
     INSERT AIIndexTuner.Run (SessionId, SessionLoginTime, Mode, SchemaName, TableName, Endpoint, Deployment, ApiShape, ReasoningEffort, SystemPromptHash,
-                             AllowColumnstore, AllowDropIndex, MaxNewIndexes, MinPriority, MinConfidence, MaxTableRows, MaxIndexSizeMB)
+                             AllowColumnstore, AllowDropIndex, MaxNewIndexes, MinPriority, MinConfidence, MaxTableRows, MaxIndexSizeMB, Version)
     VALUES (@@SPID, (SELECT login_time FROM sys.dm_exec_sessions WHERE session_id = @@SPID),
             @Mode, @SchemaName, @TableName,
             CASE WHEN @TestResponse IS NULL THEN @Endpoint END,
@@ -270,7 +270,8 @@ BEGIN
             CASE WHEN @TestResponse IS NULL THEN 'OpenAIResponses' ELSE 'Test' END,
             CASE WHEN @TestResponse IS NULL THEN @Effort END,
             CONVERT(char(64), HASHBYTES('SHA2_256', @SystemPrompt), 2),
-            @AllowColumnstore, @AllowDropIndex, @MaxNewIndexes, @MinPriority, @MinConfidence, @MaxTableRows, @MaxIndexSizeMB);
+            @AllowColumnstore, @AllowDropIndex, @MaxNewIndexes, @MinPriority, @MinConfidence, @MaxTableRows, @MaxIndexSizeMB,
+            AIIndexTuner.fn_Version());
     SET @RunId = SCOPE_IDENTITY();
 
     BEGIN TRY
@@ -435,7 +436,7 @@ BEGIN
     EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'Return results', @LogId = @ResultsLogId OUTPUT, @CharsAtStart = @ResultsLogChars OUTPUT;
     SET @ResultsLogRow = @ResultsLogId;
 
-    SELECT r.RunId, r.Status AS RunStatus, r.ModelUsed, r.InputTokens, r.OutputTokens, r.Summary,
+    SELECT r.RunId, r.Version, r.Status AS RunStatus, r.ModelUsed, r.InputTokens, r.OutputTokens, r.Summary,
            r.CollectedChars, r.StartedAt, r.CompletedAt,
            N'Free and open source from AI SQL Tuner. For query tuning, deadlock analysis, server health checks, code review, HTML reports or SQL Server 2022 and earlier, see AI SQL Tuner Studio: https://aisqltuner.com or https://apps.microsoft.com/detail/9P68072ZM3N5' AS MoreFrom
     FROM AIIndexTuner.Run AS r WHERE r.RunId = @RunId;

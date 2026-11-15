@@ -1,4 +1,5 @@
-# Rebuilds the install script, recreates the test database, installs, runs the workload, then the tests.
+# Rebuilds the install script, recreates the test database, installs, runs the workload, then the
+# tests, then checks setup/Uninstall.sql (which leaves the test database uninstalled).
 # A fresh database each time: dropping an index clears SQL Server's missing-index statistics for the
 # table, so the tests cannot reuse a database an earlier run changed.
 #
@@ -6,6 +7,7 @@
 #   .\tests\Run-All.ps1 -Server sql01
 #   .\tests\Run-All.ps1 -Database AIIndexTunerTest2
 #   .\tests\Run-All.ps1 -Collation Turkish_100_CI_AS
+#   .\tests\Run-All.ps1 -User sa              # SQL authentication; the password from $env:SQLCMDPASSWORD
 #
 # -Collation sets the test database's collation: Different (the default) picks one other than the
 # instance's, so collation conflicts between DMVs and catalog views show up (issue #42); Instance
@@ -17,6 +19,7 @@ param(
     [string]$Server = 'localhost',
     [string]$Database = 'AIIndexTunerTest',
     [string]$Collation = 'Different',
+    [string]$User,
     [switch]$Force
 )
 
@@ -26,8 +29,16 @@ $root = Split-Path $PSScriptRoot -Parent
 if ($Database -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { throw "Use a plain database name (letters, digits, underscores): $Database" }
 if ($Collation -notmatch '^[A-Za-z0-9_]+$') { throw "Use a collation name (letters, digits, underscores): $Collation" }
 
+# Windows authentication, or SQL authentication with -User; sqlcmd reads the password from SQLCMDPASSWORD.
+if ($User) {
+    if (-not $env:SQLCMDPASSWORD) { throw 'Set $env:SQLCMDPASSWORD to the password for -User.' }
+    $auth = @('-U', $User)
+} else {
+    $auth = @('-E')
+}
+
 function Invoke-Sql([string]$File, [string]$Db = 'master', [string]$Output) {
-    $sqlArgs = @('-S', $Server, '-E', '-C', '-f', '65001', '-b', '-d', $Db, '-v', "TestDb=$Database", "TestCollation=$Collation", '-i', $File)
+    $sqlArgs = @('-S', $Server) + $auth + @('-C', '-f', '65001', '-b', '-d', $Db, '-v', "TestDb=$Database", "TestCollation=$Collation", '-i', $File)
     if ($Output) { $sqlArgs += @('-o', $Output) }
     $output = & sqlcmd @sqlArgs
     if ($LASTEXITCODE -ne 0) {
@@ -37,7 +48,7 @@ function Invoke-Sql([string]$File, [string]$Db = 'master', [string]$Output) {
 }
 
 if (-not $Force) {
-    $credentials = & sqlcmd -S $Server -E -C -h -1 -W -Q "SET NOCOUNT ON; IF DB_ID(N'$Database') IS NULL SELECT 0 ELSE SELECT COUNT(*) FROM [$Database].sys.database_scoped_credentials;"
+    $credentials = & sqlcmd -S $Server @auth -C -h -1 -W -Q "SET NOCOUNT ON; IF DB_ID(N'$Database') IS NULL SELECT 0 ELSE SELECT COUNT(*) FROM [$Database].sys.database_scoped_credentials;"
     if ($LASTEXITCODE -ne 0) { throw "Could not check $Database for credentials." }
     if ([int]($credentials | Where-Object { $_ -match '^\d+$' } | Select-Object -First 1) -gt 0) {
         throw "$Database has a database scoped credential, which recreating it would delete. Use -Database to test in another database, or -Force to recreate it anyway."
@@ -54,7 +65,17 @@ Invoke-Sql (Join-Path $PSScriptRoot '02_Run-Workload.sql') $Database
 
 Write-Host 'Running the tests...'
 $out = Join-Path ([IO.Path]::GetTempPath()) 'aisqltuner-index-tuner-tests.txt'
-& sqlcmd -S $Server -E -C -f 65001 -b -d $Database -i (Join-Path $PSScriptRoot '03_Run-Tests.sql') -o $out -W
+& sqlcmd -S $Server @auth -C -f 65001 -b -d $Database -i (Join-Path $PSScriptRoot '03_Run-Tests.sql') -o $out -W
 $code = $LASTEXITCODE
 Get-Content $out -Encoding utf8 | Where-Object { $_ -match '^(PASS|FAIL|SKIP|ALL TESTS)|^Msg ' } | ForEach-Object { Write-Host $_ }
 if ($code -ne 0) { Write-Host "Tests failed. Full output: $out"; exit 1 }
+
+Write-Host 'Checking the uninstall...'
+Invoke-Sql (Join-Path $PSScriptRoot '04_Prepare-Uninstall.sql') $Database
+Invoke-Sql (Join-Path $root 'setup/Uninstall.sql') $Database
+Invoke-Sql (Join-Path $root 'setup/Uninstall.sql') $Database   # a second run finds nothing and changes nothing
+$check = Join-Path ([IO.Path]::GetTempPath()) 'aisqltuner-index-tuner-uninstall.txt'
+& sqlcmd -S $Server @auth -C -f 65001 -b -d $Database -i (Join-Path $PSScriptRoot '05_Check-Uninstall.sql') -o $check -W
+$code = $LASTEXITCODE
+Get-Content $check -Encoding utf8 | Where-Object { $_ -match '^(PASS|FAIL)|^Msg ' } | ForEach-Object { Write-Host $_ }
+if ($code -ne 0) { Write-Host "Uninstall check failed. Full output: $check"; exit 1 }
