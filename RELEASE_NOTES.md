@@ -7,7 +7,7 @@ To upgrade, run the new [aisqltuner-index-tuner.sql](aisqltuner-index-tuner.sql)
 where the tool is installed. It adds new columns with `ALTER TABLE`, so earlier runs and
 recommendations are kept, and it replaces the procedures and functions.
 
-## Unreleased
+## 1.1.0 (2026-11-16)
 
 ### Added
 
