@@ -2103,5 +2103,22 @@ END;
 PRINT 'PASS T37: the purge deletes old runs with their child rows, keeps Applied recommendations unless asked, clears only the detail with @DetailOnly, changes nothing with @WhatIf, and sp_AIIndexTuner applies the configured retention';
 GO
 
+/* ----- T38: explicit NULLs mean the defaults, as in the script SSMS writes for Execute Procedure ----- */
+DECLARE @T38Body nvarchar(max) = (SELECT Body FROM #Canned WHERE Name = 'good'), @T38Before int = ISNULL((SELECT MAX(RunId) FROM AIIndexTuner.Run), 0), @T38Run int;
+EXEC dbo.sp_AIIndexTuner NULL, NULL, NULL, NULL, @T38Body, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL;
+SET @T38Run = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
+IF ISNULL(@T38Run, 0) = @T38Before
+   OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.Run WHERE RunId = @T38Run AND Mode = 'RECOMMEND' AND Status = 'Succeeded')
+   OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RunId = @T38Run)
+    THROW 50999, N'FAIL T38: sp_AIIndexTuner with explicit NULLs did not run as RECOMMEND.', 1;
+EXEC dbo.sp_AIIndexTuner_Purge @OlderThanDays = 36500, @DetailOnly = NULL, @IncludeApplied = NULL, @WhatIf = NULL;
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Run WHERE RunId = @T38Run AND CollectedData IS NOT NULL)
+    THROW 50999, N'FAIL T38: sp_AIIndexTuner_Purge with explicit NULLs changed a new run.', 1;
+DELETE AIIndexTuner.RunLog WHERE RunId = @T38Run;
+DELETE AIIndexTuner.Recommendation WHERE RunId = @T38Run;
+DELETE AIIndexTuner.Run WHERE RunId = @T38Run;
+PRINT 'PASS T38: explicit NULL parameters mean the defaults in sp_AIIndexTuner and sp_AIIndexTuner_Purge';
+GO
+
 PRINT 'ALL TESTS PASSED';
 GO
