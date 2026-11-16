@@ -56,6 +56,12 @@ recommendations are kept, and it replaces the procedures and functions.
 
 ### Fixed
 
+- **Explicit NULL parameters mean the defaults.** The script SSMS writes for *Execute Procedure*
+  passes every parameter, NULL when not set. `sp_AIIndexTuner` then failed with
+  "Cannot insert the value NULL into column 'Mode'", and carried on to a second error for the
+  missing `RunId`. A NULL `@Mode` now means RECOMMEND and a NULL `@CollectOnly` means 0; in
+  `sp_AIIndexTuner_Purge`, NULL `@DetailOnly`, `@IncludeApplied` and `@WhatIf` mean 0. If the run
+  row cannot be inserted for any reason, `sp_AIIndexTuner` now stops with error 50216.
 - **The collector's impact on busy servers, untrusted query text, and drops through the clustered
   index** (issue #52).
   - HEAP TABLE ANALYSIS and INDEX PAGE DENSITY ran `sys.dm_db_index_physical_stats` (SAMPLED) on
@@ -157,6 +163,8 @@ recommendations are kept, and it replaces the procedures and functions.
 
 ### Tests
 
+- New test T38: `sp_AIIndexTuner` called with every parameter passed positionally, NULL except
+  `@TestResponse`, runs as RECOMMEND; `sp_AIIndexTuner_Purge` with NULL flags uses the defaults.
 - New test T37 (issue #55): old runs are deleted with their child rows and newer ones kept; Applied
   recommendations are kept unless `@IncludeApplied = 1`; `@DetailOnly` clears only the two
   columns; `@WhatIf` changes nothing; refusals; `sp_AIIndexTuner` applies the configured retention.

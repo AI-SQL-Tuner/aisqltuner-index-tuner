@@ -329,7 +329,9 @@ BEGIN
     SET XACT_ABORT OFF;
     DECLARE @CallStarted datetime2(3) = SYSDATETIME();   -- for @MaxMinutes
 
-    SET @Mode = UPPER(LTRIM(RTRIM(@Mode)));
+    -- A NULL passed explicitly, as in the script SSMS writes for Execute Procedure, means the default.
+    SET @Mode = UPPER(LTRIM(RTRIM(ISNULL(@Mode, 'RECOMMEND'))));
+    SET @CollectOnly = ISNULL(@CollectOnly, 0);
     SET @SchemaName = NULLIF(LTRIM(RTRIM(@SchemaName)), N'');
     SET @TableName = NULLIF(LTRIM(RTRIM(@TableName)), N'');
 
@@ -438,6 +440,10 @@ BEGIN
             @AllowColumnstore, @AllowDropIndex, @MaxNewIndexes, @MinPriority, @MinConfidence, @MaxTableRows, @MaxIndexSizeMB,
             AIIndexTuner.fn_Version());
     SET @RunId = SCOPE_IDENTITY();
+    -- With XACT_ABORT OFF a failed INSERT does not stop the procedure; without a run row nothing
+    -- after this can be recorded.
+    IF @RunId IS NULL
+        THROW 50216, N'The run could not be recorded in AIIndexTuner.Run (see the error above), so the run was not started.', 1;
 
     /* Run history retention (issue #55): with AIIndexTuner.Config.RetainRunDays or RetainRunDetailDays
        set, each run first purges older history, so a scheduled job needs no second step. This run is not
@@ -776,6 +782,8 @@ CREATE OR ALTER PROCEDURE dbo.sp_AIIndexTuner_Purge
 AS
 BEGIN
     SET NOCOUNT ON;
+    -- A NULL passed explicitly, as in the script SSMS writes for Execute Procedure, means the default.
+    SELECT @DetailOnly = ISNULL(@DetailOnly, 0), @IncludeApplied = ISNULL(@IncludeApplied, 0), @WhatIf = ISNULL(@WhatIf, 0);
     IF @OlderThanDays < 0
         THROW 50401, N'@OlderThanDays must be 0 or more, or NULL for the retention in AIIndexTuner.Config.', 1;
 
