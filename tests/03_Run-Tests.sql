@@ -2120,5 +2120,94 @@ DELETE AIIndexTuner.Run WHERE RunId = @T38Run;
 PRINT 'PASS T38: explicit NULL parameters mean the defaults in sp_AIIndexTuner and sp_AIIndexTuner_Purge';
 GO
 
+/* ----- T39: AIIndexTuner.Config.MinUsageDays (issue #66) and AIIndexTuner.IndexesToKeep (issue #67) -----
+   IX_T39_AB covers IX_T39_A and IX_T39_A2, so both are redundant, but IX_T39_A is kept. IX_T39_B is kept,
+   so it is not widened. IX_T39_C is covered by nothing, so its drop is low use, and a MinUsageDays longer
+   than any instance has run skips it. */
+IF EXISTS (SELECT 1 FROM AIIndexTuner.Config)
+    PRINT 'SKIP T39: AIIndexTuner.Config has a row';
+ELSE
+BEGIN
+    DECLARE @T39Problems nvarchar(max) = N'', @T39Run int, @T39Error int, @T39Data nvarchar(max);
+    DROP TABLE IF EXISTS dbo.T39;
+    CREATE TABLE dbo.T39 (Id int NOT NULL CONSTRAINT PK_T39 PRIMARY KEY, A int, B int, C int);
+    INSERT dbo.T39 (Id, A, B, C) SELECT value, value % 7, value % 11, value % 13 FROM GENERATE_SERIES(1, 200);
+    CREATE INDEX IX_T39_AB ON dbo.T39 (A, B);
+    CREATE INDEX IX_T39_A ON dbo.T39 (A);
+    CREATE INDEX IX_T39_A2 ON dbo.T39 (A);
+    CREATE INDEX IX_T39_B ON dbo.T39 (B);
+    CREATE INDEX IX_T39_C ON dbo.T39 (C);
+    INSERT AIIndexTuner.IndexesToKeep (SchemaName, TableName, IndexName, Reason)
+    VALUES (N'dbo', N'T39', N'IX_T39_A', N'Quarterly extract'), (N'dbo', N'T39', N'IX_T39_B', NULL),
+           (N'dbo', N'T39', N'IX_T39_Gone', N'An index that does not exist');
+    INSERT AIIndexTuner.Config (ConfigId, Endpoint, Deployment, CredentialName, MinUsageDays)
+    VALUES (1, N'https://t39.invalid/', N't39', N'https://t39.invalid', 36500);
+
+    DECLARE @T39Answer nvarchar(max) = N'{"summary": "T39", "recommendations": [
+      {"priority": 1, "category": "DropIndex", "title": "Kept, redundant", "schema_name": "dbo", "table_name": "T39", "index_name": "IX_T39_A", "key_columns": [], "include_columns": [], "confidence": "High", "rationale": "t", "script": ""},
+      {"priority": 2, "category": "DropIndex", "title": "Redundant", "schema_name": "dbo", "table_name": "T39", "index_name": "IX_T39_A2", "key_columns": [], "include_columns": [], "confidence": "High", "rationale": "t", "script": ""},
+      {"priority": 3, "category": "ConsolidateIndex", "title": "Widen kept", "schema_name": "dbo", "table_name": "T39", "index_name": "IX_T39_B", "replaces_index": "IX_T39_B",
+       "key_columns": [{"column": "B", "descending": false}], "include_columns": ["C"], "is_unique": false, "confidence": "High", "rationale": "t", "script": ""},
+      {"priority": 4, "category": "DropIndex", "title": "Low use", "schema_name": "dbo", "table_name": "T39", "index_name": "IX_T39_C", "key_columns": [], "include_columns": [], "confidence": "High", "rationale": "t", "script": ""},
+      {"priority": 5, "category": "DropIndex", "title": "Kept row, no index", "schema_name": "dbo", "table_name": "T39", "index_name": "IX_T39_Gone", "key_columns": [], "include_columns": [], "confidence": "High", "rationale": "t", "script": ""}]}';
+    EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @TestResponse = @T39Answer, @AllowDropIndex = 1;
+    SET @T39Run = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
+
+    IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RunId = @T39Run AND Priority = 1 AND Status = 'Skipped'
+                   AND StatusReason = N'[IX_T39_A] is listed in AIIndexTuner.IndexesToKeep (Quarterly extract), so it is not dropped. Delete its row there to allow it.')
+       OR INDEXPROPERTY(OBJECT_ID(N'dbo.T39'), N'IX_T39_A', N'IndexId') IS NULL
+        SET @T39Problems += N' a kept redundant index was dropped or its reason is wrong;';
+    IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RunId = @T39Run AND Priority = 2 AND Status = 'Applied')
+       OR INDEXPROPERTY(OBJECT_ID(N'dbo.T39'), N'IX_T39_A2', N'IndexId') IS NOT NULL
+        SET @T39Problems += N' a redundant index that is not kept was not dropped;';
+    IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RunId = @T39Run AND Priority = 3 AND Status = 'Skipped'
+                   AND StatusReason = N'[IX_T39_B] is listed in AIIndexTuner.IndexesToKeep, so it is not widened. Delete its row there to allow it.')
+       OR EXISTS (SELECT 1 FROM sys.index_columns WHERE object_id = OBJECT_ID(N'dbo.T39') AND index_id = INDEXPROPERTY(OBJECT_ID(N'dbo.T39'), N'IX_T39_B', N'IndexId') AND is_included_column = 1)
+        SET @T39Problems += N' a kept index was widened or its reason is wrong;';
+    IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RunId = @T39Run AND Priority = 4 AND Status = 'Skipped'
+                   AND StatusReason LIKE N'No other index covers \[IX_T39_C\], and the usage statistics cover only %at least 36500 days of them.' ESCAPE N'\')
+       OR INDEXPROPERTY(OBJECT_ID(N'dbo.T39'), N'IX_T39_C', N'IndexId') IS NULL
+        SET @T39Problems += N' a low-use drop did not use MinUsageDays;';
+    IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RunId = @T39Run AND Priority = 5 AND Status = 'Skipped'
+                   AND StatusReason = N'Index [IX_T39_Gone] does not exist on [dbo].[T39].')
+        SET @T39Problems += N' a kept row naming an index that does not exist hid that the index is not there;';
+
+    -- sp_AIIndexTuner_Apply refuses the kept index too.
+    DECLARE @T39Rec int = (SELECT RecommendationId FROM AIIndexTuner.Recommendation WHERE RunId = @T39Run AND Priority = 1);
+    EXEC dbo.sp_AIIndexTuner_Apply @RecommendationId = @T39Rec, @AllowDropIndex = 1;
+    IF INDEXPROPERTY(OBJECT_ID(N'dbo.T39'), N'IX_T39_A', N'IndexId') IS NULL
+        SET @T39Problems += N' sp_AIIndexTuner_Apply dropped a kept index;';
+
+    -- The collected data lists the kept indexes that exist, and the period; the prompt explains them.
+    EXEC AIIndexTuner.usp_CollectData @SchemaName = N'dbo', @TableName = N'T39', @Data = @T39Data OUTPUT;
+    IF @T39Data NOT LIKE N'%=== INDEXES TO KEEP ===%Minimum usage period for a low-use drop: 36500 days%"IndexName":"IX_T39_A","Reason":"Quarterly extract"%'
+       OR @T39Data NOT LIKE N'%"IndexName":"IX_T39_B"%' OR @T39Data LIKE N'%IX_T39_Gone%'
+        SET @T39Problems += N' the collected data does not list the kept indexes and the period as expected;';
+    IF AIIndexTuner.fn_SystemPrompt() NOT LIKE N'%INDEXES TO KEEP lists indexes%Never recommend dropping one%'
+        SET @T39Problems += N' the system prompt does not explain INDEXES TO KEEP;';
+
+    SET @T39Error = NULL;
+    BEGIN TRY UPDATE AIIndexTuner.Config SET MinUsageDays = 0; END TRY BEGIN CATCH SET @T39Error = ERROR_NUMBER(); END CATCH;
+    IF ISNULL(@T39Error, 0) <> 547 SET @T39Problems += N' MinUsageDays = 0 was accepted;';
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'AIIndexTuner.Config') AND name = N'MinUsageDays' AND is_nullable = 0)
+       OR (SELECT definition FROM sys.default_constraints WHERE name = N'DF_AIIndexTuner_Config_MinUsageDays') <> N'((7))'
+        SET @T39Problems += N' MinUsageDays is not NOT NULL with a default of 7;';
+
+    DELETE AIIndexTuner.Config;
+    DELETE AIIndexTuner.IndexesToKeep WHERE TableName = N'T39';
+    DELETE AIIndexTuner.RunLog WHERE RunId = @T39Run;
+    DELETE AIIndexTuner.Recommendation WHERE RunId = @T39Run;
+    DELETE AIIndexTuner.Run WHERE RunId = @T39Run;
+    DROP TABLE dbo.T39;
+
+    IF @T39Problems <> N''
+    BEGIN
+        DECLARE @T39Msg nvarchar(2048) = LEFT(N'FAIL T39:' + @T39Problems, 2048);
+        THROW 50999, @T39Msg, 1;
+    END;
+    PRINT 'PASS T39: indexes in AIIndexTuner.IndexesToKeep are neither dropped nor widened, by CREATE mode or sp_AIIndexTuner_Apply, and are listed for the model; a low-use drop needs MinUsageDays of usage statistics';
+END;
+GO
+
 PRINT 'ALL TESTS PASSED';
 GO

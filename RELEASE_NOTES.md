@@ -7,6 +7,33 @@ To upgrade, run the new [aisqltuner-index-tuner.sql](aisqltuner-index-tuner.sql)
 where the tool is installed. It adds new columns with `ALTER TABLE`, so earlier runs and
 recommendations are kept, and it replaces the procedures and functions.
 
+## 1.1.1 (2026-11-17)
+
+### Added
+
+- **`AIIndexTuner.Config.MinUsageDays`** (issue #66). A low-use index drop needed usage statistics
+  that cover at least 7 days, a fixed value, so an index used only by month-end reports could be
+  dropped for low use in the middle of the month. The period is now this setting: default 7, at
+  least 1. Usage statistics reset when the instance restarts, so a long period is often not met;
+  the drop is then skipped. The collector reports the period, and the prompt uses it in place of
+  "one week".
+- **`AIIndexTuner.IndexesToKeep`** (issue #67): indexes the tool never drops or widens, however
+  unused they look, for work that runs rarely, such as a quarterly extract or an annual report.
+  - One row per index, with an optional `Reason`, and `AddedBy` and `AddedAt` filled in. A whole
+    table cannot be listed, so an unused index the tool built can still be dropped later.
+  - CREATE mode and `sp_AIIndexTuner_Apply` mark a `DropIndex` of a listed index, whether low use
+    or redundant, and a `ConsolidateIndex` that widens one, `Skipped`, with a `StatusReason` that
+    names the table and the row's `Reason`.
+  - The new collector section INDEXES TO KEEP lists the listed indexes that exist, and the system
+    prompt tells the model not to recommend dropping or widening them.
+
+### Tests
+
+- New test T39 (issues #66 and #67): a listed index is not dropped as redundant or widened in
+  CREATE mode, nor dropped by `sp_AIIndexTuner_Apply`, while an unlisted redundant one is; the
+  collected data and the prompt list them; a `MinUsageDays` longer than the usage period skips a
+  low-use drop and is named in its reason; `MinUsageDays = 0` is rejected.
+
 ## 1.1.0 (2026-11-16)
 
 ### Added

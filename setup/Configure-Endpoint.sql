@@ -218,6 +218,7 @@ UPDATE AIIndexTuner.Config SET
     OnlineWaitMinutes   = 5,         -- low-priority wait of an online rowstore build before it gives up; NULL = normal wait
     BuildMaxDop         = NULL,      -- MAXDOP for index builds; NULL = the server's setting
     RetainRunDays       = NULL,      -- each run deletes runs completed more than this many days ago (Applied recommendations kept); NULL = keep forever
-    RetainRunDetailDays = NULL       -- each run clears CollectedData and RawResponse of runs completed more than this many days ago; NULL = keep them forever
+    RetainRunDetailDays = NULL,      -- each run clears CollectedData and RawResponse of runs completed more than this many days ago; NULL = keep them forever
+    MinUsageDays        = 7          -- days of usage statistics a low-use index drop needs; at least 1
 WHERE ConfigId = 1;
 */

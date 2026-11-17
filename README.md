@@ -121,6 +121,8 @@ an index the tool created, run its `UndoDDL` from `AIIndexTuner.Recommendation` 
      density. Each overlap says whether the narrower index is redundant: the wider index covers
      its keys, included columns and filter, and no uniqueness is lost, so it can be dropped
      whatever the usage window
+   - the indexes listed in `AIIndexTuner.IndexesToKeep`, which the model is told never to drop or
+     widen, and the minimum usage period for a low-use drop (`MinUsageDays`)
    - the top 25 plan cache statements by CPU for this database
    - non-SARGable predicates: table columns that the plans of the top 50 plan cache statements
      wrap in a function, conversion or arithmetic, such as `YEAR(InvoiceDate)` or
@@ -296,14 +298,19 @@ EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @MinPriority = 'Low', @MinConfidence 
   - indexes a foreign key references
   - indexes named by an index hint in a module, a plan guide or a Query Store hint
   - indexes a forced Query Store plan uses, since the plan would fail with `NO_INDEX`
-  - low-use drops before the usage statistics cover 7 days. An index that another index makes
+  - indexes listed in `AIIndexTuner.IndexesToKeep` (see [Indexes to keep](#indexes-to-keep)),
+    whether the drop is for low use or because another index covers them
+  - low-use drops before the usage statistics cover `MinUsageDays` days (7 by default; see
+    [Configuration](#configuration)). An index that another index makes
     redundant can be dropped at any time. Redundant here means another nonclustered index has the
     same leading keys, covers its includes and filter, and keeps any uniqueness. The clustered index
     does not count: a narrow nonclustered index on the clustering key makes counts and range scans
     cheaper, so dropping one is a low-use decision. On SQL Server, a low-use drop
     also needs the error log to confirm the period, which takes securityadmin or sysadmin and doesn't
     work inside `INSERT ... EXEC`. On Azure SQL Database a failover can reset the statistics without
-    a trace, so the 7 days are counted from the times it can see.
+    a trace, so the period is counted from the times it can see. The statistics reset when the
+    instance restarts, so a long `MinUsageDays`, such as 35 to cover a monthly cycle, is often not
+    met on a server restarted for patching: the drop is then skipped, which is the safe outcome.
   - low-use drops of an index whose reads-to-writes ratio in that period is 5 or more, or that
     has 1,000 or more reads a day, from `sys.dm_db_index_usage_stats` (reads are user seeks, scans
     and lookups; writes are user updates, counted per statement). The reads-a-day rule keeps a
@@ -316,6 +323,7 @@ EXEC dbo.sp_AIIndexTuner_Apply @RunId = 7, @MinPriority = 'Low', @MinConfidence 
   - low-use drops of a unique index, since it decides which rows the table accepts. A unique index
     is dropped only when another unique index with the same keys makes it redundant.
 - **Widenings it refuses, each with a reason:**
+  - a replaced index listed in `AIIndexTuner.IndexesToKeep`
   - a consolidation that doesn't name the index it replaces (`replaces_index`), such as a merge of
     two indexes or a new clustered index
   - a replaced index that is clustered, unique or backs a constraint, filtered, partitioned or
@@ -386,6 +394,28 @@ WHERE ep.name = N'AIIndexTuner';
 | `PhysicalStatsMaxPages` | 1280000 | Those two sections skip a table with more reserved pages (10 GB by default) and list it as skipped (NULL = no limit) |
 | `RetainRunDays` | NULL | Delete runs completed more than this many days ago, with their step log and recommendations, except Applied recommendations (NULL = keep forever). See [Run history retention](#run-history-retention) |
 | `RetainRunDetailDays` | NULL | Clear `CollectedData` and `RawResponse` of runs completed more than this many days ago, keeping the rest of the run (NULL = keep them forever) |
+| `MinUsageDays` | 7 | A low-use index drop needs usage statistics that cover at least this many days (at least 1). Set it past the longest cycle an index serves, such as 35 for month-end reports; the statistics reset when the instance restarts, so a long period is often not met and the drop is skipped. For quarterly or annual work, list the index in [Indexes to keep](#indexes-to-keep) |
+
+### Indexes to keep
+
+Some indexes are needed only by work that runs rarely, such as a quarterly extract or an annual
+report, and look unused the rest of the time. List them in `AIIndexTuner.IndexesToKeep`, and the
+tool never drops or widens them, however unused they look, in CREATE mode or with
+`sp_AIIndexTuner_Apply`. Such a recommendation is marked `Skipped`, with a `StatusReason` that names
+the table and the row's `Reason`. The collector also lists them for the model, which is told not to
+recommend dropping or widening them.
+
+```sql
+INSERT AIIndexTuner.IndexesToKeep (SchemaName, TableName, IndexName, Reason)
+VALUES (N'Sales', N'Invoice', N'IX_Invoice_FiscalQuarter', N'Quarterly finance extract');
+
+SELECT * FROM AIIndexTuner.IndexesToKeep;                     -- AddedBy and AddedAt are filled in
+DELETE AIIndexTuner.IndexesToKeep WHERE IndexName = N'IX_Invoice_FiscalQuarter';   -- allow it again
+```
+
+Each row names one index; a whole table cannot be listed, so an index the tool built that nothing
+uses can still be dropped later. A row naming an index that does not exist is ignored. A kept index
+can still be the one that makes another index redundant.
 
 ### Step log
 
