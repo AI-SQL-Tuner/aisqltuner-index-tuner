@@ -3189,6 +3189,19 @@ BEGIN
             @IsColumnstore bit = CASE WHEN @IndexType LIKE '%COLUMNSTORE' THEN 1 ELSE 0 END,
             @Target nvarchar(300) = QUOTENAME(@SchemaName) + N'.' + QUOTENAME(@TableName);
 
+    -- A drop or widening of an index listed in AIIndexTuner.IndexesToKeep (issue #67). Only a row whose
+    -- index exists counts, as in the collector, so a stale row cannot hide that the index is not there.
+    DECLARE @KeepReason nvarchar(4000) =
+        (SELECT TOP (1) CONCAT(QUOTENAME(k.IndexName), N' is listed in AIIndexTuner.IndexesToKeep',
+                               N' (' + NULLIF(LTRIM(k.Reason), N'') + N')',
+                               N', so it is not ', CASE WHEN @IsWidening = 1 THEN N'widened' ELSE N'dropped' END,
+                               N'. Delete its row there to allow it.')
+         FROM AIIndexTuner.IndexesToKeep AS k
+         INNER JOIN sys.indexes AS i ON i.object_id = OBJECT_ID(@Target, N'U') AND i.name = k.IndexName
+         WHERE (@Category = 'DropIndex' OR @IsWidening = 1)
+           AND k.SchemaName = @SchemaName AND k.TableName = @TableName
+           AND k.IndexName = CASE WHEN @IsWidening = 1 THEN @ReplacesIndex ELSE @IndexName END);
+
     /* ----- Validation: each failed check skips the recommendation with a reason ----- */
     IF @Category = 'ConsolidateIndex' AND @IsWidening = 0
         SET @Reason = N'ConsolidateIndex is applied only when it widens one existing index, and this one does not name the index it replaces (replaces_index). Review the script and apply it yourself.';
@@ -3202,17 +3215,8 @@ BEGIN
     ELSE IF @IsWidening = 1 AND @IsUnique = 1
         SET @Reason = N'A widening keeps the index non-unique; a unique index changes which rows the table accepts. Review it and apply it yourself.';
     -- An index listed in AIIndexTuner.IndexesToKeep (issue #67) is neither dropped nor widened.
-    ELSE IF (@Category = 'DropIndex' OR @IsWidening = 1)
-         AND EXISTS (SELECT 1 FROM AIIndexTuner.IndexesToKeep
-                     WHERE SchemaName = @SchemaName AND TableName = @TableName
-                       AND IndexName = CASE WHEN @IsWidening = 1 THEN @ReplacesIndex ELSE @IndexName END)
-        SET @Reason = (SELECT TOP (1) CONCAT(QUOTENAME(IndexName), N' is listed in AIIndexTuner.IndexesToKeep',
-                                             N' (' + NULLIF(LTRIM(Reason), N'') + N')',
-                                             N', so it is not ', CASE WHEN @IsWidening = 1 THEN N'widened' ELSE N'dropped' END,
-                                             N'. Delete its row there to allow it.')
-                       FROM AIIndexTuner.IndexesToKeep
-                       WHERE SchemaName = @SchemaName AND TableName = @TableName
-                         AND IndexName = CASE WHEN @IsWidening = 1 THEN @ReplacesIndex ELSE @IndexName END);
+    ELSE IF @KeepReason IS NOT NULL
+        SET @Reason = @KeepReason;
     ELSE IF @Category = 'DropIndex' AND @AllowDropIndex = 0
         SET @Reason = N'Index drops are not allowed (@AllowDropIndex = 0).';
     ELSE IF @Category = 'DropIndex' AND @AllowDropIndex IS NULL

@@ -2148,7 +2148,8 @@ BEGIN
       {"priority": 2, "category": "DropIndex", "title": "Redundant", "schema_name": "dbo", "table_name": "T39", "index_name": "IX_T39_A2", "key_columns": [], "include_columns": [], "confidence": "High", "rationale": "t", "script": ""},
       {"priority": 3, "category": "ConsolidateIndex", "title": "Widen kept", "schema_name": "dbo", "table_name": "T39", "index_name": "IX_T39_B", "replaces_index": "IX_T39_B",
        "key_columns": [{"column": "B", "descending": false}], "include_columns": ["C"], "is_unique": false, "confidence": "High", "rationale": "t", "script": ""},
-      {"priority": 4, "category": "DropIndex", "title": "Low use", "schema_name": "dbo", "table_name": "T39", "index_name": "IX_T39_C", "key_columns": [], "include_columns": [], "confidence": "High", "rationale": "t", "script": ""}]}';
+      {"priority": 4, "category": "DropIndex", "title": "Low use", "schema_name": "dbo", "table_name": "T39", "index_name": "IX_T39_C", "key_columns": [], "include_columns": [], "confidence": "High", "rationale": "t", "script": ""},
+      {"priority": 5, "category": "DropIndex", "title": "Kept row, no index", "schema_name": "dbo", "table_name": "T39", "index_name": "IX_T39_Gone", "key_columns": [], "include_columns": [], "confidence": "High", "rationale": "t", "script": ""}]}';
     EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @TestResponse = @T39Answer, @AllowDropIndex = 1;
     SET @T39Run = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
 
@@ -2167,6 +2168,9 @@ BEGIN
                    AND StatusReason LIKE N'No other index covers \[IX_T39_C\], and the usage statistics cover only %at least 36500 days of them.' ESCAPE N'\')
        OR INDEXPROPERTY(OBJECT_ID(N'dbo.T39'), N'IX_T39_C', N'IndexId') IS NULL
         SET @T39Problems += N' a low-use drop did not use MinUsageDays;';
+    IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Recommendation WHERE RunId = @T39Run AND Priority = 5 AND Status = 'Skipped'
+                   AND StatusReason = N'Index [IX_T39_Gone] does not exist on [dbo].[T39].')
+        SET @T39Problems += N' a kept row naming an index that does not exist hid that the index is not there;';
 
     -- sp_AIIndexTuner_Apply refuses the kept index too.
     DECLARE @T39Rec int = (SELECT RecommendationId FROM AIIndexTuner.Recommendation WHERE RunId = @T39Run AND Priority = 1);
