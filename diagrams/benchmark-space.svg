@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 760" width="1600" height="760" font-family="'Segoe UI', Inter, -apple-system, 'Helvetica Neue', Arial, sans-serif" text-rendering="geometricPrecision">
+  <title>Similar read savings, a tenth of the index space</title>
+  <desc>On the challenge scenario, applying all the proc's advice cut reads by 93% with 206 MB of new index space; creating every missing-index suggestion cut 90% with 2,075 MB.</desc>
+  <defs>
+    <pattern id="hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="8" height="8" fill="#FFFFFF"/>
+      <line x1="0" y1="0" x2="0" y2="8" stroke="#B6B5AF" stroke-width="3"/>
+    </pattern>
+    <pattern id="hatchP" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="8" height="8" fill="#FFFFFF"/>
+      <line x1="0" y1="0" x2="0" y2="8" stroke="#86b6ef" stroke-width="3"/>
+    </pattern>
+  </defs>
+  <rect width="1600" height="760" fill="#FFFFFF"/>
+  <text x="40" y="42" font-size="14" font-weight="700" letter-spacing="2.5" fill="#2563EB">AISQLTUNER-INDEX-TUNER · BENCHMARK</text>
+  <text x="40" y="86" font-size="38" font-weight="800" fill="#0B2545">Similar read savings, a tenth of the index space</text>
+  <text x="40" y="118" font-size="19" fill="#475569">On the challenge scenario: net index space added (bars) and the logical-read saving it bought.</text>
+  <line x1="340.0" y1="200" x2="340.0" y2="600" stroke="#E2E8F0"/>
+  <text x="340.0" y="624" font-size="13" fill="#64748B" text-anchor="middle">0 MB</text>
+  <line x1="578.1" y1="200" x2="578.1" y2="600" stroke="#E2E8F0"/>
+  <text x="578.1" y="624" font-size="13" fill="#64748B" text-anchor="middle">500 MB</text>
+  <line x1="816.2" y1="200" x2="816.2" y2="600" stroke="#E2E8F0"/>
+  <text x="816.2" y="624" font-size="13" fill="#64748B" text-anchor="middle">1,000 MB</text>
+  <line x1="1054.3" y1="200" x2="1054.3" y2="600" stroke="#E2E8F0"/>
+  <text x="1054.3" y="624" font-size="13" fill="#64748B" text-anchor="middle">1,500 MB</text>
+  <line x1="1292.4" y1="200" x2="1292.4" y2="600" stroke="#E2E8F0"/>
+  <text x="1292.4" y="624" font-size="13" fill="#64748B" text-anchor="middle">2,000 MB</text>
+  <text x="324" y="256.0" font-size="17" font-weight="700" fill="#334155" text-anchor="end">All proc advice applied</text>
+  <path d="M340 228 H434.1 Q438.1 228 438.1 232 V268 Q438.1 272 434.1 272 H340 Z" fill="#2a78d6"/>
+  <text x="448.1" y="256.0" font-size="18" font-weight="700" fill="#334155">206 MB</text>
+  <text x="514.1" y="256.0" font-size="17" fill="#64748B">→ −93% reads</text>
+  <text x="324" y="356.0" font-size="17" font-weight="700" fill="#334155" text-anchor="end">CREATE mode (applies itself)</text>
+  <path d="M340 328 H492.2 Q496.2 328 496.2 332 V368 Q496.2 372 492.2 372 H340 Z" fill="#2a78d6"/>
+  <text x="506.2" y="356.0" font-size="18" font-weight="700" fill="#334155">328 MB</text>
+  <text x="572.2" y="356.0" font-size="17" fill="#64748B">→ −79% reads</text>
+  <text x="324" y="456.0" font-size="17" font-weight="400" fill="#334155" text-anchor="end">AI SQL Tuner desktop app</text>
+  <path d="M340 428 H557.4 Q561.4 428 561.4 432 V468 Q561.4 472 557.4 472 H340 Z" fill="#858480"/>
+  <text x="571.4" y="456.0" font-size="18" font-weight="700" fill="#334155">465 MB</text>
+  <text x="637.4" y="456.0" font-size="17" fill="#64748B">→ −83% reads</text>
+  <text x="324" y="556.0" font-size="17" font-weight="400" fill="#334155" text-anchor="end">Every missing-index suggestion</text>
+  <path d="M340 528 H1324.1 Q1328.1 528 1328.1 532 V568 Q1328.1 572 1324.1 572 H340 Z" fill="#858480"/>
+  <text x="1338.1" y="556.0" font-size="18" font-weight="700" fill="#334155">2,075 MB</text>
+  <text x="1426.1" y="556.0" font-size="17" fill="#64748B">→ −90% reads</text>
+  <text x="40" y="732" font-size="14" fill="#64748B">Mean of 5 trials. Space is net of any indexes the advice dropped. Database size: 1.8 GB.</text>
+</svg>

@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="1600" height="900" font-family="'Segoe UI', Inter, -apple-system, 'Helvetica Neue', Arial, sans-serif" text-rendering="geometricPrecision">
+  <title>How much faster the whole workload ran</title>
+  <desc>Total execution time reduction per arm and scenario, with each scenario's noise floor. challenge and sqlstorm-oltp show real gains; on tpch10-realistic every arm is inside the 22.2% noise floor.</desc>
+  <defs>
+    <pattern id="hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="8" height="8" fill="#FFFFFF"/>
+      <line x1="0" y1="0" x2="0" y2="8" stroke="#B6B5AF" stroke-width="3"/>
+    </pattern>
+    <pattern id="hatchP" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="8" height="8" fill="#FFFFFF"/>
+      <line x1="0" y1="0" x2="0" y2="8" stroke="#86b6ef" stroke-width="3"/>
+    </pattern>
+  </defs>
+  <rect width="1600" height="900" fill="#FFFFFF"/>
+  <text x="40" y="42" font-size="14" font-weight="700" letter-spacing="2.5" fill="#2563EB">AISQLTUNER-INDEX-TUNER · BENCHMARK</text>
+  <text x="40" y="86" font-size="38" font-weight="800" fill="#0B2545">How much faster the whole workload ran</text>
+  <text x="40" y="118" font-size="19" fill="#475569">Change in total execution time (reads and writes), mean of 5 trials. Shaded band = noise floor.</text>
+  <rect x="40" y="147" width="16" height="16" rx="3" fill="#2a78d6"/>
+  <text x="64" y="160" font-size="15" fill="#334155">sp_AIIndexTuner (this repo)</text>
+  <rect x="320.2" y="147" width="16" height="16" rx="3" fill="#858480"/>
+  <text x="344.2" y="160" font-size="15" fill="#334155">Comparison</text>
+  <rect x="454.2" y="147" width="16" height="16" rx="3" fill="url(#hatch)"/>
+  <text x="478.2" y="160" font-size="15" fill="#334155">Inside the noise floor: no claim</text>
+  <text x="324" y="295.0" font-size="17" font-weight="700" fill="#334155" text-anchor="end">CREATE mode (applies itself)</text>
+  <text x="324" y="373.0" font-size="17" font-weight="700" fill="#334155" text-anchor="end">CREATE mode + widenings (#27)</text>
+  <text x="324" y="451.0" font-size="17" font-weight="700" fill="#334155" text-anchor="end">All proc advice applied</text>
+  <text x="324" y="529.0" font-size="17" font-weight="400" fill="#334155" text-anchor="end">AI SQL Tuner desktop app</text>
+  <text x="324" y="607.0" font-size="17" font-weight="400" fill="#334155" text-anchor="end">Every missing-index suggestion</text>
+  <text x="324" y="685.0" font-size="17" font-weight="400" fill="#334155" text-anchor="end">Statistics refresh only</text>
+  <text x="340" y="204" font-size="20" font-weight="800" fill="#0B2545">challenge</text>
+  <text x="340" y="228" font-size="14" fill="#64748B">1.8 GB · 16 known problems</text>
+  <rect x="340" y="250" width="32.9" height="468" fill="#F1F5F9"/>
+  <text x="376.9" y="740" font-size="13" fill="#64748B">noise floor 10.6%</text>
+  <line x1="340.0" y1="250" x2="340.0" y2="718" stroke="#E2E8F0" stroke-width="1"/>
+  <text x="340.0" y="762" font-size="13" fill="#64748B" text-anchor="middle">0</text>
+  <line x1="417.5" y1="250" x2="417.5" y2="718" stroke="#E2E8F0" stroke-width="1"/>
+  <text x="417.5" y="762" font-size="13" fill="#64748B" text-anchor="middle">−25%</text>
+  <line x1="495.0" y1="250" x2="495.0" y2="718" stroke="#E2E8F0" stroke-width="1"/>
+  <text x="495.0" y="762" font-size="13" fill="#64748B" text-anchor="middle">−50%</text>
+  <line x1="572.5" y1="250" x2="572.5" y2="718" stroke="#E2E8F0" stroke-width="1"/>
+  <text x="572.5" y="762" font-size="13" fill="#64748B" text-anchor="middle">−75%</text>
+  <line x1="650.0" y1="250" x2="650.0" y2="718" stroke="#E2E8F0" stroke-width="1"/>
+  <text x="650.0" y="762" font-size="13" fill="#64748B" text-anchor="middle">−100%</text>
+  <path d="M340 272 H534.1 Q538.1 272 538.1 276 V302 Q538.1 306 534.1 306 H340 Z" fill="#2a78d6"/>
+  <text x="546.1" y="295.0" font-size="17" font-weight="700" fill="#334155">−64%</text>
+  <text x="346" y="372.0" font-size="14" fill="#94A3B8">not run</text>
+  <path d="M340 428 H573.5 Q577.5 428 577.5 432 V458 Q577.5 462 573.5 462 H340 Z" fill="#2a78d6"/>
+  <text x="585.5" y="451.0" font-size="17" font-weight="700" fill="#334155">−77%</text>
+  <path d="M340 506 H560.4 Q564.4 506 564.4 510 V536 Q564.4 540 560.4 540 H340 Z" fill="#858480"/>
+  <text x="572.4" y="529.0" font-size="17" font-weight="700" fill="#334155">−72%</text>
+  <path d="M340 584 H555.2 Q559.2 584 559.2 588 V614 Q559.2 618 555.2 618 H340 Z" fill="#858480"/>
+  <text x="567.2" y="607.0" font-size="17" font-weight="700" fill="#334155">−71%</text>
+  <text x="348.0" y="685.0" font-size="17" font-weight="700" fill="#334155">0%</text>
+  <text x="750" y="204" font-size="20" font-weight="800" fill="#0B2545">sqlstorm-oltp</text>
+  <text x="750" y="228" font-size="14" fill="#64748B">1.9 GB · Stack Overflow OLTP</text>
+  <rect x="750" y="250" width="25.1" height="468" fill="#F1F5F9"/>
+  <text x="779.1" y="740" font-size="13" fill="#64748B">noise floor 8.1%</text>
+  <line x1="750.0" y1="250" x2="750.0" y2="718" stroke="#E2E8F0" stroke-width="1"/>
+  <text x="750.0" y="762" font-size="13" fill="#64748B" text-anchor="middle">0</text>
+  <line x1="827.5" y1="250" x2="827.5" y2="718" stroke="#E2E8F0" stroke-width="1"/>
+  <text x="827.5" y="762" font-size="13" fill="#64748B" text-anchor="middle">−25%</text>
+  <line x1="905.0" y1="250" x2="905.0" y2="718" stroke="#E2E8F0" stroke-width="1"/>
+  <text x="905.0" y="762" font-size="13" fill="#64748B" text-anchor="middle">−50%</text>
+  <line x1="982.5" y1="250" x2="982.5" y2="718" stroke="#E2E8F0" stroke-width="1"/>
+  <text x="982.5" y="762" font-size="13" fill="#64748B" text-anchor="middle">−75%</text>
+  <line x1="1060.0" y1="250" x2="1060.0" y2="718" stroke="#E2E8F0" stroke-width="1"/>
+  <text x="1060.0" y="762" font-size="13" fill="#64748B" text-anchor="middle">−100%</text>
+  <path d="M750 272 H823.8 Q827.8 272 827.8 276 V302 Q827.8 306 823.8 306 H750 Z" fill="#2a78d6"/>
+  <text x="835.8" y="295.0" font-size="17" font-weight="700" fill="#334155">−25%</text>
+  <path d="M750 350 H879.6 Q883.6 350 883.6 354 V380 Q883.6 384 879.6 384 H750 Z" fill="#2a78d6"/>
+  <text x="891.6" y="373.0" font-size="17" font-weight="700" fill="#334155">−43%</text>
+  <path d="M750 428 H867.5 Q871.5 428 871.5 432 V458 Q871.5 462 867.5 462 H750 Z" fill="#2a78d6"/>
+  <text x="879.5" y="451.0" font-size="17" font-weight="700" fill="#334155">−39%</text>
+  <path d="M750 506 H863.8 Q867.8 506 867.8 510 V536 Q867.8 540 863.8 540 H750 Z" fill="#858480"/>
+  <text x="875.8" y="529.0" font-size="17" font-weight="700" fill="#334155">−38%</text>
+  <path d="M750 584 H789.1 Q793.1 584 793.1 588 V614 Q793.1 618 789.1 618 H750 Z" fill="#858480"/>
+  <text x="801.1" y="607.0" font-size="17" font-weight="700" fill="#334155">−14%</text>
+  <path d="M750 662 H786 Q790 662 790 666 V692 Q790 696 786 696 H750 Z" fill="url(#hatch)"/>
+  <rect x="750" y="662.0" width="40.0" height="34" fill="none" stroke="#858480" stroke-width="1.5"/>
+  <text x="798.0" y="685.0" font-size="17" font-weight="700" fill="#334155">−13%*</text>
+  <text x="1160" y="204" font-size="20" font-weight="800" fill="#0B2545">tpch10-realistic</text>
+  <text x="1160" y="228" font-size="14" fill="#64748B">22 GB · TPC-H reports</text>
+  <rect x="1160" y="250" width="68.8" height="468" fill="#F1F5F9"/>
+  <text x="1232.8" y="740" font-size="13" fill="#64748B">noise floor 22.2%</text>
+  <line x1="1160.0" y1="250" x2="1160.0" y2="718" stroke="#E2E8F0" stroke-width="1"/>
+  <text x="1160.0" y="762" font-size="13" fill="#64748B" text-anchor="middle">0</text>
+  <line x1="1237.5" y1="250" x2="1237.5" y2="718" stroke="#E2E8F0" stroke-width="1"/>
+  <text x="1237.5" y="762" font-size="13" fill="#64748B" text-anchor="middle">−25%</text>
+  <line x1="1315.0" y1="250" x2="1315.0" y2="718" stroke="#E2E8F0" stroke-width="1"/>
+  <text x="1315.0" y="762" font-size="13" fill="#64748B" text-anchor="middle">−50%</text>
+  <line x1="1392.5" y1="250" x2="1392.5" y2="718" stroke="#E2E8F0" stroke-width="1"/>
+  <text x="1392.5" y="762" font-size="13" fill="#64748B" text-anchor="middle">−75%</text>
+  <line x1="1470.0" y1="250" x2="1470.0" y2="718" stroke="#E2E8F0" stroke-width="1"/>
+  <text x="1470.0" y="762" font-size="13" fill="#64748B" text-anchor="middle">−100%</text>
+  <path d="M1160 272 H1200 Q1204 272 1204 276 V302 Q1204 306 1200 306 H1160 Z" fill="url(#hatchP)"/>
+  <rect x="1160" y="272.0" width="44.0" height="34" fill="none" stroke="#2a78d6" stroke-width="1.5"/>
+  <text x="1212.0" y="295.0" font-size="17" font-weight="700" fill="#334155">−14%</text>
+  <text x="1166" y="372.0" font-size="14" fill="#94A3B8">not run</text>
+  <path d="M1160 428 H1202.2 Q1206.2 428 1206.2 432 V458 Q1206.2 462 1202.2 462 H1160 Z" fill="url(#hatchP)"/>
+  <rect x="1160" y="428.0" width="46.2" height="34" fill="none" stroke="#2a78d6" stroke-width="1.5"/>
+  <text x="1214.2" y="451.0" font-size="17" font-weight="700" fill="#334155">−15%</text>
+  <path d="M1160 506 H1221.4 Q1225.4 506 1225.4 510 V536 Q1225.4 540 1221.4 540 H1160 Z" fill="url(#hatch)"/>
+  <rect x="1160" y="506.0" width="65.4" height="34" fill="none" stroke="#858480" stroke-width="1.5"/>
+  <text x="1233.4" y="529.0" font-size="17" font-weight="700" fill="#334155">−21%</text>
+  <path d="M1160 584 H1199.7 Q1203.7 584 1203.7 588 V614 Q1203.7 618 1199.7 618 H1160 Z" fill="url(#hatch)"/>
+  <rect x="1160" y="584.0" width="43.7" height="34" fill="none" stroke="#858480" stroke-width="1.5"/>
+  <text x="1211.7" y="607.0" font-size="17" font-weight="700" fill="#334155">−14%</text>
+  <path d="M1160 662 H1207.2 Q1211.2 662 1211.2 666 V692 Q1211.2 696 1207.2 696 H1160 Z" fill="url(#hatch)"/>
+  <rect x="1160" y="662.0" width="51.1" height="34" fill="none" stroke="#858480" stroke-width="1.5"/>
+  <text x="1219.2" y="685.0" font-size="17" font-weight="700" fill="#334155">−17%</text>
+  <text x="40" y="872" font-size="14" fill="#64748B">* −1.8% without one outlier trial, so no claim is made. tpch10-realistic: all changes are inside its 22.2% floor.</text>
+</svg>
