@@ -71,11 +71,12 @@ Four altered inputs test robustness: a long usage history, an attempt to hijack 
 | **sqlstorm-oltp** | `SQLStormOltp`, 1.9 GB: a Stack Overflow sample with a one-column index on every foreign key | 4,000 short reads and 480 committed writes per pass |
 | **tpch10-realistic** | `tpch10`, 22 GB: TPC-H at scale factor 10, with triggers that keep summary tables up to date | 6 reports based on TPC-H queries, plus 2 refresh writes that are rolled back |
 
-### The five ways of tuning (arms)
+### The ways of tuning (arms)
 
 | Arm | Label in the charts | What gets applied |
 |---|---|---|
 | `proc-create` | CREATE mode (applies itself) | Only what `sp_AIIndexTuner @Mode = 'CREATE'` validates and builds on its own |
+| `proc-create` with widenings (#27) | CREATE mode + widenings (#27) | The same, with a proc version that also widens existing indexes in place ([#26](https://github.com/AI-SQL-Tuner/aisqltuner-index-tuner/issues/26)). Measured on sqlstorm-oltp only |
 | `proc-reviewed` | All proc advice applied | Every script the proc recommends, as a DBA who follows all of the advice would apply them |
 | `desktop` | AI SQL Tuner desktop app | Every script from the [AI SQL Tuner](https://aisqltuner.com) desktop app's IndexTuning goal |
 | `naive-missing-index` | Every missing-index suggestion | One index for each suggestion in SQL Server's missing-index DMVs, exactly as suggested. No AI involved |

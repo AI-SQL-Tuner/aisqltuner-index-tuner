@@ -26,19 +26,19 @@
   <line x1="1292.4" y1="200" x2="1292.4" y2="600" stroke="#E2E8F0"/>
   <text x="1292.4" y="624" font-size="13" fill="#64748B" text-anchor="middle">2,000 MB</text>
   <text x="324" y="256.0" font-size="17" font-weight="700" fill="#334155" text-anchor="end">All proc advice applied</text>
-  <path d="M340 228.0 H434.0952380952381 Q438.0952380952381 228.0 438.0952380952381 232.0 V268.0 Q438.0952380952381 272.0 434.0952380952381 272.0 H340 Z" fill="#2a78d6"/>
+  <path d="M340 228 H434.1 Q438.1 228 438.1 232 V268 Q438.1 272 434.1 272 H340 Z" fill="#2a78d6"/>
   <text x="448.1" y="256.0" font-size="18" font-weight="700" fill="#334155">206 MB</text>
   <text x="514.1" y="256.0" font-size="17" fill="#64748B">→ −93% reads</text>
   <text x="324" y="356.0" font-size="17" font-weight="700" fill="#334155" text-anchor="end">CREATE mode (applies itself)</text>
-  <path d="M340 328.0 H492.19047619047615 Q496.19047619047615 328.0 496.19047619047615 332.0 V368.0 Q496.19047619047615 372.0 492.19047619047615 372.0 H340 Z" fill="#2a78d6"/>
+  <path d="M340 328 H492.2 Q496.2 328 496.2 332 V368 Q496.2 372 492.2 372 H340 Z" fill="#2a78d6"/>
   <text x="506.2" y="356.0" font-size="18" font-weight="700" fill="#334155">328 MB</text>
   <text x="572.2" y="356.0" font-size="17" fill="#64748B">→ −79% reads</text>
   <text x="324" y="456.0" font-size="17" font-weight="400" fill="#334155" text-anchor="end">AI SQL Tuner desktop app</text>
-  <path d="M340 428.0 H557.4285714285714 Q561.4285714285714 428.0 561.4285714285714 432.0 V468.0 Q561.4285714285714 472.0 557.4285714285714 472.0 H340 Z" fill="#858480"/>
+  <path d="M340 428 H557.4 Q561.4 428 561.4 432 V468 Q561.4 472 557.4 472 H340 Z" fill="#858480"/>
   <text x="571.4" y="456.0" font-size="18" font-weight="700" fill="#334155">465 MB</text>
   <text x="637.4" y="456.0" font-size="17" fill="#64748B">→ −83% reads</text>
   <text x="324" y="556.0" font-size="17" font-weight="400" fill="#334155" text-anchor="end">Every missing-index suggestion</text>
-  <path d="M340 528.0 H1324.095238095238 Q1328.095238095238 528.0 1328.095238095238 532.0 V568.0 Q1328.095238095238 572.0 1324.095238095238 572.0 H340 Z" fill="#858480"/>
+  <path d="M340 528 H1324.1 Q1328.1 528 1328.1 532 V568 Q1328.1 572 1324.1 572 H340 Z" fill="#858480"/>
   <text x="1338.1" y="556.0" font-size="18" font-weight="700" fill="#334155">2,075 MB</text>
   <text x="1426.1" y="556.0" font-size="17" fill="#64748B">→ −90% reads</text>
   <text x="40" y="732" font-size="14" fill="#64748B">Mean of 5 trials. Space is net of any indexes the advice dropped. Database size: 1.8 GB.</text>

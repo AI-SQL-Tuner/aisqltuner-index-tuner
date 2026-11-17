@@ -60,8 +60,10 @@ def bar(x, y, length, height, fill):
     if length <= 0:
         return ""
     r = min(4, length)
-    return (f'  <path d="M{x} {y} H{x + length - r} Q{x + length} {y} {x + length} {y + r} '
-            f'V{y + height - r} Q{x + length} {y + height} {x + length - r} {y + height} H{x} Z" fill="{fill}"/>')
+    n = lambda v: f"{v:.1f}".rstrip("0").rstrip(".")
+    x2 = x + length
+    return (f'  <path d="M{n(x)} {n(y)} H{n(x2 - r)} Q{n(x2)} {n(y)} {n(x2)} {n(y + r)} '
+            f'V{n(y + height - r)} Q{n(x2)} {n(y + height)} {n(x2 - r)} {n(y + height)} H{n(x)} Z" fill="{fill}"/>')
 
 
 # ---------------------------------------------------------------------------
@@ -117,8 +119,6 @@ def impact_chart(name, title, subtitle, desc, data, floors, note, hatched):
         for t in (0, 25, 50, 75, 100):
             gx = x0 + t * scale
             s.append(f'  <line x1="{gx:.1f}" y1="{top}" x2="{gx:.1f}" y2="{bottom}" stroke="{GRID}" stroke-width="1"/>')
-            if floor is None or floor < 1 or t != 0:
-                pass
             s.append(f'  <text x="{gx:.1f}" y="{bottom + (44 if floor and floor >= 1 else 22)}" font-size="13" '
                      f'fill="{MUTED}" text-anchor="middle">{"0" if t == 0 else f"−{t}%"}</text>')
         for i, (aid, _, is_proc) in enumerate(ARMS):

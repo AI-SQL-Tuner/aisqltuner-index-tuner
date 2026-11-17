@@ -37,16 +37,16 @@
   <text x="572.5" y="740" font-size="13" fill="#64748B" text-anchor="middle">−75%</text>
   <line x1="650.0" y1="250" x2="650.0" y2="718" stroke="#E2E8F0" stroke-width="1"/>
   <text x="650.0" y="740" font-size="13" fill="#64748B" text-anchor="middle">−100%</text>
-  <path d="M340 272.0 H580.9 Q584.9 272.0 584.9 276.0 V302.0 Q584.9 306.0 580.9 306.0 H340 Z" fill="#2a78d6"/>
+  <path d="M340 272 H580.9 Q584.9 272 584.9 276 V302 Q584.9 306 580.9 306 H340 Z" fill="#2a78d6"/>
   <text x="592.9" y="295.0" font-size="17" font-weight="700" fill="#334155">−79%</text>
   <text x="346" y="372.0" font-size="14" fill="#94A3B8">not run</text>
-  <path d="M340 428.0 H624.3 Q628.3 428.0 628.3 432.0 V458.0 Q628.3 462.0 624.3 462.0 H340 Z" fill="#2a78d6"/>
+  <path d="M340 428 H624.3 Q628.3 428 628.3 432 V458 Q628.3 462 624.3 462 H340 Z" fill="#2a78d6"/>
   <text x="636.3" y="451.0" font-size="17" font-weight="700" fill="#334155">−93%</text>
-  <path d="M340 506.0 H593.3 Q597.3 506.0 597.3 510.0 V536.0 Q597.3 540.0 593.3 540.0 H340 Z" fill="#858480"/>
+  <path d="M340 506 H593.3 Q597.3 506 597.3 510 V536 Q597.3 540 593.3 540 H340 Z" fill="#858480"/>
   <text x="605.3" y="529.0" font-size="17" font-weight="700" fill="#334155">−83%</text>
-  <path d="M340 584.0 H615.0 Q619.0 584.0 619.0 588.0 V614.0 Q619.0 618.0 615.0 618.0 H340 Z" fill="#858480"/>
+  <path d="M340 584 H615 Q619 584 619 588 V614 Q619 618 615 618 H340 Z" fill="#858480"/>
   <text x="627.0" y="607.0" font-size="17" font-weight="700" fill="#334155">−90%</text>
-  <path d="M340 662.0 H340.0 Q340.93 662.0 340.93 662.93 V695.07 Q340.93 696.0 340.0 696.0 H340 Z" fill="#858480"/>
+  <path d="M340 662 H340 Q340.9 662 340.9 662.9 V695.1 Q340.9 696 340 696 H340 Z" fill="#858480"/>
   <text x="348.9" y="685.0" font-size="17" font-weight="700" fill="#334155">−0.3%</text>
   <text x="750" y="204" font-size="20" font-weight="800" fill="#0B2545">sqlstorm-oltp</text>
   <text x="750" y="228" font-size="14" fill="#64748B">1.9 GB · Stack Overflow OLTP</text>
@@ -60,15 +60,15 @@
   <text x="982.5" y="740" font-size="13" fill="#64748B" text-anchor="middle">−75%</text>
   <line x1="1060.0" y1="250" x2="1060.0" y2="718" stroke="#E2E8F0" stroke-width="1"/>
   <text x="1060.0" y="740" font-size="13" fill="#64748B" text-anchor="middle">−100%</text>
-  <path d="M750 272.0 H845.2 Q849.2 272.0 849.2 276.0 V302.0 Q849.2 306.0 845.2 306.0 H750 Z" fill="#2a78d6"/>
+  <path d="M750 272 H845.2 Q849.2 272 849.2 276 V302 Q849.2 306 845.2 306 H750 Z" fill="#2a78d6"/>
   <text x="857.2" y="295.0" font-size="17" font-weight="700" fill="#334155">−32%</text>
-  <path d="M750 350.0 H990.9 Q994.9 350.0 994.9 354.0 V380.0 Q994.9 384.0 990.9 384.0 H750 Z" fill="#2a78d6"/>
+  <path d="M750 350 H990.9 Q994.9 350 994.9 354 V380 Q994.9 384 990.9 384 H750 Z" fill="#2a78d6"/>
   <text x="1002.9" y="373.0" font-size="17" font-weight="700" fill="#334155">−79%</text>
-  <path d="M750 428.0 H990.9 Q994.9 428.0 994.9 432.0 V458.0 Q994.9 462.0 990.9 462.0 H750 Z" fill="#2a78d6"/>
+  <path d="M750 428 H990.9 Q994.9 428 994.9 432 V458 Q994.9 462 990.9 462 H750 Z" fill="#2a78d6"/>
   <text x="1002.9" y="451.0" font-size="17" font-weight="700" fill="#334155">−79%</text>
-  <path d="M750 506.0 H987.8 Q991.8 506.0 991.8 510.0 V536.0 Q991.8 540.0 987.8 540.0 H750 Z" fill="#858480"/>
+  <path d="M750 506 H987.8 Q991.8 506 991.8 510 V536 Q991.8 540 987.8 540 H750 Z" fill="#858480"/>
   <text x="999.8" y="529.0" font-size="17" font-weight="700" fill="#334155">−78%</text>
-  <path d="M750 584.0 H750.0 Q753.1 584.0 753.1 587.1 V614.9 Q753.1 618.0 750.0 618.0 H750 Z" fill="#858480"/>
+  <path d="M750 584 H750 Q753.1 584 753.1 587.1 V614.9 Q753.1 618 750 618 H750 Z" fill="#858480"/>
   <text x="761.1" y="607.0" font-size="17" font-weight="700" fill="#334155">−1%</text>
   <text x="758.0" y="685.0" font-size="17" font-weight="700" fill="#334155">+0.3%</text>
   <text x="1160" y="204" font-size="20" font-weight="800" fill="#0B2545">tpch10-realistic</text>
@@ -83,16 +83,16 @@
   <text x="1392.5" y="740" font-size="13" fill="#64748B" text-anchor="middle">−75%</text>
   <line x1="1470.0" y1="250" x2="1470.0" y2="718" stroke="#E2E8F0" stroke-width="1"/>
   <text x="1470.0" y="740" font-size="13" fill="#64748B" text-anchor="middle">−100%</text>
-  <path d="M1160 272.0 H1422.6 Q1426.6 272.0 1426.6 276.0 V302.0 Q1426.6 306.0 1422.6 306.0 H1160 Z" fill="#2a78d6"/>
+  <path d="M1160 272 H1422.6 Q1426.6 272 1426.6 276 V302 Q1426.6 306 1422.6 306 H1160 Z" fill="#2a78d6"/>
   <text x="1434.6" y="295.0" font-size="17" font-weight="700" fill="#334155">−86%</text>
   <text x="1166" y="372.0" font-size="14" fill="#94A3B8">not run</text>
-  <path d="M1160 428.0 H1422.6 Q1426.6 428.0 1426.6 432.0 V458.0 Q1426.6 462.0 1422.6 462.0 H1160 Z" fill="#2a78d6"/>
+  <path d="M1160 428 H1422.6 Q1426.6 428 1426.6 432 V458 Q1426.6 462 1422.6 462 H1160 Z" fill="#2a78d6"/>
   <text x="1434.6" y="451.0" font-size="17" font-weight="700" fill="#334155">−86%</text>
-  <path d="M1160 506.0 H1419.5 Q1423.5 506.0 1423.5 510.0 V536.0 Q1423.5 540.0 1419.5 540.0 H1160 Z" fill="#858480"/>
+  <path d="M1160 506 H1419.5 Q1423.5 506 1423.5 510 V536 Q1423.5 540 1419.5 540 H1160 Z" fill="#858480"/>
   <text x="1431.5" y="529.0" font-size="17" font-weight="700" fill="#334155">−85%</text>
-  <path d="M1160 584.0 H1422.6 Q1426.6 584.0 1426.6 588.0 V614.0 Q1426.6 618.0 1422.6 618.0 H1160 Z" fill="#858480"/>
+  <path d="M1160 584 H1422.6 Q1426.6 584 1426.6 588 V614 Q1426.6 618 1422.6 618 H1160 Z" fill="#858480"/>
   <text x="1434.6" y="607.0" font-size="17" font-weight="700" fill="#334155">−86%</text>
-  <path d="M1160 662.0 H1338.9 Q1342.9 662.0 1342.9 666.0 V692.0 Q1342.9 696.0 1338.9 696.0 H1160 Z" fill="#858480"/>
+  <path d="M1160 662 H1338.9 Q1342.9 662 1342.9 666 V692 Q1342.9 696 1338.9 696 H1160 Z" fill="#858480"/>
   <text x="1350.9" y="685.0" font-size="17" font-weight="700" fill="#334155">−59%</text>
   <text x="40" y="872" font-size="14" fill="#64748B">Noise floors are 0.002–0.04%, so every bar is a real change. CREATE mode + widenings was measured on sqlstorm-oltp only.</text>
 </svg>

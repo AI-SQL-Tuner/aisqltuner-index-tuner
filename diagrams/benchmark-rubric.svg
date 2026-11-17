@@ -31,21 +31,21 @@
   <text x="1410.0" y="674" font-size="13" fill="#64748B" text-anchor="middle">100%</text>
   <text x="244" y="256" font-size="19" font-weight="700" fill="#334155" text-anchor="end">Batch 2</text>
   <text x="244" y="278" font-size="14" fill="#64748B" text-anchor="end">build A11117F5</text>
-  <path d="M260 216 H1305.95 Q1309.95 216 1309.95 220 V256 Q1309.95 260 1305.95 260 H260 Z" fill="#2a78d6"/>
+  <path d="M260 216 H1306 Q1310 216 1310 220 V256 Q1310 260 1306 260 H260 Z" fill="#2a78d6"/>
   <text x="1320.0" y="245.0" font-size="19" font-weight="700" fill="#334155">91.3%</text>
-  <path d="M260 270 H1241.5500000000002 Q1245.5500000000002 270 1245.5500000000002 274 V296 Q1245.5500000000002 300 1241.5500000000002 300 H260 Z" fill="#9ec5f4"/>
+  <path d="M260 270 H1241.6 Q1245.6 270 1245.6 274 V296 Q1245.6 300 1241.6 300 H260 Z" fill="#9ec5f4"/>
   <text x="1255.6" y="291" font-size="16" fill="#334155">85.7%</text>
   <text x="244" y="406" font-size="19" font-weight="700" fill="#334155" text-anchor="end">Batch 3</text>
   <text x="244" y="428" font-size="14" fill="#64748B" text-anchor="end">build D6C7E42C</text>
-  <path d="M260 366 H1351.95 Q1355.95 366 1355.95 370 V406 Q1355.95 410 1351.95 410 H260 Z" fill="#2a78d6"/>
+  <path d="M260 366 H1352 Q1356 366 1356 370 V406 Q1356 410 1352 410 H260 Z" fill="#2a78d6"/>
   <text x="1366.0" y="395.0" font-size="19" font-weight="700" fill="#334155">95.3%</text>
   <path d="M260 420 H1044.9 Q1048.9 420 1048.9 424 V446 Q1048.9 450 1044.9 450 H260 Z" fill="#9ec5f4"/>
   <text x="1058.9" y="441" font-size="16" fill="#334155">68.6%</text>
   <text x="244" y="556" font-size="19" font-weight="700" fill="#334155" text-anchor="end">Batch 4</text>
   <text x="244" y="578" font-size="14" fill="#64748B" text-anchor="end">build D6C7E42C</text>
-  <path d="M260 516 H1345.05 Q1349.05 516 1349.05 520 V556 Q1349.05 560 1345.05 560 H260 Z" fill="#2a78d6"/>
+  <path d="M260 516 H1345 Q1349 516 1349 520 V556 Q1349 560 1345 560 H260 Z" fill="#2a78d6"/>
   <text x="1359.0" y="545.0" font-size="19" font-weight="700" fill="#334155">94.7%</text>
-  <path d="M260 570 H1176.0 Q1180.0 570 1180.0 574 V596 Q1180.0 600 1176.0 600 H260 Z" fill="#9ec5f4"/>
+  <path d="M260 570 H1176 Q1180 570 1180 574 V596 Q1180 600 1176 600 H260 Z" fill="#9ec5f4"/>
   <text x="1190.0" y="591" font-size="16" fill="#334155">80.0%</text>
   <text x="40" y="732" font-size="14" fill="#64748B">With 5 runs per check, one run is 20 points, so the gap between batches 3 and 4 is run-to-run variance.</text>
 </svg>
