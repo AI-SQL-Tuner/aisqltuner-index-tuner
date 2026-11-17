@@ -430,6 +430,28 @@ BEGIN
         SET @Data += CONCAT(@nl, N'=== INDEX USAGE STATISTICS ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
     END CATCH;
 
+    EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'INDEXES TO KEEP', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
+    /* ===== INDEXES TO KEEP ===== AIIndexTuner.IndexesToKeep (issue #67), existing indexes in scope, and
+       AIIndexTuner.Config.MinUsageDays (issue #66), which the apply step uses for low-use drops. */
+    BEGIN TRY
+        DECLARE @MinUsageDays int = ISNULL((SELECT MinUsageDays FROM AIIndexTuner.Config WHERE ConfigId = 1), 7);
+        SELECT @j = (
+            SELECT k.SchemaName + N'.' + k.TableName AS TableName, k.IndexName, k.Reason
+            FROM AIIndexTuner.IndexesToKeep AS k
+            INNER JOIN sys.schemas AS sch ON sch.name = k.SchemaName
+            INNER JOIN sys.objects AS obj ON obj.schema_id = sch.schema_id AND obj.name = k.TableName AND obj.type = 'U'
+            INNER JOIN sys.indexes AS i ON i.object_id = obj.object_id AND i.name = k.IndexName
+            WHERE (@SchemaName IS NULL OR sch.name = @SchemaName) AND (@TableName IS NULL OR obj.name = @TableName)
+            ORDER BY k.SchemaName, k.TableName, k.IndexName
+            FOR JSON PATH);
+        SET @Data += CONCAT(@nl, N'=== INDEXES TO KEEP ===', @nl,
+                            N'Minimum usage period for a low-use drop: ', @MinUsageDays, N' days of usage statistics.', @nl,
+                            N'Indexes never to drop or widen: ', ISNULL(@j, N'(none)'), @nl);
+    END TRY
+    BEGIN CATCH
+        SET @Data += CONCAT(@nl, N'=== INDEXES TO KEEP ===', @nl, N'Warning: section skipped: ', ERROR_MESSAGE(), @nl);
+    END CATCH;
+
     EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'MISSING INDEX OVERLAP SIGNALS', @Data, @LogId = @LogId OUTPUT, @CharsAtStart = @LogChars OUTPUT;
     /* ===== MISSING INDEX OVERLAP SIGNALS =====
        For the top missing-index candidates, the best-matching existing index and a redundancy score,

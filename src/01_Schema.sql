@@ -199,6 +199,33 @@ IF COL_LENGTH(N'AIIndexTuner.Config', N'RetainRunDays') IS NULL
         RetainRunDetailDays int NULL CONSTRAINT CK_AIIndexTuner_Config_RetainDetail CHECK (RetainRunDetailDays >= 1);
 GO
 
+/* MinUsageDays (issue #66): a low-use index drop needs usage statistics that cover at least this many
+   days. Set it past the longest cycle an index serves, such as 35 for month-end reports. The statistics
+   reset when the instance restarts, so a long period is often not met; the drop is then skipped. WITH
+   VALUES gives existing installs the default too. */
+IF COL_LENGTH(N'AIIndexTuner.Config', N'MinUsageDays') IS NULL
+    ALTER TABLE AIIndexTuner.Config ADD
+        MinUsageDays int NOT NULL CONSTRAINT DF_AIIndexTuner_Config_MinUsageDays DEFAULT (7) WITH VALUES
+                                  CONSTRAINT CK_AIIndexTuner_Config_MinUsageDays CHECK (MinUsageDays >= 1);
+GO
+
+/* Indexes the tool never drops or widens (issue #67), however unused they look: those that only a
+   rarely run workload needs, such as a quarterly extract or an annual report. One row per index; a
+   whole table cannot be listed, so an index the tool built and nothing uses can still be dropped. A
+   row naming an index that does not exist is ignored. The collector lists them for the model. */
+IF OBJECT_ID(N'AIIndexTuner.IndexesToKeep', N'U') IS NULL
+    CREATE TABLE AIIndexTuner.IndexesToKeep
+    (
+        SchemaName sysname       NOT NULL,
+        TableName  sysname       NOT NULL,
+        IndexName  sysname       NOT NULL,
+        Reason     nvarchar(400) NULL,
+        AddedBy    sysname       NOT NULL CONSTRAINT DF_AIIndexTuner_IndexesToKeep_AddedBy DEFAULT (ORIGINAL_LOGIN()),
+        AddedAt    datetime2(0)  NOT NULL CONSTRAINT DF_AIIndexTuner_IndexesToKeep_AddedAt DEFAULT (SYSDATETIME()),
+        CONSTRAINT PK_AIIndexTuner_IndexesToKeep PRIMARY KEY (SchemaName, TableName, IndexName)
+    );
+GO
+
 /* Step logging (issue #38): sp_AIIndexTuner @Logging, NULL = this default. On by default, since a
    run writes only about 30 small rows. WITH VALUES gives existing installs the default too. */
 IF COL_LENGTH(N'AIIndexTuner.Config', N'EnableLogging') IS NULL

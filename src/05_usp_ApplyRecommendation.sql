@@ -140,8 +140,9 @@ GO
     Applied: new rowstore indexes; new columnstore indexes when allowed; drops of nonclustered
     indexes when allowed, nothing depends on them, and either another index makes them redundant
     or they are low use: not unique, and fewer than 5 reads per write and fewer than 1000 reads a
-    day in usage statistics that cover at least 7 days (the model's word that an index is little used is not enough, issue #45);
-    and widenings.
+    day in usage statistics that cover at least AIIndexTuner.Config.MinUsageDays (default 7, issue #66)
+    days (the model's word that an index is little used is not enough, issue #45); and widenings.
+    An index listed in AIIndexTuner.IndexesToKeep is never dropped or widened (issue #67).
     A widening is a ConsolidateIndex that names the index it replaces (ReplacesIndex): a nonclustered rowstore index that is not
     unique, not filtered, not partitioned and not disabled. The new index must keep its keys as
     its leading keys, in the same order and direction, and keep every column it includes. It is
@@ -233,6 +234,18 @@ BEGIN
         SET @Reason = N'The script creates a clustered index, which is not a widening of a nonclustered one. Review it and apply it yourself.';
     ELSE IF @IsWidening = 1 AND @IsUnique = 1
         SET @Reason = N'A widening keeps the index non-unique; a unique index changes which rows the table accepts. Review it and apply it yourself.';
+    -- An index listed in AIIndexTuner.IndexesToKeep (issue #67) is neither dropped nor widened.
+    ELSE IF (@Category = 'DropIndex' OR @IsWidening = 1)
+         AND EXISTS (SELECT 1 FROM AIIndexTuner.IndexesToKeep
+                     WHERE SchemaName = @SchemaName AND TableName = @TableName
+                       AND IndexName = CASE WHEN @IsWidening = 1 THEN @ReplacesIndex ELSE @IndexName END)
+        SET @Reason = (SELECT TOP (1) CONCAT(QUOTENAME(IndexName), N' is listed in AIIndexTuner.IndexesToKeep',
+                                             N' (' + NULLIF(LTRIM(Reason), N'') + N')',
+                                             N', so it is not ', CASE WHEN @IsWidening = 1 THEN N'widened' ELSE N'dropped' END,
+                                             N'. Delete its row there to allow it.')
+                       FROM AIIndexTuner.IndexesToKeep
+                       WHERE SchemaName = @SchemaName AND TableName = @TableName
+                         AND IndexName = CASE WHEN @IsWidening = 1 THEN @ReplacesIndex ELSE @IndexName END);
     ELSE IF @Category = 'DropIndex' AND @AllowDropIndex = 0
         SET @Reason = N'Index drops are not allowed (@AllowDropIndex = 0).';
     ELSE IF @Category = 'DropIndex' AND @AllowDropIndex IS NULL
@@ -318,7 +331,8 @@ BEGIN
         -- the usage history. Or it is low use, which is checked here rather than taken from the model
         -- (issue #45): it is not unique, the usage statistics cover at least @MinUsageDays, and they
         -- show a reads-to-writes ratio below 5 and fewer than 1000 reads a day in that time (fn_IndexUseCheck).
-        DECLARE @Basis nvarchar(4000), @MinUsageDays int = 7;
+        -- AIIndexTuner.Config.MinUsageDays (issue #66); 7 without a configuration row.
+        DECLARE @Basis nvarchar(4000), @MinUsageDays int = ISNULL((SELECT MinUsageDays FROM AIIndexTuner.Config WHERE ConfigId = 1), 7);
         IF @Reason IS NULL
         BEGIN
             DECLARE @Redundant sysname, @Sig nvarchar(max), @DropUnique bit, @DropFilter nvarchar(max);
