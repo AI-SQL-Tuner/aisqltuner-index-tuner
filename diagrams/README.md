@@ -19,9 +19,27 @@ Each comes as an SVG (sharp at any size, editable in a text editor) and a 3200 x
 
 ![Recommendation types](recommendation-types.png)
 
+## Benchmark charts
+
+Four charts of the results in [BENCHMARK.md](../BENCHMARK.md). They are generated, not hand-drawn:
+[benchmark-charts.py](benchmark-charts.py) holds the numbers and writes the SVGs. When a result
+changes, edit the numbers there, run it, and re-render the PNGs as below.
+
+```powershell
+python diagrams/benchmark-charts.py
+```
+
+| Chart | Shows | Files |
+|---|---|---|
+| **Rubric** | Part 1 scores by batch | [SVG](benchmark-rubric.svg), [PNG](benchmark-rubric.png) |
+| **Reads** | Logical-read reduction for each arm and workload | [SVG](benchmark-reads.svg), [PNG](benchmark-reads.png) |
+| **Time** | Total execution time reduction, with each workload's noise floor | [SVG](benchmark-time.svg), [PNG](benchmark-time.png) |
+| **Space** | Index space added and the read reduction it bought, on the challenge workload | [SVG](benchmark-space.svg), [PNG](benchmark-space.png) |
+
 ## Re-rendering the PNGs
 
-Edit the SVG, then render it with headless Chrome or Edge. The size is 1600 x 900 at 2x:
+Edit the SVG, then render it with headless Chrome or Edge. The size is 1600 x 900 at 2x
+(`benchmark-rubric` and `benchmark-space` are 1600 x 760: set `--window-size=1600,760` for those):
 
 ```powershell
 $chrome = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
