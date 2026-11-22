@@ -233,7 +233,7 @@ $settings = Get-Json "SELECT Scale, Reps FROM AIIndexTunerBench.ChallengeSetting
 $summary = Get-Json "SELECT CaseId, CheckId, Kind, Variant, Description, Runs, Passed, PassPct, Errors FROM AIIndexTunerBench.vRubricSummary WHERE BatchId = $batchId ORDER BY Variant, CaseId, CheckId FOR JSON PATH;"
 $runs = Get-Json @"
 SELECT rr.Variant, rr.Iteration, r.RunId, r.Status, r.ModelUsed, r.InputTokens, r.OutputTokens, r.ModelMs, r.PollCount, r.CollectedChars,
-       r.PayloadSupplied, LEFT(r.PayloadHash, 12) AS PayloadHash, LEFT(r.ErrorMessage, 200) AS ErrorMessage,
+       r.PayloadSupplied, LEFT(r.PayloadHash, 12) AS PayloadHash, LEFT(r.ErrorMessage, 500) AS ErrorMessage,
        (SELECT COUNT(*) FROM AIIndexTuner.Recommendation AS rec WHERE rec.RunId = r.RunId) AS Recommendations,
        (SELECT SUM(CAST(res.Passed AS int)) FROM AIIndexTunerBench.RubricResult AS res INNER JOIN AIIndexTunerBench.RubricCheck AS c ON c.CheckId = res.CheckId
         WHERE res.RunId = r.RunId AND c.Kind <> 'preferred') AS ScoredPassed,
