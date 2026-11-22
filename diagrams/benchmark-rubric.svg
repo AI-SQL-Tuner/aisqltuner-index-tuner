@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 760" width="1600" height="760" font-family="'Segoe UI', Inter, -apple-system, 'Helvetica Neue', Arial, sans-serif" text-rendering="geometricPrecision">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 840" width="1600" height="840" font-family="'Segoe UI', Inter, -apple-system, 'Helvetica Neue', Arial, sans-serif" text-rendering="geometricPrecision">
   <title>Are the recommendations right?</title>
-  <desc>Rubric scores by batch. Required and forbidden checks: 91.3%, 95.3% and 94.7%. Preferred checks: 85.7%, 68.6% and 80.0%.</desc>
+  <desc>Rubric scores by batch. Required and forbidden checks: 91.3%, 95.3%, 94.7%, 100% (gpt-6.2-sol) and 99.3%. Preferred checks: 85.7%, 68.6%, 80.0%, 85.7% and 88.6%.</desc>
   <defs>
     <pattern id="hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
       <rect width="8" height="8" fill="#FFFFFF"/>
@@ -11,7 +11,7 @@
       <line x1="0" y1="0" x2="0" y2="8" stroke="#86b6ef" stroke-width="3"/>
     </pattern>
   </defs>
-  <rect width="1600" height="760" fill="#FFFFFF"/>
+  <rect width="1600" height="840" fill="#FFFFFF"/>
   <text x="40" y="42" font-size="14" font-weight="700" letter-spacing="2.5" fill="#2563EB">AISQLTUNER-INDEX-TUNER · BENCHMARK</text>
   <text x="40" y="86" font-size="38" font-weight="800" fill="#0B2545">Are the recommendations right?</text>
   <text x="40" y="118" font-size="19" fill="#475569">Share of rubric checks passed across 5 runs per batch, on 16 known tuning problems.</text>
@@ -19,33 +19,45 @@
   <text x="64" y="160" font-size="15" fill="#334155">Must-do and must-never-do checks (the score that matters)</text>
   <rect x="578.2" y="147" width="16" height="16" rx="3" fill="#9ec5f4"/>
   <text x="602.2" y="160" font-size="15" fill="#334155">Preferred checks (better among acceptable answers)</text>
-  <line x1="260.0" y1="200" x2="260.0" y2="650" stroke="#E2E8F0"/>
-  <text x="260.0" y="674" font-size="13" fill="#64748B" text-anchor="middle">0%</text>
-  <line x1="547.5" y1="200" x2="547.5" y2="650" stroke="#E2E8F0"/>
-  <text x="547.5" y="674" font-size="13" fill="#64748B" text-anchor="middle">25%</text>
-  <line x1="835.0" y1="200" x2="835.0" y2="650" stroke="#E2E8F0"/>
-  <text x="835.0" y="674" font-size="13" fill="#64748B" text-anchor="middle">50%</text>
-  <line x1="1122.5" y1="200" x2="1122.5" y2="650" stroke="#E2E8F0"/>
-  <text x="1122.5" y="674" font-size="13" fill="#64748B" text-anchor="middle">75%</text>
-  <line x1="1410.0" y1="200" x2="1410.0" y2="650" stroke="#E2E8F0"/>
-  <text x="1410.0" y="674" font-size="13" fill="#64748B" text-anchor="middle">100%</text>
+  <line x1="260.0" y1="200" x2="260.0" y2="740" stroke="#E2E8F0"/>
+  <text x="260.0" y="764" font-size="13" fill="#64748B" text-anchor="middle">0%</text>
+  <line x1="547.5" y1="200" x2="547.5" y2="740" stroke="#E2E8F0"/>
+  <text x="547.5" y="764" font-size="13" fill="#64748B" text-anchor="middle">25%</text>
+  <line x1="835.0" y1="200" x2="835.0" y2="740" stroke="#E2E8F0"/>
+  <text x="835.0" y="764" font-size="13" fill="#64748B" text-anchor="middle">50%</text>
+  <line x1="1122.5" y1="200" x2="1122.5" y2="740" stroke="#E2E8F0"/>
+  <text x="1122.5" y="764" font-size="13" fill="#64748B" text-anchor="middle">75%</text>
+  <line x1="1410.0" y1="200" x2="1410.0" y2="740" stroke="#E2E8F0"/>
+  <text x="1410.0" y="764" font-size="13" fill="#64748B" text-anchor="middle">100%</text>
   <text x="244" y="256" font-size="19" font-weight="700" fill="#334155" text-anchor="end">Batch 2</text>
   <text x="244" y="278" font-size="14" fill="#64748B" text-anchor="end">build A11117F5</text>
   <path d="M260 216 H1306 Q1310 216 1310 220 V256 Q1310 260 1306 260 H260 Z" fill="#2a78d6"/>
   <text x="1320.0" y="245.0" font-size="19" font-weight="700" fill="#334155">91.3%</text>
   <path d="M260 270 H1241.6 Q1245.6 270 1245.6 274 V296 Q1245.6 300 1241.6 300 H260 Z" fill="#9ec5f4"/>
   <text x="1255.6" y="291" font-size="16" fill="#334155">85.7%</text>
-  <text x="244" y="406" font-size="19" font-weight="700" fill="#334155" text-anchor="end">Batch 3</text>
-  <text x="244" y="428" font-size="14" fill="#64748B" text-anchor="end">build D6C7E42C</text>
-  <path d="M260 366 H1352 Q1356 366 1356 370 V406 Q1356 410 1352 410 H260 Z" fill="#2a78d6"/>
-  <text x="1366.0" y="395.0" font-size="19" font-weight="700" fill="#334155">95.3%</text>
-  <path d="M260 420 H1044.9 Q1048.9 420 1048.9 424 V446 Q1048.9 450 1044.9 450 H260 Z" fill="#9ec5f4"/>
-  <text x="1058.9" y="441" font-size="16" fill="#334155">68.6%</text>
-  <text x="244" y="556" font-size="19" font-weight="700" fill="#334155" text-anchor="end">Batch 4</text>
-  <text x="244" y="578" font-size="14" fill="#64748B" text-anchor="end">build D6C7E42C</text>
-  <path d="M260 516 H1345 Q1349 516 1349 520 V556 Q1349 560 1345 560 H260 Z" fill="#2a78d6"/>
-  <text x="1359.0" y="545.0" font-size="19" font-weight="700" fill="#334155">94.7%</text>
-  <path d="M260 570 H1176 Q1180 570 1180 574 V596 Q1180 600 1176 600 H260 Z" fill="#9ec5f4"/>
-  <text x="1190.0" y="591" font-size="16" fill="#334155">80.0%</text>
-  <text x="40" y="732" font-size="14" fill="#64748B">With 5 runs per check, one run is 20 points, so the gap between batches 3 and 4 is run-to-run variance.</text>
+  <text x="244" y="364" font-size="19" font-weight="700" fill="#334155" text-anchor="end">Batch 3</text>
+  <text x="244" y="386" font-size="14" fill="#64748B" text-anchor="end">build D6C7E42C</text>
+  <path d="M260 324 H1352 Q1356 324 1356 328 V364 Q1356 368 1352 368 H260 Z" fill="#2a78d6"/>
+  <text x="1366.0" y="353.0" font-size="19" font-weight="700" fill="#334155">95.3%</text>
+  <path d="M260 378 H1044.9 Q1048.9 378 1048.9 382 V404 Q1048.9 408 1044.9 408 H260 Z" fill="#9ec5f4"/>
+  <text x="1058.9" y="399" font-size="16" fill="#334155">68.6%</text>
+  <text x="244" y="472" font-size="19" font-weight="700" fill="#334155" text-anchor="end">Batch 4</text>
+  <text x="244" y="494" font-size="14" fill="#64748B" text-anchor="end">build D6C7E42C</text>
+  <path d="M260 432 H1345 Q1349 432 1349 436 V472 Q1349 476 1345 476 H260 Z" fill="#2a78d6"/>
+  <text x="1359.0" y="461.0" font-size="19" font-weight="700" fill="#334155">94.7%</text>
+  <path d="M260 486 H1176 Q1180 486 1180 490 V512 Q1180 516 1176 516 H260 Z" fill="#9ec5f4"/>
+  <text x="1190.0" y="507" font-size="16" fill="#334155">80.0%</text>
+  <text x="244" y="580" font-size="19" font-weight="700" fill="#334155" text-anchor="end">Batch 5</text>
+  <text x="244" y="602" font-size="14" fill="#64748B" text-anchor="end">v1.1.1, gpt-6.2-sol</text>
+  <path d="M260 540 H1406 Q1410 540 1410 544 V580 Q1410 584 1406 584 H260 Z" fill="#2a78d6"/>
+  <text x="1420.0" y="569.0" font-size="19" font-weight="700" fill="#334155">100%</text>
+  <path d="M260 594 H1241.6 Q1245.6 594 1245.6 598 V620 Q1245.6 624 1241.6 624 H260 Z" fill="#9ec5f4"/>
+  <text x="1255.6" y="615" font-size="16" fill="#334155">85.7%</text>
+  <text x="244" y="688" font-size="19" font-weight="700" fill="#334155" text-anchor="end">Batch 6</text>
+  <text x="244" y="710" font-size="14" fill="#64748B" text-anchor="end">v1.1.1</text>
+  <path d="M260 648 H1398 Q1402 648 1402 652 V688 Q1402 692 1398 692 H260 Z" fill="#2a78d6"/>
+  <text x="1412.0" y="677.0" font-size="19" font-weight="700" fill="#334155">99.3%</text>
+  <path d="M260 702 H1274.9 Q1278.9 702 1278.9 706 V728 Q1278.9 732 1274.9 732 H260 Z" fill="#9ec5f4"/>
+  <text x="1288.9" y="723" font-size="16" fill="#334155">88.6%</text>
+  <text x="40" y="812" font-size="14" fill="#64748B">With 5 runs per check, one run is 20 points, so the gap between batches 3 and 4 is run-to-run variance. All batches use gpt-5.6-luna except batch 5.</text>
 </svg>
