@@ -224,16 +224,23 @@ def space_chart():
 
 
 def rubric_chart():
-    W, H = 1600, 840
+    W, H = 1600, 1056
     s = header(W, H, "Are the recommendations right?",
                "Share of rubric checks passed across 5 runs per batch, on 16 known tuning problems.",
-               "Rubric scores by batch. Required and forbidden checks: 91.3%, 95.3%, 94.7%, 100% (gpt-6.2-sol) "
-               "and 99.3%. Preferred checks: 85.7%, 68.6%, 80.0%, 85.7% and 88.6%.")
+               "Rubric scores by batch. Required and forbidden checks: 91.3%, 95.3%, 94.7%, 100% (gpt-6.2-sol), "
+               "99.3%, 100% and 100% (gpt-6.2-sol low and high). Preferred checks: 85.7%, 68.6%, 80.0%, 85.7%, "
+               "88.6%, 85.7% and 85.7%.")
     s += legend(40, 160, [(PROC, "Must-do and must-never-do checks (the score that matters)"),
                           ("#9ec5f4", "Preferred checks (better among acceptable answers)")])
-    batches = [("Batch 2", "build A11117F5", 91.3, 85.7), ("Batch 3", "build D6C7E42C", 95.3, 68.6),
-               ("Batch 4", "build D6C7E42C", 94.7, 80.0),
-               ("Batch 5", "v1.1.1, gpt-6.2-sol", 100.0, 85.7), ("Batch 6", "v1.1.1", 99.3, 88.6)]
+    batches = [
+        ("Batch 2", "build A11117F5", 91.3, 85.7),
+        ("Batch 3", "build D6C7E42C", 95.3, 68.6),
+        ("Batch 4", "build D6C7E42C", 94.7, 80.0),
+        ("Batch 5", "v1.1.1, gpt-6.2-sol", 100.0, 85.7),
+        ("Batch 6", "v1.1.1", 99.3, 88.6),
+        ("Batch 7", "v1.1.1, gpt-6.2-sol low", 100.0, 85.7),
+        ("Batch 8", "v1.1.1, gpt-6.2-sol high", 100.0, 85.7),
+    ]
     left, top, group_h, bar_h = 260, 200, 108, 44
     scale = 1150 / 100
     bottom = top + len(batches) * group_h
@@ -253,7 +260,7 @@ def rubric_chart():
         s.append(bar(left, y2, pref * scale, 30, "#9ec5f4"))
         s.append(f'  <text x="{left + pref * scale + 10:.1f}" y="{y2 + 21}" font-size="16" fill="{TEXT}">{pref}%</text>')
     s.append(f'  <text x="40" y="{H - 28}" font-size="14" fill="{MUTED}">With 5 runs per check, one run is 20 '
-             f'points, so the gap between batches 3 and 4 is run-to-run variance. All batches use gpt-5.6-luna except batch 5.</text>')
+             f'points, so the gap between batches 3 and 4 is run-to-run variance. Batches 5, 7 and 8 use gpt-6.2-sol; the rest gpt-5.6-luna. All at medium unless noted.</text>')
     s.append("</svg>")
     (OUT / "benchmark-rubric.svg").write_text("\n".join(x for x in s if x) + "\n", encoding="utf-8")
 

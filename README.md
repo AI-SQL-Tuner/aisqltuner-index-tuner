@@ -396,6 +396,19 @@ WHERE ep.name = N'AIIndexTuner';
 | `RetainRunDetailDays` | NULL | Clear `CollectedData` and `RawResponse` of runs completed more than this many days ago, keeping the rest of the run (NULL = keep them forever) |
 | `MinUsageDays` | 7 | A low-use index drop needs usage statistics that cover at least this many days (at least 1). Set it past the longest cycle an index serves, such as 35 for month-end reports; the statistics reset when the instance restarts, so a long period is often not met and the drop is skipped. For quarterly or annual work, list the index in [Indexes to keep](#indexes-to-keep) |
 
+### Choosing a model and effort
+
+- **Default: `gpt-5.6-luna` at `medium`.** It passed 99.3% of the benchmark's required and forbidden
+  checks and 88.6% of the preferred ones, for about $0.02 per whole-database run of the benchmark database.
+- **Premium: `gpt-6.2-sol` at `low`.** It passed every required and forbidden check in every run, at
+  about the same time and output tokens as `gpt-5.6-luna` at `medium`, but at about 9 times the cost
+  (about $0.14 per run at Global Standard list prices).
+  It scored a little lower on preferred checks (85.7%). `medium` and `high` scored exactly the same
+  as `low` and only took longer, so `low` is enough. `gpt-6.2-sol` is not offered in every region
+  (it was not deployable in East US 2 when tested; East US and South Central US work).
+
+See [Benchmark](BENCHMARK.md#part-1-is-the-advice-right) for the runs.
+
 ### Indexes to keep
 
 Some indexes are needed only by work that runs rarely, such as a quarterly extract or an annual

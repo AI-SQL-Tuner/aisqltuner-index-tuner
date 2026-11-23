@@ -39,7 +39,7 @@ python diagrams/benchmark-charts.py
 ## Re-rendering the PNGs
 
 Edit the SVG, then render it with headless Chrome or Edge. The size is 1600 x 900 at 2x
-(`benchmark-space` is 1600 x 760 and `benchmark-rubric` 1600 x 840: set `--window-size` to match):
+(`benchmark-space` is 1600 x 760 and `benchmark-rubric` 1600 x 1056: set `--window-size` to match):
 
 ```powershell
 $chrome = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
