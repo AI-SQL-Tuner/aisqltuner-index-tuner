@@ -7,13 +7,13 @@ We tested `sp_AIIndexTuner` to answer two questions ([issue #2](https://github.c
 
 ## The short version
 
-- **The advice passed 91–100% of the checks that matter most**: what it must recommend and what it must never recommend. On version 1.1.1, `gpt-6.2-sol` scored 100% and `gpt-5.6-luna` 99.3%.
+- **The advice passed 91–100% of the checks that matter most**: what it must recommend and what it must never recommend. On version 1.1.1, `gpt-6.2-sol` scored 100% at `low`, `medium` and `high` effort, and `gpt-5.6-luna` 99.3%.
 - **Following all of its advice cut the data read by queries by 79–93%**, the best or close to the best of every approach tested, in all three workloads.
 - **The whole workload ran 39–77% faster** in the two workloads where the timing is reliable enough to judge. In the third, timing varied too much between runs to make any claim.
 - **It got there with far less disk.** On the challenge database it used 206 MB of new indexes. Creating every missing-index suggestion SQL Server makes used 2,075 MB for a similar result, and on another workload those suggestions did almost nothing.
 - **No query returned different results** after tuning, in any of the 80 trials.
 
-**Test setup:** every result comes from the `gpt-5.6-luna` model at `medium` reasoning effort, except Part 1's batch 5, which used `gpt-6.2-sol` at `medium`, with 5 runs per test, on SQL Server 2025 Enterprise Developer Edition (`VMEnt\SQL25`: 4 vCPU, 31 GB of memory, MAXDOP 4).
+**Test setup:** every result comes from the `gpt-5.6-luna` model at `medium` reasoning effort, except Part 1's batches 5, 7 and 8, which used `gpt-6.2-sol` at `medium`, `low` and `high`, with 5 runs per test, on SQL Server 2025 Enterprise Developer Edition (`VMEnt\SQL25`: 4 vCPU, 31 GB of memory, MAXDOP 4).
 
 ## Terms used on this page
 
@@ -53,13 +53,15 @@ Four altered inputs test robustness: a long usage history, an attempt to hijack 
 
 ### Results
 
-| Batch | Proc version (system prompt hash) | Model | Required + forbidden | Preferred | Report |
+| Batch | Proc version (system prompt hash) | Model (effort `medium` unless noted) | Required + forbidden | Preferred | Report |
 |---|---|---|---:|---:|---|
 | 2 | `A11117F5` | `gpt-5.6-luna` | **91.3%** | 85.7% | [batch 2](bench/results/rubric-20261028-1401-VMEnt-SQL25-batch2.md) |
 | 3 | `D6C7E42C` (adds widenings, #27) | `gpt-5.6-luna` | **95.3%** | 68.6% | [batch 3](bench/results/rubric-20261030-0910-VMEnt-SQL25-batch3.md) |
 | 4 | `D6C7E42C` | `gpt-5.6-luna` | **94.7%** | 80.0% | [batch 4](bench/results/rubric-20261030-0945-VMEnt-SQL25-batch4.md) |
 | 5 | `C2F4B2B1` (version 1.1.1) | `gpt-6.2-sol` | **100%** | 85.7% | [batch 5](bench/results/rubric-20261122-1013-VMEnt-SQL25-batch5.md) |
 | 6 | `C2F4B2B1` (version 1.1.1) | `gpt-5.6-luna` | **99.3%** | 88.6% | [batch 6](bench/results/rubric-20261122-1034-VMEnt-SQL25-batch6.md) |
+| 7 | `C2F4B2B1` (version 1.1.1) | `gpt-6.2-sol`, `low` effort | **100%** | 85.7% | [batch 7](bench/results/rubric-20261123-0849-VMEnt-SQL25-batch7.md) |
+| 8 | `C2F4B2B1` (version 1.1.1) | `gpt-6.2-sol`, `high` effort | **100%** | 85.7% | [batch 8](bench/results/rubric-20261123-0924-VMEnt-SQL25-batch8.md) |
 
 **Required + forbidden is the score to watch**: it covers what the model must do and what it must never do. Each check runs 5 times, so a single run moves a check's score by 20 points. Batches 3 and 4 used the same proc version; their difference is normal run-to-run variation.
 
@@ -67,6 +69,11 @@ Four altered inputs test robustness: a long usage history, an attempt to hijack 
 - **`gpt-6.2-sol` passed every required and forbidden check in all 5 runs.** `gpt-5.6-luna` missed one: in one run it recommended two new LastName-led indexes on CustomerContacts instead of one (C6-F1).
 - **Preferred checks:** `gpt-6.2-sol` always recommended dropping the never-read index once the input showed 30 days of usage (P1-P1, 5/5 against 2/5). It never proposed a nonclustered columnstore on FactEvents (C4-P1, 0/5 against 4/5), although it weighed FactEvents' write load every time, which is the required check.
 - **Cost and speed:** `gpt-6.2-sol` took longer on a whole-database run (about 61 s against 43 s) and wrote more (about 9,700 output tokens against 7,900). On a one-table run it was faster (13 s against 17 s) and wrote about half as much.
+
+**Batches 5, 7 and 8 run `gpt-6.2-sol` at three effort levels** on the same proc version:
+- **The scores did not change with effort.** Every check had the same result at `low`, `medium` and `high`: 100% of required and forbidden checks and 85.7% of preferred ones. The only miss each time was the preferred nonclustered columnstore on FactEvents (C4-P1, 0/5).
+- **Effort changed only cost and speed.** On a whole-database run, `low` took about 46 s and wrote about 7,600 output tokens, `medium` 61 s and 9,700, and `high` 92 s and 13,900.
+- **`low` is enough for the proc.** It costs about the same as `gpt-5.6-luna` at `medium` (43 s, 7,900 tokens) and scored higher.
 
 ## Part 2: does following the advice help?
 
@@ -193,7 +200,7 @@ Each report explains how to rerun its tests.
 
 ## Limits
 
-- **Few models and one effort level.** Part 1 has tested `gpt-5.6-luna` and `gpt-6.2-sol`, Part 2 only `gpt-5.6-luna`, all at `medium`.
+- **Few models and effort levels.** Part 1 has tested `gpt-5.6-luna` at `medium` and `gpt-6.2-sol` at `low`, `medium` and `high`; Part 2 only `gpt-5.6-luna` at `medium`.
 - **The proc and the desktop app received different inputs.** Each tool used its own data collector, so the comparison covers the collector, the prompt and the scripts together, the way each product actually runs.
 - **Three workloads.** They are synthetic or derived from benchmarks, not recorded from production systems.
 
