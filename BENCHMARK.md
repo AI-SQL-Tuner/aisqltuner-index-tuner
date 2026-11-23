@@ -75,6 +75,8 @@ Four altered inputs test robustness: a long usage history, an attempt to hijack 
 - **Effort changed only cost and speed.** On a whole-database run, `low` took about 46 s and wrote about 7,600 output tokens, `medium` 61 s and 9,700, and `high` 92 s and 13,900.
 - **`low` is enough for the proc.** It costs about the same as `gpt-5.6-luna` at `medium` (43 s, 7,900 tokens) and scored higher.
 
+**Which to use:** `gpt-5.6-luna` at `medium` stays the default: it is the cheaper model and the two are close, with `gpt-6.2-sol` ahead on required and forbidden checks (100% against 99.3%) and behind on preferred ones (85.7% against 88.6%). Choose `gpt-6.2-sol` at `low` when a missed required or forbidden check costs more than the premium model's price. Model prices were not compared here.
+
 ## Part 2: does following the advice help?
 
 ### The three workloads
