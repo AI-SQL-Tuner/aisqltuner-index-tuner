@@ -232,10 +232,15 @@ def rubric_chart():
                "88.6%, 85.7% and 85.7%.")
     s += legend(40, 160, [(PROC, "Must-do and must-never-do checks (the score that matters)"),
                           ("#9ec5f4", "Preferred checks (better among acceptable answers)")])
-    batches = [("Batch 2", "build A11117F5", 91.3, 85.7), ("Batch 3", "build D6C7E42C", 95.3, 68.6),
-               ("Batch 4", "build D6C7E42C", 94.7, 80.0),
-               ("Batch 5", "v1.1.1, gpt-6.2-sol", 100.0, 85.7), ("Batch 6", "v1.1.1", 99.3, 88.6),
-               ("Batch 7", "v1.1.1, gpt-6.2-sol low", 100.0, 85.7), ("Batch 8", "v1.1.1, gpt-6.2-sol high", 100.0, 85.7)]
+    batches = [
+        ("Batch 2", "build A11117F5", 91.3, 85.7),
+        ("Batch 3", "build D6C7E42C", 95.3, 68.6),
+        ("Batch 4", "build D6C7E42C", 94.7, 80.0),
+        ("Batch 5", "v1.1.1, gpt-6.2-sol", 100.0, 85.7),
+        ("Batch 6", "v1.1.1", 99.3, 88.6),
+        ("Batch 7", "v1.1.1, gpt-6.2-sol low", 100.0, 85.7),
+        ("Batch 8", "v1.1.1, gpt-6.2-sol high", 100.0, 85.7),
+    ]
     left, top, group_h, bar_h = 260, 200, 108, 44
     scale = 1150 / 100
     bottom = top + len(batches) * group_h
