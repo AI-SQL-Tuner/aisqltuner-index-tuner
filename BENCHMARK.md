@@ -75,6 +75,12 @@ Four altered inputs test robustness: a long usage history, an attempt to hijack 
 - **Effort changed only cost and speed.** On a whole-database run, `low` took about 46 s and wrote about 7,600 output tokens, `medium` 61 s and 9,700, and `high` 92 s and 13,900.
 - **`low` is enough for the proc.** It takes about the same time and output tokens as `gpt-5.6-luna` at `medium` (43 s, 7,900 tokens), though at ten times the price per token.
 
+**Explanations:** we read every title and rationale from the whole-database runs. Each rationale was about the same length at `low` as for `gpt-5.6-luna` (about 80 words; `medium` about 90). `gpt-6.2-sol`'s are easier to act on:
+- **Titles name the outcome:** for example *Use one surname-first index for the three CustomerContacts searches* or *Drop IX_Accounts_AccountNumber and keep the unique constraint*. `gpt-5.6-luna`'s titles mostly restate the action, such as *Create CustomerContacts city-last-name covering index*.
+- **Rationales start with the problem in workload terms**, such as *ran 200 times and averages 23,436 reads for 10 rows*, then explain the design choice and its trade-off. `gpt-5.6-luna`'s usually start with the raw missing-index numbers (seeks, percent impact, size) and quote internal flags such as `NarrowerIsRedundant true`.
+- **It explains what not to do:** it filed keep-rowstore-on-FactEvents and keep-the-unused-Products-index-for-now as their own recommendations, with the reason.
+- Both are written for a DBA. `gpt-6.2-sol` still uses terms such as *clustered locator* and *delta store*, and it gives size estimates as ranges where `gpt-5.6-luna` gives a single number.
+
 **Cost per run:** at Azure's Global Standard list prices (November 2026, short context, no cached-input discount), `gpt-6.2-sol` costs $2.00 per million input tokens and $10.00 per million output tokens, and `gpt-5.6-luna` $0.20 and $1.20, ten times less. A whole-database run of the challenge database (about 32,900 input tokens) cost:
 
 | Model and effort | Output tokens | Cost per run |
