@@ -73,9 +73,18 @@ Four altered inputs test robustness: a long usage history, an attempt to hijack 
 **Batches 5, 7 and 8 run `gpt-6.2-sol` at three effort levels** on the same proc version:
 - **The scores did not change with effort.** Every check had the same result at `low`, `medium` and `high`: 100% of required and forbidden checks and 85.7% of preferred ones. The only miss each time was the preferred nonclustered columnstore on FactEvents (C4-P1, 0/5).
 - **Effort changed only cost and speed.** On a whole-database run, `low` took about 46 s and wrote about 7,600 output tokens, `medium` 61 s and 9,700, and `high` 92 s and 13,900.
-- **`low` is enough for the proc.** It costs about the same as `gpt-5.6-luna` at `medium` (43 s, 7,900 tokens) and scored higher.
+- **`low` is enough for the proc.** It takes about the same time and output tokens as `gpt-5.6-luna` at `medium` (43 s, 7,900 tokens), though at ten times the price per token.
 
-**Which to use:** `gpt-5.6-luna` at `medium` stays the default: it is the cheaper model and the two are close, with `gpt-6.2-sol` ahead on required and forbidden checks (100% against 99.3%) and behind on preferred ones (85.7% against 88.6%). Choose `gpt-6.2-sol` at `low` when a missed required or forbidden check costs more than the premium model's price. Model prices were not compared here.
+**Cost per run:** at Azure's Global Standard list prices (November 2026, short context, no cached-input discount), `gpt-6.2-sol` costs $2.00 per million input tokens and $10.00 per million output tokens, and `gpt-5.6-luna` $0.20 and $1.20, ten times less. A whole-database run of the challenge database (about 32,900 input tokens) cost:
+
+| Model and effort | Output tokens | Cost per run |
+|---|---:|---:|
+| `gpt-5.6-luna`, `medium` | 7,900 | $0.016 |
+| `gpt-6.2-sol`, `low` | 7,600 | $0.14 |
+| `gpt-6.2-sol`, `medium` | 9,700 | $0.16 |
+| `gpt-6.2-sol`, `high` | 13,900 | $0.20 |
+
+**Which to use:** `gpt-5.6-luna` at `medium` stays the default. The two are close, with `gpt-6.2-sol` ahead on required and forbidden checks (100% against 99.3%) and behind on preferred ones (85.7% against 88.6%), and `gpt-6.2-sol` costs about 9 times as much per run even at `low`. Choose `gpt-6.2-sol` at `low` when a missed required or forbidden check costs more than about 13 cents a run.
 
 ## Part 2: does following the advice help?
 

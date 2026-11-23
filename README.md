@@ -399,9 +399,10 @@ WHERE ep.name = N'AIIndexTuner';
 ### Choosing a model and effort
 
 - **Default: `gpt-5.6-luna` at `medium`.** It passed 99.3% of the benchmark's required and forbidden
-  checks and 88.6% of the preferred ones, at the lowest cost tested.
+  checks and 88.6% of the preferred ones, for about $0.02 per whole-database run of the benchmark database.
 - **Premium: `gpt-6.2-sol` at `low`.** It passed every required and forbidden check in every run, at
-  about the same time and output tokens as `gpt-5.6-luna` at `medium`, but at a premium model's price.
+  about the same time and output tokens as `gpt-5.6-luna` at `medium`, but at about 9 times the cost
+  (about $0.14 per run at Global Standard list prices).
   It scored a little lower on preferred checks (85.7%). `medium` and `high` scored exactly the same
   as `low` and only took longer, so `low` is enough. `gpt-6.2-sol` is not offered in every region
   (it was not deployable in East US 2 when tested; East US and South Central US work).
