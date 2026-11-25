@@ -226,6 +226,42 @@ IF OBJECT_ID(N'AIIndexTuner.IndexesToKeep', N'U') IS NULL
     );
 GO
 
+/* Workload snapshots (issue #72): database-wide cumulative counters, for sp_AIIndexTuner_Impact on a
+   database without Query Store. CaptureSnapshots = 1 makes each sp_AIIndexTuner run record one first;
+   sp_AIIndexTuner_Impact @Snapshot = 1 records one on demand, for example from a daily job. Off by
+   default: a snapshot reads the whole plan cache. WITH VALUES gives existing installs the default too. */
+IF COL_LENGTH(N'AIIndexTuner.Config', N'CaptureSnapshots') IS NULL
+    ALTER TABLE AIIndexTuner.Config ADD
+        CaptureSnapshots bit NOT NULL CONSTRAINT DF_AIIndexTuner_Config_CaptureSnapshots DEFAULT (0) WITH VALUES;
+GO
+
+/* One row per snapshot. The counters are cumulative since the instance started (ServerStartTime) or the
+   database came online, so only the difference between two snapshots with no restart between them means
+   anything. The query counters sum sys.dm_exec_query_stats for this database: a plan evicted from the
+   cache, which an index change causes for the plans on its table, takes its counters with it, so they
+   undercount. The I/O counters (sys.dm_io_virtual_file_stats) do not lose anything that way. A counter
+   that could not be read is NULL, and Note says why. RunId: the sp_AIIndexTuner run that took it, NULL
+   when taken on demand; no foreign key, so purging runs keeps the snapshots. */
+IF OBJECT_ID(N'AIIndexTuner.WorkloadSnapshot', N'U') IS NULL
+    CREATE TABLE AIIndexTuner.WorkloadSnapshot
+    (
+        SnapshotId       int IDENTITY(1, 1) NOT NULL CONSTRAINT PK_AIIndexTuner_WorkloadSnapshot PRIMARY KEY,
+        CapturedAt       datetime2(0)   NOT NULL CONSTRAINT DF_AIIndexTuner_WorkloadSnapshot_CapturedAt DEFAULT (SYSDATETIME()),
+        RunId            int            NULL,
+        ServerStartTime  datetime2(0)   NULL,
+        Executions       bigint         NULL,
+        CpuMs            bigint         NULL,
+        DurationMs       bigint         NULL,
+        LogicalReads     bigint         NULL,
+        LogicalWrites    bigint         NULL,
+        PhysicalReads    bigint         NULL,
+        DataBytesRead    bigint         NULL,
+        DataBytesWritten bigint         NULL,
+        IoStallMs        bigint         NULL,
+        Note             nvarchar(1000) NULL
+    );
+GO
+
 /* Step logging (issue #38): sp_AIIndexTuner @Logging, NULL = this default. On by default, since a
    run writes only about 30 small rows. WITH VALUES gives existing installs the default too. */
 IF COL_LENGTH(N'AIIndexTuner.Config', N'EnableLogging') IS NULL
@@ -357,6 +393,55 @@ BEGIN
         INSERT AIIndexTuner.RunLog (RunId, Collector, StartTime) VALUES (@RunId, @Step, @Now);
         SELECT @LogId = SCOPE_IDENTITY(), @CharsAtStart = @Len;
     END;
+END;
+GO
+
+/* Records one row in AIIndexTuner.WorkloadSnapshot (issue #72). Needs VIEW SERVER STATE (VIEW DATABASE
+   STATE in Azure SQL Database); a counter it cannot read is left NULL and the reason kept in Note. */
+CREATE OR ALTER PROCEDURE AIIndexTuner.usp_CaptureSnapshot
+    @RunId      int = NULL,
+    @SnapshotId int = NULL OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @Start datetime2(0), @Execs bigint, @CpuMs bigint, @DurMs bigint, @Reads bigint, @Writes bigint, @Phys bigint,
+            @BytesRead bigint, @BytesWritten bigint, @StallMs bigint, @Note nvarchar(1000) = N'';
+
+    BEGIN TRY
+        SELECT @Start = sqlserver_start_time FROM sys.dm_os_sys_info;
+    END TRY
+    BEGIN CATCH
+        SET @Note += LEFT(N'Server start time: ' + ERROR_MESSAGE(), 300) + N' ';
+    END CATCH;
+
+    BEGIN TRY
+        SELECT @Execs = ISNULL(SUM(qs.execution_count), 0),
+               @CpuMs = ISNULL(SUM(qs.total_worker_time), 0) / 1000,
+               @DurMs = ISNULL(SUM(qs.total_elapsed_time), 0) / 1000,
+               @Reads = ISNULL(SUM(qs.total_logical_reads), 0),
+               @Writes = ISNULL(SUM(qs.total_logical_writes), 0),
+               @Phys = ISNULL(SUM(qs.total_physical_reads), 0)
+        FROM sys.dm_exec_query_stats AS qs
+        CROSS APPLY (SELECT CAST(pa.value AS int) AS dbid FROM sys.dm_exec_plan_attributes(qs.plan_handle) AS pa WHERE pa.attribute = N'dbid') AS pdb
+        WHERE pdb.dbid = DB_ID();
+    END TRY
+    BEGIN CATCH
+        SELECT @Execs = NULL, @CpuMs = NULL, @DurMs = NULL, @Reads = NULL, @Writes = NULL, @Phys = NULL;
+        SET @Note += LEFT(N'Query stats: ' + ERROR_MESSAGE(), 300) + N' ';
+    END CATCH;
+
+    BEGIN TRY
+        SELECT @BytesRead = SUM(num_of_bytes_read), @BytesWritten = SUM(num_of_bytes_written), @StallMs = SUM(io_stall)
+        FROM sys.dm_io_virtual_file_stats(DB_ID(), NULL);
+    END TRY
+    BEGIN CATCH
+        SET @Note += LEFT(N'File stats: ' + ERROR_MESSAGE(), 300);
+    END CATCH;
+
+    INSERT AIIndexTuner.WorkloadSnapshot (RunId, ServerStartTime, Executions, CpuMs, DurationMs, LogicalReads, LogicalWrites, PhysicalReads,
+                                          DataBytesRead, DataBytesWritten, IoStallMs, Note)
+    VALUES (@RunId, @Start, @Execs, @CpuMs, @DurMs, @Reads, @Writes, @Phys, @BytesRead, @BytesWritten, @StallMs, NULLIF(RTRIM(@Note), N''));
+    SET @SnapshotId = SCOPE_IDENTITY();
 END;
 GO
 

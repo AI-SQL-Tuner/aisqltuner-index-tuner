@@ -68,7 +68,7 @@ can apply what it finds.
 
 1. Run [aisqltuner-index-tuner.sql](aisqltuner-index-tuner.sql) in the user database you want to
    tune. It creates the `AIIndexTuner` schema with its tables and procedures, plus
-   `dbo.sp_AIIndexTuner`, `dbo.sp_AIIndexTuner_Apply` and `dbo.sp_AIIndexTuner_Purge`. Install it in each database you tune,
+   `dbo.sp_AIIndexTuner`, `dbo.sp_AIIndexTuner_Apply`, `dbo.sp_AIIndexTuner_Purge` and `dbo.sp_AIIndexTuner_Impact`. Install it in each database you tune,
    because the endpoint credential is a database scoped credential.
 2. Fill in step 0 of [setup/Configure-Endpoint.sql](setup/Configure-Endpoint.sql) and run the
    whole script. It creates the database master key and the credential, named from the endpoint
@@ -102,7 +102,7 @@ when you report a problem.
 ### Uninstall
 
 Run [setup/Uninstall.sql](setup/Uninstall.sql) in the database. It drops `dbo.sp_AIIndexTuner`,
-`dbo.sp_AIIndexTuner_Apply`, `dbo.sp_AIIndexTuner_Purge`, the `AIIndexTuner` schema with everything in it (including all runs
+`dbo.sp_AIIndexTuner_Apply`, `dbo.sp_AIIndexTuner_Purge`, `dbo.sp_AIIndexTuner_Impact`, the `AIIndexTuner` schema with everything in it (including all runs
 and recommendations) and the database scoped credential named in `AIIndexTuner.Config`. Indexes the
 tool created or widened are kept; set `RemoveIndexTags = 1` in its step 0 to also remove their
 `AIIndexTuner` extended property, or `DropCredential = 0` to keep the credential. It leaves the
@@ -395,6 +395,7 @@ WHERE ep.name = N'AIIndexTuner';
 | `RetainRunDays` | NULL | Delete runs completed more than this many days ago, with their step log and recommendations, except Applied recommendations (NULL = keep forever). See [Run history retention](#run-history-retention) |
 | `RetainRunDetailDays` | NULL | Clear `CollectedData` and `RawResponse` of runs completed more than this many days ago, keeping the rest of the run (NULL = keep them forever) |
 | `MinUsageDays` | 7 | A low-use index drop needs usage statistics that cover at least this many days (at least 1). Set it past the longest cycle an index serves, such as 35 for month-end reports; the statistics reset when the instance restarts, so a long period is often not met and the drop is skipped. For quarterly or annual work, list the index in [Indexes to keep](#indexes-to-keep) |
+| `CaptureSnapshots` | 0 | 1 = each `sp_AIIndexTuner` run first records the database's cumulative workload counters in `AIIndexTuner.WorkloadSnapshot`, for [measuring impact](#measuring-impact) without Query Store |
 
 ### Choosing a model and effort
 
@@ -488,6 +489,66 @@ EXEC dbo.sp_AIIndexTuner_Purge @OlderThanDays = 365, @IncludeApplied = 1;   -- A
 `@OlderThanDays` replaces the configured retention for that call (0 means every completed run).
 Each run is purged in its own transaction, so run it outside a transaction, except with
 `@WhatIf = 1`.
+
+### Measuring impact
+
+`sp_AIIndexTuner_Impact` shows what a run's applied recommendations changed in the real workload,
+outside the [benchmark](#benchmark). It compares the days before the run's first applied change
+with the days after its last one. That works for a database whose workload is broadly the same
+from day to day.
+
+```sql
+EXEC dbo.sp_AIIndexTuner_Impact;                          -- the latest run that applied something, 7 days each side
+EXEC dbo.sp_AIIndexTuner_Impact @RunId = 42, @Days = 14;  -- another run, two weeks each side
+EXEC dbo.sp_AIIndexTuner_Impact @RankBy = 'Reads';        -- rank queries by the change in logical reads
+EXEC dbo.sp_AIIndexTuner_Impact @ResultSet = 'Workload';  -- one result set only, for INSERT ... EXEC
+```
+
+It reads **Query Store** when it is on. Query Store keeps runtime statistics per query and per
+time interval, across plan changes, so the same query can be compared before and after. The plan
+cache can't do that: creating or dropping an index evicts the plans on its table, and
+`sys.dm_exec_query_stats` loses their counters with them. Query Store intervals that overlap the
+change are left out of both periods, and so are the tool's own procedures.
+
+It returns four result sets:
+
+| Result set | What it shows |
+|---|---|
+| Summary | The periods compared and the days each covers, the Query Store state and settings, and warnings that affect how far to trust the figures: little time since the change, periods of different length, Query Store read-only or near its size limit, data older than its retention, a capture mode other than `ALL` |
+| Workload | CPU, duration, logical and physical reads, writes and log, as totals, per day and per execution, before and after, with the change in percent. With Query Store, once for all queries and once for only the queries that ran in both periods, the like-for-like comparison |
+| Queries | The `@Top` most improved and most regressed queries that ran in both periods, ranked by `@RankBy` (`CPU`, `Reads` or `Duration`): the change per execution times the executions per day after the change. Each row says whether its plan changed and which of the run's indexes its plans use, before or after |
+| Recommendations | Each applied recommendation: whether the index exists, its seeks, scans, lookups and updates since it was created, its leaf writes and page allocations, the queries whose plans used it before and after, and their cost per execution before and after. A note flags an index nobody reads and queries that got more expensive |
+
+How to read it:
+
+- Per-execution figures don't depend on how much the workload ran, and per-day figures show the
+  total load. A per-execution drop with a per-day rise means the workload grew.
+- Compare whole weeks (`@Days = 7`, `14` or `28`) for a workload with a weekly cycle, and wait
+  until the after period is as long as the before period. Until then, per-day figures are scaled
+  from fewer days and the summary says so.
+- The write side counts: a new index makes inserts, updates and deletes on its table cost more,
+  which shows as logical writes and log in the workload, and as leaf writes on the recommendation.
+- Usage and operational statistics reset when the instance restarts, so the index columns of the
+  Recommendations result set cover only the time since then (`UsageSince`).
+
+**Without Query Store**, it compares workload snapshots: database-wide cumulative counters from the
+plan cache (`sys.dm_exec_query_stats`) and the data files (`sys.dm_io_virtual_file_stats`), kept in
+`AIIndexTuner.WorkloadSnapshot`. Set `CaptureSnapshots = 1` in `AIIndexTuner.Config` and each
+`sp_AIIndexTuner` run records one before it changes anything. Or record one daily from a job:
+
+```sql
+EXEC dbo.sp_AIIndexTuner_Impact @Snapshot = 1;
+```
+
+Only the difference between consecutive snapshots with no restart between them is used, and pairs
+that span the change are left out. The data file figures are reliable. The query figures lose the
+counters of evicted plans, so treat them as approximate. Snapshots give no per-query or
+per-index workload detail. `@Source = 'Snapshots'` uses them even when Query Store is on.
+
+It changes nothing (except `@Snapshot = 1`). It needs `VIEW DATABASE STATE` for Query Store and
+`VIEW SERVER STATE` for index usage and snapshots (`VIEW DATABASE STATE` in Azure SQL Database).
+`AppliedAt` is local server time and Query Store keeps UTC. They are converted with the server's
+offset now, so a change applied before a daylight saving switch is placed an hour off.
 
 ## Data disclosure
 
@@ -623,6 +684,9 @@ The tests use `@TestResponse` canned model answers, so they need no AI endpoint.
 - supplied diagnostics (`@CollectedData`)
 - leaving the tool's own statements out of the collected data, including its dynamic SQL and its
   temp-table writes
+- measuring impact: Query Store before and after a CREATE run (a query that scanned now seeks the
+  new index; about two minutes, waiting for one-minute interval boundaries), and the snapshot
+  arithmetic, with a restart and the change left out
 
 ### Live tests
 

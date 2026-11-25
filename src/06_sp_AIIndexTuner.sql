@@ -353,11 +353,12 @@ BEGIN
         THROW 50205, N'The table in @SchemaName.@TableName does not exist in this database.', 1;
 
     DECLARE @IncludeQueryText bit = 1, @KeepDetail bit = 1, @Endpoint nvarchar(400), @Deployment nvarchar(128), @Effort varchar(10),
-            @MaxPayloadChars int, @CredentialName sysname, @ConfigLogging bit, @RetainRunDays int, @RetainRunDetailDays int;
+            @MaxPayloadChars int, @CredentialName sysname, @ConfigLogging bit, @RetainRunDays int, @RetainRunDetailDays int,
+            @CaptureSnapshots bit = 0;
     SELECT @IncludeQueryText = IncludeQueryText, @KeepDetail = KeepRunDetail,
            @Endpoint = Endpoint, @Deployment = Deployment, @Effort = ReasoningEffort, @MaxPayloadChars = MaxPayloadChars,
            @CredentialName = CredentialName, @ConfigLogging = EnableLogging,
-           @RetainRunDays = RetainRunDays, @RetainRunDetailDays = RetainRunDetailDays
+           @RetainRunDays = RetainRunDays, @RetainRunDetailDays = RetainRunDetailDays, @CaptureSnapshots = CaptureSnapshots
     FROM AIIndexTuner.Config WHERE ConfigId = 1;
     SET @Logging = COALESCE(@Logging, @ConfigLogging, 1);
 
@@ -444,6 +445,26 @@ BEGIN
     -- after this can be recorded.
     IF @RunId IS NULL
         THROW 50216, N'The run could not be recorded in AIIndexTuner.Run (see the error above), so the run was not started.', 1;
+
+    /* Workload snapshot (issue #72): with AIIndexTuner.Config.CaptureSnapshots = 1, each run first records
+       the database's cumulative counters for sp_AIIndexTuner_Impact. Before the run applies anything, so a
+       daily run's snapshot closes the day before the change. It never stops the run: an error is only logged. */
+    IF @CaptureSnapshots = 1
+    BEGIN
+        DECLARE @SnapLogId int, @SnapLogChars int, @SnapLogRow int, @SnapMsg nvarchar(4000), @SnapId int;
+        EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, N'Workload snapshot', @LogId = @SnapLogId OUTPUT, @CharsAtStart = @SnapLogChars OUTPUT;
+        SET @SnapLogRow = @SnapLogId;
+        BEGIN TRY
+            EXEC AIIndexTuner.usp_CaptureSnapshot @RunId = @RunId, @SnapshotId = @SnapId OUTPUT;
+            SET @SnapMsg = CONCAT(N'SnapshotId ', @SnapId, N'. ', (SELECT Note FROM AIIndexTuner.WorkloadSnapshot WHERE SnapshotId = @SnapId));
+        END TRY
+        BEGIN CATCH
+            SET @SnapMsg = LEFT(CONCAT(N'Failed: ', ERROR_MESSAGE()), 4000);
+        END CATCH;
+        EXEC AIIndexTuner.usp_LogStep @Logging, @RunId, NULL, @LogId = @SnapLogId OUTPUT, @CharsAtStart = @SnapLogChars OUTPUT;
+        IF @Logging = 1
+            UPDATE AIIndexTuner.RunLog SET Message = @SnapMsg WHERE RunLogId = @SnapLogRow;
+    END;
 
     /* Run history retention (issue #55): with AIIndexTuner.Config.RetainRunDays or RetainRunDetailDays
        set, each run first purges older history, so a scheduled job needs no second step. This run is not

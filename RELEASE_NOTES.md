@@ -7,6 +7,42 @@ To upgrade, run the new [aisqltuner-index-tuner.sql](aisqltuner-index-tuner.sql)
 where the tool is installed. It adds new columns with `ALTER TABLE`, so earlier runs and
 recommendations are kept, and it replaces the procedures and functions.
 
+## 1.2.0 (unreleased)
+
+### Added
+
+- **`dbo.sp_AIIndexTuner_Impact`** (issue #72): what a run's applied recommendations changed in the
+  real workload, outside the benchmark. It compares the `@Days` (default 7) before the run's first
+  applied change with the `@Days` after its last one, or up to now. See *Measuring impact* in the
+  [README](README.md#measuring-impact).
+  - It reads Query Store when it is on: per-query runtime statistics, matched by `query_hash`
+    across plan changes, which the plan cache loses when an index change evicts plans. Query Store
+    intervals that overlap the change, and the tool's own procedures, are left out.
+  - Four result sets: Summary (the periods, the days covered, Query Store state and warnings),
+    Workload (CPU, duration, reads, writes and log as totals, per day and per execution, for all
+    queries and for the queries in both periods), Queries (the most improved and regressed, ranked
+    by `@RankBy`, with plan changes and the run's indexes in their plans) and Recommendations
+    (index use and writes since it was created, and the queries whose plans use it).
+    `@ResultSet` returns one of them, for `INSERT ... EXEC`.
+- **`AIIndexTuner.WorkloadSnapshot`** and **`AIIndexTuner.Config.CaptureSnapshots`** (default 0),
+  for databases without Query Store: database-wide cumulative counters from the plan cache and the
+  data files. With `CaptureSnapshots = 1` each `sp_AIIndexTuner` run records one first (the
+  `Workload snapshot` step in `AIIndexTuner.RunLog`); `sp_AIIndexTuner_Impact @Snapshot = 1`
+  records one on demand. `sp_AIIndexTuner_Impact` compares consecutive snapshots with no restart
+  between them.
+- `setup/Uninstall.sql` drops `dbo.sp_AIIndexTuner_Impact` too.
+
+### Tests
+
+- New test T40 (issue #72): Query Store with one-minute intervals, a query that scans a table, a
+  CREATE run that adds an index for it, and the query again. Its reads per execution drop, it is
+  listed as improved with the new index in its plan, the recommendation shows the index used, and
+  `CaptureSnapshots = 1` makes the run record a snapshot. It waits up to two minutes for interval
+  boundaries, and clears the test database's Query Store, so it runs last.
+- New test T41 (issue #72): snapshot figures per day and per execution from known counters, with a
+  pair across a restart and a pair that spans the change left out; `@Snapshot = 1`; parameter
+  checks.
+
 ## 1.1.1 (2026-11-17)
 
 ### Added

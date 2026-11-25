@@ -10,6 +10,7 @@ DECLARE @Left nvarchar(max) = CONCAT_WS(N', ',
     CASE WHEN OBJECT_ID(N'dbo.sp_AIIndexTuner', N'P') IS NOT NULL THEN N'dbo.sp_AIIndexTuner' END,
     CASE WHEN OBJECT_ID(N'dbo.sp_AIIndexTuner_Apply', N'P') IS NOT NULL THEN N'dbo.sp_AIIndexTuner_Apply' END,
     CASE WHEN OBJECT_ID(N'dbo.sp_AIIndexTuner_Purge', N'P') IS NOT NULL THEN N'dbo.sp_AIIndexTuner_Purge' END,
+    CASE WHEN OBJECT_ID(N'dbo.sp_AIIndexTuner_Impact', N'P') IS NOT NULL THEN N'dbo.sp_AIIndexTuner_Impact' END,
     CASE WHEN EXISTS (SELECT 1 FROM sys.database_scoped_credentials WHERE name = N'https://uninstall-test.invalid') THEN N'the credential' END,
     CASE WHEN INDEXPROPERTY(OBJECT_ID(N'dbo.AuditLog'), N'IX_AuditLog_UninstallTest', 'IndexID') IS NULL THEN N'(the tagged index is missing)' END,
     CASE WHEN NOT EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = 7 AND major_id = OBJECT_ID(N'dbo.AuditLog') AND name = N'AIIndexTuner'
