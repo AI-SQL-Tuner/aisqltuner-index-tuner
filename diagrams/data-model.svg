@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="1600" height="900" font-family="'Segoe UI', -apple-system, 'Helvetica Neue', Arial, sans-serif" text-rendering="geometricPrecision">
   <title>aisqltuner-index-tuner data model</title>
-  <desc>Three tables in the AIIndexTuner schema. Config holds one row of settings. Run holds one row per call of sp_AIIndexTuner. Recommendation holds one row per recommendation and references its Run. Indexes the tool creates are tagged with an extended property.</desc>
+  <desc>The main tables in the AIIndexTuner schema. Config holds one row of settings. Run holds one row per call of sp_AIIndexTuner. Recommendation holds one row per recommendation and references its Run. WorkloadSnapshot holds cumulative workload counters for sp_AIIndexTuner_Impact, recorded by a run when CaptureSnapshots is 1. Indexes the tool creates are tagged with an extended property.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#FFFFFF"/>
@@ -19,12 +19,12 @@
   <!-- Header -->
   <text x="40" y="42" font-size="14" font-weight="700" letter-spacing="2.5" fill="#2563EB">AISQLTUNER-INDEX-TUNER</text>
   <text x="40" y="88" font-size="46" font-weight="800" fill="#0B2545">Data model</text>
-  <text x="40" y="120" font-size="20" fill="#475569">Three tables in the AIIndexTuner schema: settings, runs and recommendations</text>
+  <text x="40" y="120" font-size="20" fill="#475569">The main tables in the AIIndexTuner schema: settings, runs, recommendations and workload snapshots</text>
   <rect x="1330" y="46" width="230" height="36" rx="18" fill="#0B2545"/>
   <text x="1445" y="70" font-size="15" font-weight="600" fill="#FFFFFF" text-anchor="middle">Open source · MIT license</text>
 
   <!-- ===== Config ===== -->
-  <rect x="40" y="150" width="400" height="350" rx="14" fill="#FFFFFF" stroke="#CBDAF2" filter="url(#sh)"/>
+  <rect x="40" y="150" width="400" height="336" rx="14" fill="#FFFFFF" stroke="#CBDAF2" filter="url(#sh)"/>
   <path d="M40 212V164a14 14 0 0 1 14-14h372a14 14 0 0 1 14 14v48z" fill="#0B2545"/>
   <text x="64" y="180" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="18" font-weight="700" fill="#FFFFFF">AIIndexTuner.Config</text>
   <text x="64" y="200" font-size="12.5" fill="#BFD3F6">One row: how to call the model</text>
@@ -34,37 +34,61 @@
   <text x="182" y="236" font-size="12" fill="#64748B">always 1</text>
   <line x1="64" y1="248" x2="416" y2="248" stroke="#E2E8F0"/>
   <g font-size="11" font-weight="700" letter-spacing="1.4" fill="#64748B">
-    <text x="64" y="268">WHERE TO CALL</text>
-    <text x="64" y="310">MODEL SETTINGS</text>
-    <text x="64" y="352">LIMITS</text>
-    <text x="64" y="413">BEHAVIOR</text>
-    <text x="64" y="455">PRIVACY AND DETAIL</text>
+    <text x="64" y="266">WHERE TO CALL</text>
+    <text x="64" y="304">MODEL SETTINGS</text>
+    <text x="64" y="342">LIMITS</text>
+    <text x="64" y="397">BEHAVIOR</text>
+    <text x="64" y="452">PRIVACY AND DETAIL</text>
   </g>
   <g font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="12.5" fill="#0B2545">
-    <text x="64" y="288">Endpoint · Deployment · CredentialName</text>
-    <text x="64" y="330">ReasoningEffort · MaxOutputTokens</text>
-    <text x="64" y="372">RequestTimeoutSec · MaxWaitSec · PollIntervalSec</text>
-    <text x="64" y="391">MaxPayloadChars</text>
-    <text x="64" y="433">UseBackgroundMode · UseStructuredOutput</text>
-    <text x="64" y="475">IncludeQueryText · KeepRunDetail</text>
+    <text x="64" y="284">Endpoint · Deployment · CredentialName</text>
+    <text x="64" y="322">ReasoningEffort · MaxOutputTokens</text>
+    <text x="64" y="360">RequestTimeoutSec · MaxWaitSec · PollIntervalSec</text>
+    <text x="64" y="377">MaxPayloadChars</text>
+    <text x="64" y="415">UseBackgroundMode · UseStructuredOutput</text>
+    <text x="64" y="432">CaptureSnapshots</text>
+    <text x="64" y="470">IncludeQueryText · KeepRunDetail</text>
   </g>
 
   <!-- Legend -->
-  <rect x="40" y="525" width="400" height="145" rx="14" fill="#FFFFFF" stroke="#CBDAF2"/>
-  <text x="64" y="552" font-size="11" font-weight="700" letter-spacing="1.4" fill="#64748B">HOW TO READ</text>
-  <rect x="64" y="563" width="26" height="16" rx="4" fill="#2563EB"/>
-  <text x="77" y="575" font-size="10" font-weight="700" fill="#FFFFFF" text-anchor="middle">PK</text>
-  <text x="108" y="576" font-size="13.5" fill="#334155">Primary key</text>
-  <rect x="64" y="587" width="26" height="16" rx="4" fill="#0E7490"/>
-  <text x="77" y="599" font-size="10" font-weight="700" fill="#FFFFFF" text-anchor="middle">FK</text>
-  <text x="108" y="600" font-size="13.5" fill="#334155">Foreign key, enforced by SQL Server</text>
+  <rect x="40" y="722" width="400" height="96" rx="14" fill="#FFFFFF" stroke="#CBDAF2"/>
+  <text x="64" y="746" font-size="11" font-weight="700" letter-spacing="1.4" fill="#64748B">HOW TO READ</text>
+  <rect x="64" y="760" width="26" height="16" rx="4" fill="#2563EB"/>
+  <text x="77" y="772" font-size="10" font-weight="700" fill="#FFFFFF" text-anchor="middle">PK</text>
+  <text x="100" y="773" font-size="13" fill="#334155">Primary key</text>
+  <rect x="222" y="760" width="26" height="16" rx="4" fill="#0E7490"/>
+  <text x="235" y="772" font-size="10" font-weight="700" fill="#FFFFFF" text-anchor="middle">FK</text>
+  <text x="258" y="773" font-size="13" fill="#334155">Foreign key (enforced)</text>
   <g stroke="#2563EB" stroke-width="2" fill="none">
-    <line x1="62" y1="619" x2="92" y2="619"/>
-    <path d="M80 619l12-7M80 619l12 0M80 619l12 7"/>
+    <line x1="62" y1="796" x2="92" y2="796"/>
+    <path d="M80 796l12-7M80 796l12 0M80 796l12 7"/>
   </g>
-  <text x="108" y="624" font-size="13.5" fill="#334155">One-to-many</text>
-  <line x1="62" y1="643" x2="92" y2="643" stroke="#64748B" stroke-width="2" stroke-dasharray="5 4"/>
-  <text x="108" y="648" font-size="13.5" fill="#334155">Value copied, no foreign key</text>
+  <text x="100" y="801" font-size="13" fill="#334155">One-to-many</text>
+  <line x1="220" y1="796" x2="250" y2="796" stroke="#64748B" stroke-width="2" stroke-dasharray="5 4"/>
+  <text x="258" y="801" font-size="13" fill="#334155">Value copied, no foreign key</text>
+
+  <!-- ===== WorkloadSnapshot ===== -->
+  <rect x="40" y="500" width="400" height="170" rx="14" fill="#FFFFFF" stroke="#CBDAF2" filter="url(#sh)"/>
+  <path d="M40 550V514a14 14 0 0 1 14-14h372a14 14 0 0 1 14 14v36z" fill="#475569"/>
+  <text x="64" y="523" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="16" font-weight="700" fill="#FFFFFF">AIIndexTuner.WorkloadSnapshot</text>
+  <text x="64" y="541" font-size="12" fill="#E2E8F0">Cumulative counters for sp_AIIndexTuner_Impact</text>
+  <rect x="64" y="561" width="26" height="16" rx="4" fill="#2563EB"/>
+  <text x="77" y="573" font-size="10" font-weight="700" fill="#FFFFFF" text-anchor="middle">PK</text>
+  <text x="100" y="574" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="13.5" font-weight="700" fill="#0B2545">SnapshotId</text>
+  <text x="194" y="574" font-size="12" fill="#64748B">int identity</text>
+  <line x1="64" y1="585" x2="416" y2="585" stroke="#E2E8F0"/>
+  <g font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="12" fill="#0B2545">
+    <text x="64" y="603">CapturedAt · RunId · ServerStartTime</text>
+    <text x="64" y="620">Executions · CpuMs · DurationMs</text>
+    <text x="64" y="637">LogicalReads · LogicalWrites · PhysicalReads</text>
+    <text x="64" y="654">DataBytesRead · DataBytesWritten · IoStallMs</text>
+  </g>
+
+  <!-- Run -> WorkloadSnapshot (logical) -->
+  <path d="M569 628H443" fill="none" stroke="#64748B" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#arGray)"/>
+  <rect x="449" y="588" width="112" height="32" rx="8" fill="#F5F8FD"/>
+  <text x="505" y="602" font-size="12" fill="#475569" text-anchor="middle">RunId of the</text>
+  <text x="505" y="616" font-size="12" fill="#475569" text-anchor="middle">run that took it</text>
 
   <!-- Config -> Run (logical) -->
   <path d="M441 278H505V430H567" fill="none" stroke="#64748B" stroke-width="2.2" stroke-dasharray="6 5" marker-end="url(#arGray)"/>
@@ -157,16 +181,16 @@
   <text x="1367" y="700" font-size="12" fill="#475569">applies changes</text>
 
   <!-- Your indexes strip -->
-  <rect x="40" y="722" width="1520" height="96" rx="14" fill="#EAF1FE" stroke="#9DBBF0" stroke-width="1.5"/>
-  <g transform="translate(66 752)" fill="none" stroke="#2563EB" stroke-width="2.2" stroke-linejoin="round">
+  <rect x="470" y="722" width="1090" height="96" rx="14" fill="#EAF1FE" stroke="#9DBBF0" stroke-width="1.5"/>
+  <g transform="translate(496 752)" fill="none" stroke="#2563EB" stroke-width="2.2" stroke-linejoin="round">
     <rect x="1" y="3" width="26" height="24" rx="3"/>
     <path d="M1 11h26M1 19h26M10 3v24"/>
   </g>
-  <text x="112" y="764" font-size="20" font-weight="700" fill="#0B2545">Your indexes</text>
-  <text x="112" y="788" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="13" fill="#2563EB">sys.indexes · extended property AIIndexTuner</text>
-  <text x="620" y="760" font-size="15.5" fill="#334155">Every index the tool creates is tagged with the extended property AIIndexTuner,</text>
-  <text x="620" y="782" font-size="15.5" fill="#334155">naming the run and the recommendation, so you can always find what it built.</text>
-  <text x="620" y="804" font-size="15.5" fill="#334155">A widened index says <tspan font-weight="700">Widened by</tspan>: roll it back with its UndoDDL.</text>
+  <text x="542" y="764" font-size="20" font-weight="700" fill="#0B2545">Your indexes</text>
+  <text x="542" y="788" font-family="Consolas, 'SFMono-Regular', Menlo, 'Courier New', monospace" font-size="13" fill="#2563EB">sys.indexes · extended property AIIndexTuner</text>
+  <text x="900" y="760" font-size="15.5" fill="#334155">Every index the tool creates is tagged with the extended property AIIndexTuner,</text>
+  <text x="900" y="782" font-size="15.5" fill="#334155">naming the run and the recommendation, so you can always find what it built.</text>
+  <text x="900" y="804" font-size="15.5" fill="#334155">A widened index says <tspan font-weight="700">Widened by</tspan>: roll it back with its UndoDDL.</text>
 
   <!-- Footer -->
   <line x1="40" y1="858" x2="1560" y2="858" stroke="#D5E0F2"/>
