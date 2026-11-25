@@ -4917,19 +4917,24 @@ BEGIN
         /* ===== Query Store ===== */
         -- Intervals are aligned to their length, which divides a day, so the change window is widened
         -- to whole intervals: the intervals that overlap the change are in neither period. In UTC.
-        DECLARE @L int = ISNULL(NULLIF(@QsIntervalMin, 0), 60), @QsEarliest datetime2(0),
+        -- The after period ends at an interval boundary too, except while it is still open (it ends
+        -- now): then the current interval is included, since its statistics run only up to now.
+        DECLARE @L int = ISNULL(NULLIF(@QsIntervalMin, 0), 60), @QsEarliest datetime2(0), @AfterOpen bit = CASE WHEN @AfterTo >= @Now THEN 1 ELSE 0 END,
                 @BeforeFromU datetime2(0), @BeforeToU datetime2(0), @AfterFromU datetime2(0), @AfterToU datetime2(0);
         SELECT @BeforeFromU = DATEADD(MINUTE, ((DATEDIFF(MINUTE, @Epoch, DATEADD(MINUTE, -@Tz, @BeforeFrom)) + @L - 1) / @L) * @L, @Epoch),
                @BeforeToU   = DATEADD(MINUTE, (DATEDIFF(MINUTE, @Epoch, DATEADD(MINUTE, -@Tz, @BeforeTo)) / @L) * @L, @Epoch),
                @AfterFromU  = DATEADD(MINUTE, ((DATEDIFF(MINUTE, @Epoch, DATEADD(MINUTE, -@Tz, @AfterFrom)) + @L - 1) / @L) * @L, @Epoch),
-               @AfterToU    = DATEADD(MINUTE, -@Tz, @AfterTo);
+               @AfterToU    = CASE WHEN @AfterOpen = 1 THEN DATEADD(MINUTE, -@Tz, @AfterTo)
+                                   ELSE DATEADD(MINUTE, (DATEDIFF(MINUTE, @Epoch, DATEADD(MINUTE, -@Tz, @AfterTo)) / @L) * @L, @Epoch) END;
         SELECT @QsEarliest = MIN(CONVERT(datetime2(0), SWITCHOFFSET(start_time, 0))) FROM sys.query_store_runtime_stats_interval;
-        IF @QsEarliest > @BeforeFromU SET @BeforeFromU = @QsEarliest;   -- Query Store has no data before then
+        -- Query Store has no data before then.
+        IF @QsEarliest > @BeforeFromU SET @BeforeFromU = @QsEarliest;
+        IF @QsEarliest > @AfterFromU SET @AfterFromU = @QsEarliest;
+        IF @AfterToU < @AfterFromU SET @AfterToU = @AfterFromU;
         SELECT @BeforeDays = CASE WHEN @BeforeToU > @BeforeFromU THEN DATEDIFF(SECOND, @BeforeFromU, @BeforeToU) / 86400.0 ELSE 0 END,
                @AfterDays  = CASE WHEN @AfterToU > @AfterFromU THEN DATEDIFF(SECOND, @AfterFromU, @AfterToU) / 86400.0 ELSE 0 END,
                @BeforeFrom = DATEADD(MINUTE, @Tz, @BeforeFromU), @BeforeTo = DATEADD(MINUTE, @Tz, @BeforeToU),
-               @AfterFrom  = DATEADD(MINUTE, @Tz, @AfterFromU);
-        IF @AfterTo < @AfterFrom SET @AfterTo = @AfterFrom;
+               @AfterFrom  = DATEADD(MINUTE, @Tz, @AfterFromU), @AfterTo = DATEADD(MINUTE, @Tz, @AfterToU);
 
         CREATE TABLE #iv (runtime_stats_interval_id bigint NOT NULL PRIMARY KEY, Period char(1) NOT NULL);
         INSERT #iv (runtime_stats_interval_id, Period)
@@ -4937,7 +4942,7 @@ BEGIN
         FROM sys.query_store_runtime_stats_interval AS i
         CROSS APPLY (SELECT CONVERT(datetime2(0), SWITCHOFFSET(i.start_time, 0)) AS StartU, CONVERT(datetime2(0), SWITCHOFFSET(i.end_time, 0)) AS EndU) AS u
         WHERE (u.StartU >= @BeforeFromU AND u.EndU <= @BeforeToU)
-           OR (u.StartU >= @AfterFromU AND u.StartU < @AfterToU);
+           OR (u.StartU >= @AfterFromU AND (u.EndU <= @AfterToU OR (@AfterOpen = 1 AND u.StartU < @AfterToU)));
 
         -- The tool's own procedures, left out of the workload.
         CREATE TABLE #own (object_id int NOT NULL PRIMARY KEY);
