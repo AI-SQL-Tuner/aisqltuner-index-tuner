@@ -7,6 +7,58 @@ To upgrade, run the new [aisqltuner-index-tuner.sql](aisqltuner-index-tuner.sql)
 where the tool is installed. It adds new columns with `ALTER TABLE`, so earlier runs and
 recommendations are kept, and it replaces the procedures and functions.
 
+## 1.2.0 (unreleased)
+
+### Added
+
+- **`dbo.sp_AIIndexTuner_Impact`** (issue #72): what a run's applied recommendations changed in the
+  real workload, outside the benchmark. It compares the `@Days` (default 7) before the run's first
+  applied change with the `@Days` after its last one, or up to now. See *Measuring impact* in the
+  [README](README.md#measuring-impact).
+  - It reads Query Store when it is on: per-query runtime statistics, matched by `query_hash`
+    across plan changes, which the plan cache loses when an index change evicts plans. Query Store
+    intervals that overlap the change, and the tool's own procedures, are left out.
+  - Four result sets: Summary (the periods, the days covered, Query Store state and warnings),
+    Workload (CPU, duration, reads, writes and log as totals, per day and per execution, for all
+    queries and for the queries in both periods), Queries (the most improved and regressed, ranked
+    by `@RankBy`, with plan changes and the run's indexes in their plans) and Recommendations
+    (index use and writes since it was created, and the queries whose plans use it).
+    `@ResultSet` returns one of them, for `INSERT ... EXEC`.
+  - The Summary warns when other runs changed indexes inside the measured time, naming each run,
+    when it applied them, and the indexes, since part of the difference may be theirs.
+  - To find the plans that use an index, it reads plan XML only where it can matter: for a created
+    index, plans first compiled after it was built; for a dropped one, plans compiled before. The
+    names are matched exactly, in a binary collation. On a 786 MB Query Store this took a run with two
+    created and two widened indexes from 86 to 13 seconds. A widened index still needs every plan in
+    the periods.
+- **`AIIndexTuner.WorkloadSnapshot`** and **`AIIndexTuner.Config.CaptureSnapshots`** (default 0),
+  for databases without Query Store: database-wide cumulative counters from the plan cache and the
+  data files. With `CaptureSnapshots = 1` each `sp_AIIndexTuner` run records one first (the
+  `Workload snapshot` step in `AIIndexTuner.RunLog`); `sp_AIIndexTuner_Impact @Snapshot = 1`
+  records one on demand. `sp_AIIndexTuner_Impact` compares consecutive snapshots with no restart
+  between them.
+- `setup/Uninstall.sql` drops `dbo.sp_AIIndexTuner_Impact` too.
+
+### Fixed
+
+- A CREATE run was marked `Succeeded`, with its `CompletedAt`, as soon as the model's answer was
+  stored, before its indexes were built. While they were built it looked finished, with `ApplyMs`
+  NULL, and a run killed then was never found as `Abandoned`. It now stays `Running` until its apply
+  step ends, and then gets `Succeeded`, `CompletedAt` and `ApplyMs` together. An error that stops
+  the apply step marks the run `Failed`, with the error and the open `RunLog` step closed.
+
+### Tests
+
+- New test T40 (issue #72): Query Store with one-minute intervals, a query that scans a table, a
+  CREATE run that adds an index for it, and the query again. Its reads per execution drop, it is
+  listed as improved with the new index in its plan, the recommendation shows the index used, and
+  `CaptureSnapshots = 1` makes the run record a snapshot. It waits up to two minutes for interval
+  boundaries, and clears the test database's Query Store, so it runs last.
+- New test T41 (issue #72): snapshot figures per day and per execution from known counters, with a
+  pair across a restart and a pair that spans the change left out; `@Snapshot = 1`; parameter
+  checks.
+- T3 checks that a CREATE run is completed after its last applied index, with `ApplyMs`.
+
 ## 1.1.1 (2026-11-17)
 
 ### Added

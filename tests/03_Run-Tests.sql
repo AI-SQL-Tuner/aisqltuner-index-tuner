@@ -256,7 +256,12 @@ IF (SELECT COUNT(*) FROM sys.extended_properties AS ep
     INNER JOIN sys.indexes AS i ON ep.class = 7 AND ep.major_id = i.object_id AND ep.minor_id = i.index_id
     WHERE ep.name = N'AIIndexTuner' AND i.object_id = OBJECT_ID(N'dbo.Orders')) <> 3
     THROW 50999, N'FAIL T3: expected 3 tagged indexes.', 1;
-PRINT 'PASS T3: CREATE applies 3 indexes, skips 4 with reasons, leaves 2 for review, resists injection';
+-- The run completes after its apply step, not when the model answers (run 63 on 1.2.0 showed CompletedAt before the builds).
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Run AS r
+               WHERE r.RunId = @RunId AND r.Status = 'Succeeded' AND r.ApplyMs IS NOT NULL
+                 AND r.CompletedAt >= (SELECT MAX(AppliedAt) FROM AIIndexTuner.Recommendation WHERE RunId = @RunId))
+    THROW 50999, N'FAIL T3: the run was not completed after its apply step, with ApplyMs.', 1;
+PRINT 'PASS T3: CREATE applies 3 indexes, skips 4 with reasons, leaves 2 for review, resists injection, and completes the run after applying';
 GO
 
 /* ===== T4: rerun is idempotent: existing indexes are detected ===== */
@@ -2206,6 +2211,244 @@ BEGIN
         THROW 50999, @T39Msg, 1;
     END;
     PRINT 'PASS T39: indexes in AIIndexTuner.IndexesToKeep are neither dropped nor widened, by CREATE mode or sp_AIIndexTuner_Apply, and are listed for the model; a low-use drop needs MinUsageDays of usage statistics';
+END;
+GO
+
+/* ----- T41: sp_AIIndexTuner_Impact on workload snapshots, and its parameter checks (issue #72) -----
+   Snapshots with known counters a day apart around a change applied 3 days ago: one day before at
+   2,000 CPU ms and 100,000 reads, one day after at 1,000 CPU ms and 20,000 reads. A pair across a
+   restart is left out, and so is the pair that spans the change. */
+BEGIN
+    DECLARE @T41Problems nvarchar(max) = N'', @T41Run int, @T41Empty int, @T41Other int, @T41Error int, @T41Base datetime2(0) = SYSDATETIME(),
+            @T41Count int, @MB bigint = 1048576;
+
+    INSERT AIIndexTuner.Run (Mode, Status) VALUES ('CREATE', 'Succeeded');
+    SET @T41Run = SCOPE_IDENTITY();
+    INSERT AIIndexTuner.Recommendation (RunId, Priority, Category, Title, Status, AppliedAt)
+    VALUES (@T41Run, 1, 'Statistics', N'T41 change', 'Applied', DATEADD(DAY, -3, @T41Base));
+    INSERT AIIndexTuner.Run (Mode, Status) VALUES ('RECOMMEND', 'Succeeded');
+    SET @T41Empty = SCOPE_IDENTITY();
+    -- Another run's index changes: two in the after period, one long before the periods.
+    INSERT AIIndexTuner.Run (Mode, Status) VALUES ('CREATE', 'Succeeded');
+    SET @T41Other = SCOPE_IDENTITY();
+    INSERT AIIndexTuner.Recommendation (RunId, Priority, Category, Title, SchemaName, TableName, IndexName, Status, AppliedAt)
+    VALUES (@T41Other, 1, 'CreateIndex', N'T41 other 1', 'dbo', 'T41A', 'IX_T41A', 'Applied', DATEADD(HOUR, -36, @T41Base)),
+           (@T41Other, 2, 'DropIndex', N'T41 other 2', 'dbo', 'T41B', 'IX_T41B', 'Applied', DATEADD(HOUR, -35, @T41Base)),
+           (@T41Other, 3, 'CreateIndex', N'T41 other 3', 'dbo', 'T41C', 'IX_T41C', 'Applied', DATEADD(DAY, -20, @T41Base));
+
+    DELETE AIIndexTuner.WorkloadSnapshot;
+    INSERT AIIndexTuner.WorkloadSnapshot (CapturedAt, ServerStartTime, Executions, CpuMs, DurationMs, LogicalReads, LogicalWrites, PhysicalReads,
+                                          DataBytesRead, DataBytesWritten, IoStallMs)
+    VALUES (DATEADD(DAY, -6, @T41Base), '2025-12-01', 99999, 99999, 99999, 99999, 99999, 99999, 99999, 99999, 99999),   -- before a restart
+           (DATEADD(DAY, -5, @T41Base), '2026-01-01', 0, 0, 0, 0, 0, 0, 0, 0, 0),
+           (DATEADD(DAY, -4, @T41Base), '2026-01-01', 1000, 2000, 4000, 100000, 1000, 500, 100 * @MB, 10 * @MB, 1000),
+           (DATEADD(DAY, -2, @T41Base), '2026-01-01', 5000, 9000, 9000, 500000, 9000, 900, 500 * @MB, 50 * @MB, 5000),   -- spans the change
+           (DATEADD(DAY, -1, @T41Base), '2026-01-01', 7000, 10000, 11000, 520000, 10000, 1000, 520 * @MB, 60 * @MB, 5500);
+
+    CREATE TABLE #T41Summary (RunId int, Source varchar(20), AppliedRecommendations int, FirstAppliedAt datetime2(0), LastAppliedAt datetime2(0),
+        BeforeFrom datetime2(0), BeforeTo datetime2(0), BeforeDays decimal(10, 4), AfterFrom datetime2(0), AfterTo datetime2(0), AfterDays decimal(10, 4),
+        QueriesInBothPeriods int, QueriesOnlyBefore int, QueriesOnlyAfter int, SnapshotPairsBefore int, SnapshotPairsAfter int,
+        QueryStoreState nvarchar(60), QueryStoreCaptureMode nvarchar(60), QueryStoreIntervalMinutes int, QueryStoreStaleDays bigint,
+        QueryStoreUsedMB bigint, QueryStoreMaxMB bigint, Warnings nvarchar(max));
+    CREATE TABLE #T41Workload (Source varchar(20), Scope nvarchar(40), Metric nvarchar(40), BeforeTotal decimal(38, 1), AfterTotal decimal(38, 1),
+        BeforePerDay decimal(38, 1), AfterPerDay decimal(38, 1), PerDayChangePct decimal(19, 1), BeforePerExec decimal(38, 3), AfterPerExec decimal(38, 3),
+        PerExecChangePct decimal(19, 1));
+    CREATE TABLE #T41Recs (RecommendationId int, Priority int, Category varchar(30), SchemaName nvarchar(128), TableName nvarchar(128), IndexName nvarchar(128),
+        AppliedAt datetime2(0), IndexExists bit, UserSeeks bigint, UserScans bigint, UserLookups bigint, UserUpdates bigint, LeafWrites bigint,
+        LeafPageAllocations bigint, UsageSince datetime2(0), QueriesUsingBefore int, QueriesUsingAfter int, ExecsPerDayUsingBefore decimal(19, 1),
+        ExecsPerDayUsingAfter decimal(19, 1), AffectedQueries int, AffectedCpuMsPerExecBefore decimal(19, 3), AffectedCpuMsPerExecAfter decimal(19, 3),
+        AffectedReadsPerExecBefore decimal(19, 1), AffectedReadsPerExecAfter decimal(19, 1), Note nvarchar(400));
+    CREATE TABLE #T41Queries (Direction varchar(10), [Rank] int, QueryHash binary(8), SampleQueryId bigint, ObjectName nvarchar(300), QueryText nvarchar(max),
+        ExecsPerDayBefore decimal(19, 1), ExecsPerDayAfter decimal(19, 1), CpuMsPerExecBefore decimal(19, 3), CpuMsPerExecAfter decimal(19, 3),
+        DurationMsPerExecBefore decimal(19, 3), DurationMsPerExecAfter decimal(19, 3), ReadsPerExecBefore decimal(19, 1), ReadsPerExecAfter decimal(19, 1),
+        WritesPerExecBefore decimal(19, 1), WritesPerExecAfter decimal(19, 1), CpuMsPerDayChange decimal(19, 1), DurationMsPerDayChange decimal(19, 1),
+        ReadsPerDayChange decimal(19, 1), PlanChanged bit, RunIndexesInPlans nvarchar(max));
+
+    INSERT #T41Summary EXEC dbo.sp_AIIndexTuner_Impact @RunId = @T41Run, @Source = 'snapshots', @ResultSet = 'Summary';
+    INSERT #T41Workload EXEC dbo.sp_AIIndexTuner_Impact @RunId = @T41Run, @Source = 'Snapshots', @ResultSet = 'Workload';
+    INSERT #T41Recs EXEC dbo.sp_AIIndexTuner_Impact @RunId = @T41Run, @Source = 'Snapshots', @ResultSet = 'Recommendations';
+    INSERT #T41Queries EXEC dbo.sp_AIIndexTuner_Impact @RunId = @T41Run, @Source = 'Snapshots', @ResultSet = 'Queries';
+
+    IF NOT EXISTS (SELECT 1 FROM #T41Summary WHERE Source = 'Snapshots' AND SnapshotPairsBefore = 1 AND SnapshotPairsAfter = 1
+                   AND BeforeDays = 1 AND AfterDays = 1 AND Warnings LIKE N'%1 pairs of consecutive snapshots in the periods were left out%')
+        SET @T41Problems += N' the summary does not show one pair a day long on each side and the restart pair left out;';
+    IF NOT EXISTS (SELECT 1 FROM #T41Summary WHERE Warnings LIKE N'%Run ' + CAST(@T41Other AS nvarchar(10)) + N' also changed 2 indexes between % and %, after this run''s change and inside the measured time%CreateIndex [[]dbo].[[]T41A].[[]IX_T41A], DropIndex [[]dbo].[[]T41B].[[]IX_T41B]%'
+                   AND Warnings NOT LIKE N'%IX_T41C%')
+        SET @T41Problems += N' the summary does not warn of the other run''s two index changes in the after period, or names the one outside the periods;';
+    IF NOT EXISTS (SELECT 1 FROM #T41Workload WHERE Scope = N'Database' AND Metric = N'CPU ms' AND BeforePerDay = 2000 AND AfterPerDay = 1000
+                   AND PerDayChangePct = -50 AND BeforePerExec = 2 AND AfterPerExec = 0.5 AND PerExecChangePct = -75)
+       OR NOT EXISTS (SELECT 1 FROM #T41Workload WHERE Metric = N'Logical reads' AND BeforePerDay = 100000 AND AfterPerDay = 20000)
+       OR NOT EXISTS (SELECT 1 FROM #T41Workload WHERE Metric = N'Data MB read' AND BeforePerDay = 100 AND AfterPerDay = 20 AND BeforePerExec IS NULL)
+       OR NOT EXISTS (SELECT 1 FROM #T41Workload WHERE Metric = N'Executions' AND BeforePerDay = 1000 AND AfterPerDay = 2000)
+       OR (SELECT COUNT(*) FROM #T41Workload) <> 9
+        SET @T41Problems += N' the snapshot workload figures are wrong;';
+    IF NOT EXISTS (SELECT 1 FROM #T41Recs WHERE Category = 'Statistics' AND IndexName IS NULL AND Note = N'Not an index change: see the Workload result set.')
+        SET @T41Problems += N' the non-index recommendation is not reported as such;';
+    IF EXISTS (SELECT 1 FROM #T41Queries)
+        SET @T41Problems += N' queries were listed from snapshots;';
+
+    -- @Snapshot = 1 records a snapshot now.
+    SET @T41Count = (SELECT COUNT(*) FROM AIIndexTuner.WorkloadSnapshot);
+    EXEC dbo.sp_AIIndexTuner_Impact @Snapshot = 1;
+    IF (SELECT COUNT(*) FROM AIIndexTuner.WorkloadSnapshot) <> @T41Count + 1
+       OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.WorkloadSnapshot WHERE CapturedAt >= @T41Base AND RunId IS NULL AND Executions IS NOT NULL AND DataBytesRead IS NOT NULL)
+        SET @T41Problems += N' @Snapshot = 1 did not record a snapshot;';
+
+    -- Parameter checks.
+    SET @T41Error = NULL; BEGIN TRY EXEC dbo.sp_AIIndexTuner_Impact @RunId = @T41Run, @Days = 0; END TRY BEGIN CATCH SET @T41Error = ERROR_NUMBER(); END CATCH;
+    IF ISNULL(@T41Error, 0) <> 50501 SET @T41Problems += N' @Days = 0 was accepted;';
+    SET @T41Error = NULL; BEGIN TRY EXEC dbo.sp_AIIndexTuner_Impact @RunId = @T41Run, @RankBy = 'Writes'; END TRY BEGIN CATCH SET @T41Error = ERROR_NUMBER(); END CATCH;
+    IF ISNULL(@T41Error, 0) <> 50503 SET @T41Problems += N' @RankBy = Writes was accepted;';
+    SET @T41Error = NULL; BEGIN TRY EXEC dbo.sp_AIIndexTuner_Impact @RunId = @T41Run, @Source = 'Cache'; END TRY BEGIN CATCH SET @T41Error = ERROR_NUMBER(); END CATCH;
+    IF ISNULL(@T41Error, 0) <> 50504 SET @T41Problems += N' @Source = Cache was accepted;';
+    SET @T41Error = NULL; BEGIN TRY EXEC dbo.sp_AIIndexTuner_Impact @RunId = @T41Run, @ResultSet = 'All'; END TRY BEGIN CATCH SET @T41Error = ERROR_NUMBER(); END CATCH;
+    IF ISNULL(@T41Error, 0) <> 50505 SET @T41Problems += N' @ResultSet = All was accepted;';
+    SET @T41Error = NULL; BEGIN TRY EXEC dbo.sp_AIIndexTuner_Impact @RunId = @T41Empty; END TRY BEGIN CATCH SET @T41Error = ERROR_NUMBER(); END CATCH;
+    IF ISNULL(@T41Error, 0) <> 50507 SET @T41Problems += N' a run with nothing applied was accepted;';
+
+    DELETE AIIndexTuner.WorkloadSnapshot;
+    DELETE AIIndexTuner.Recommendation WHERE RunId IN (@T41Run, @T41Empty, @T41Other);
+    DELETE AIIndexTuner.Run WHERE RunId IN (@T41Run, @T41Empty, @T41Other);
+
+    IF @T41Problems <> N''
+    BEGIN
+        DECLARE @T41Msg nvarchar(2048) = LEFT(N'FAIL T41:' + @T41Problems, 2048);
+        THROW 50999, @T41Msg, 1;
+    END;
+    PRINT 'PASS T41: sp_AIIndexTuner_Impact compares workload snapshots per day and per execution, leaves out pairs across a restart or the change, warns of other runs'' index changes in the periods, records a snapshot with @Snapshot = 1, and checks its parameters';
+END;
+GO
+
+/* ----- T40: sp_AIIndexTuner_Impact on Query Store (issue #72) -----
+   One-minute Query Store intervals, a baseline workload that scans dbo.T40, a CREATE run that adds
+   IX_T40_K (with CaptureSnapshots = 1, so the run records a workload snapshot first), and the same
+   workload again, which now seeks. AppliedAt is moved back to the minute boundary just before the
+   index was built, so that no interval overlaps the change and the test waits two minutes at most.
+   The probe's reads per execution must drop, the probe must be listed as improved with the new index
+   in its plan, and the recommendation must show the index used. Clears Query Store: run it last. */
+IF EXISTS (SELECT 1 FROM AIIndexTuner.Config)
+    PRINT 'SKIP T40: AIIndexTuner.Config has a row';
+ELSE
+BEGIN
+    DECLARE @T40Problems nvarchar(max) = N'', @T40Run int, @T40Rec int, @T40i int, @T40Sum int,
+            @T40B1 datetime2(0), @T40B2 datetime2(0), @T40Wait char(8), @T40Skip bit = 0;
+    -- A clean Query Store, so a rerun on the same database does not see an earlier IX_T40_K in its plans.
+    ALTER DATABASE CURRENT SET QUERY_STORE CLEAR;
+    ALTER DATABASE CURRENT SET QUERY_STORE (INTERVAL_LENGTH_MINUTES = 1);
+    DROP TABLE IF EXISTS dbo.T40;
+    CREATE TABLE dbo.T40 (Id int IDENTITY(1, 1) NOT NULL CONSTRAINT PK_T40 PRIMARY KEY, K int NOT NULL, V int NOT NULL, Pad char(200) NOT NULL);
+    INSERT dbo.T40 (K, V, Pad) SELECT value % 5000, 1, 'x' FROM GENERATE_SERIES(1, 50000);
+    INSERT AIIndexTuner.Config (ConfigId, Endpoint, Deployment, CredentialName, CaptureSnapshots)
+    VALUES (1, N'https://t40.invalid/', N't40', N'https://t40.invalid', 1);
+
+    -- Baseline, from the start of the next minute.
+    SET @T40B1 = DATEADD(MINUTE, DATEDIFF(MINUTE, '2000-01-01', SYSDATETIME()) + 1, CAST('2000-01-01' AS datetime2(0)));
+    SET @T40Wait = CONVERT(char(8), DATEADD(SECOND, 1, @T40B1), 108);
+    WAITFOR TIME @T40Wait;
+    SET @T40i = 0;
+    WHILE @T40i < 40
+    BEGIN
+        EXEC sys.sp_executesql N'SELECT @s = SUM(V) FROM dbo.T40 WHERE K = @k ', N'@k int, @s int OUTPUT', @k = @T40i, @s = @T40Sum OUTPUT;
+        SET @T40i += 1;
+    END;
+
+    -- The change, from the start of the minute after.
+    SET @T40B2 = DATEADD(MINUTE, DATEDIFF(MINUTE, '2000-01-01', SYSDATETIME()) + 1, CAST('2000-01-01' AS datetime2(0)));
+    SET @T40Wait = CONVERT(char(8), DATEADD(SECOND, 1, @T40B2), 108);
+    WAITFOR TIME @T40Wait;
+    EXEC dbo.sp_AIIndexTuner @Mode = 'CREATE', @CollectedData = N'{"t40": true}', @TestResponse = N'{"summary": "T40", "recommendations": [
+      {"priority": 1, "category": "CreateIndex", "title": "Index T40 by K", "schema_name": "dbo", "table_name": "T40", "index_name": "IX_T40_K",
+       "index_type": "NONCLUSTERED", "key_columns": [{"column": "K", "descending": false}], "include_columns": ["V"], "is_unique": false,
+       "confidence": "High", "rationale": "t", "script": ""}]}';
+    SET @T40Run = (SELECT MAX(RunId) FROM AIIndexTuner.Run);
+    SET @T40Rec = (SELECT RecommendationId FROM AIIndexTuner.Recommendation WHERE RunId = @T40Run AND Status = 'Applied');
+    IF @T40Rec IS NULL
+        SET @T40Problems += N' the CREATE run did not apply IX_T40_K;';
+    UPDATE AIIndexTuner.Recommendation SET AppliedAt = @T40B2 WHERE RecommendationId = @T40Rec;
+
+    SET @T40i = 0;
+    WHILE @T40i < 40
+    BEGIN
+        EXEC sys.sp_executesql N'SELECT @s = SUM(V) FROM dbo.T40 WHERE K = @k ', N'@k int, @s int OUTPUT', @k = @T40i, @s = @T40Sum OUTPUT;
+        SET @T40i += 1;
+    END;
+    EXEC sys.sp_query_store_flush_db;
+
+    -- The interval length change takes effect at an interval boundary; if the baseline still landed in
+    -- an interval that spans the change, the test proves nothing.
+    IF EXISTS (SELECT 1
+               FROM sys.query_store_query_text AS qt
+               INNER JOIN sys.query_store_query AS q ON q.query_text_id = qt.query_text_id
+               INNER JOIN sys.query_store_plan AS p ON p.query_id = q.query_id
+               INNER JOIN sys.query_store_runtime_stats AS rs ON rs.plan_id = p.plan_id
+               INNER JOIN sys.query_store_runtime_stats_interval AS i ON i.runtime_stats_interval_id = rs.runtime_stats_interval_id
+               WHERE qt.query_sql_text LIKE N'%SUM(V) FROM dbo.T40 WHERE K = @k%' AND qt.query_sql_text NOT LIKE N'%query_store%'
+                 AND i.start_time < TODATETIMEOFFSET(@T40B2, DATEPART(TZOFFSET, SYSDATETIMEOFFSET()))
+                 AND i.end_time > TODATETIMEOFFSET(@T40B2, DATEPART(TZOFFSET, SYSDATETIMEOFFSET())))
+        SET @T40Skip = 1;
+
+    CREATE TABLE #T40Summary (RunId int, Source varchar(20), AppliedRecommendations int, FirstAppliedAt datetime2(0), LastAppliedAt datetime2(0),
+        BeforeFrom datetime2(0), BeforeTo datetime2(0), BeforeDays decimal(10, 4), AfterFrom datetime2(0), AfterTo datetime2(0), AfterDays decimal(10, 4),
+        QueriesInBothPeriods int, QueriesOnlyBefore int, QueriesOnlyAfter int, SnapshotPairsBefore int, SnapshotPairsAfter int,
+        QueryStoreState nvarchar(60), QueryStoreCaptureMode nvarchar(60), QueryStoreIntervalMinutes int, QueryStoreStaleDays bigint,
+        QueryStoreUsedMB bigint, QueryStoreMaxMB bigint, Warnings nvarchar(max));
+    CREATE TABLE #T40Workload (Source varchar(20), Scope nvarchar(40), Metric nvarchar(40), BeforeTotal decimal(38, 1), AfterTotal decimal(38, 1),
+        BeforePerDay decimal(38, 1), AfterPerDay decimal(38, 1), PerDayChangePct decimal(19, 1), BeforePerExec decimal(38, 3), AfterPerExec decimal(38, 3),
+        PerExecChangePct decimal(19, 1));
+    CREATE TABLE #T40Queries (Direction varchar(10), [Rank] int, QueryHash binary(8), SampleQueryId bigint, ObjectName nvarchar(300), QueryText nvarchar(max),
+        ExecsPerDayBefore decimal(19, 1), ExecsPerDayAfter decimal(19, 1), CpuMsPerExecBefore decimal(19, 3), CpuMsPerExecAfter decimal(19, 3),
+        DurationMsPerExecBefore decimal(19, 3), DurationMsPerExecAfter decimal(19, 3), ReadsPerExecBefore decimal(19, 1), ReadsPerExecAfter decimal(19, 1),
+        WritesPerExecBefore decimal(19, 1), WritesPerExecAfter decimal(19, 1), CpuMsPerDayChange decimal(19, 1), DurationMsPerDayChange decimal(19, 1),
+        ReadsPerDayChange decimal(19, 1), PlanChanged bit, RunIndexesInPlans nvarchar(max));
+    CREATE TABLE #T40Recs (RecommendationId int, Priority int, Category varchar(30), SchemaName nvarchar(128), TableName nvarchar(128), IndexName nvarchar(128),
+        AppliedAt datetime2(0), IndexExists bit, UserSeeks bigint, UserScans bigint, UserLookups bigint, UserUpdates bigint, LeafWrites bigint,
+        LeafPageAllocations bigint, UsageSince datetime2(0), QueriesUsingBefore int, QueriesUsingAfter int, ExecsPerDayUsingBefore decimal(19, 1),
+        ExecsPerDayUsingAfter decimal(19, 1), AffectedQueries int, AffectedCpuMsPerExecBefore decimal(19, 3), AffectedCpuMsPerExecAfter decimal(19, 3),
+        AffectedReadsPerExecBefore decimal(19, 1), AffectedReadsPerExecAfter decimal(19, 1), Note nvarchar(400));
+
+    IF @T40Skip = 0 AND @T40Rec IS NOT NULL
+    BEGIN
+        -- @RunId NULL takes the latest run with an Applied recommendation: this one.
+        INSERT #T40Summary EXEC dbo.sp_AIIndexTuner_Impact @ResultSet = 'Summary';
+        INSERT #T40Workload EXEC dbo.sp_AIIndexTuner_Impact @RunId = @T40Run, @ResultSet = 'Workload';
+        INSERT #T40Queries EXEC dbo.sp_AIIndexTuner_Impact @RunId = @T40Run, @RankBy = 'reads', @Top = 1000, @ResultSet = 'queries';
+        INSERT #T40Recs EXEC dbo.sp_AIIndexTuner_Impact @RunId = @T40Run, @ResultSet = 'Recommendations';
+        EXEC dbo.sp_AIIndexTuner_Impact @RunId = @T40Run, @RankBy = 'Reads', @Top = 5;   -- all four, for the output file
+
+        IF NOT EXISTS (SELECT 1 FROM #T40Summary WHERE RunId = @T40Run AND Source = 'Query Store' AND AppliedRecommendations = 1
+                       AND BeforeDays > 0 AND AfterTo > AfterFrom AND BeforeTo = @T40B2 AND AfterFrom = @T40B2 AND QueryStoreIntervalMinutes = 1)
+            SET @T40Problems += N' the summary does not show the run, Query Store and both periods split at the change;';
+        IF NOT EXISTS (SELECT 1 FROM #T40Workload WHERE Scope = N'Queries in both periods' AND Metric = N'Logical reads'
+                       AND AfterPerExec < BeforePerExec / 2 AND PerExecChangePct < -50)
+            SET @T40Problems += N' the like-for-like logical reads per execution did not drop by half;';
+        IF (SELECT COUNT(*) FROM #T40Workload WHERE Scope = N'All queries') <> 7
+            SET @T40Problems += N' the workload does not have 7 metrics for all queries;';
+        IF NOT EXISTS (SELECT 1 FROM #T40Queries WHERE QueryText LIKE N'%SUM(V) FROM dbo.T40 WHERE K = @k%' AND Direction = 'Improved'
+                       AND ReadsPerExecAfter * 10 < ReadsPerExecBefore AND ReadsPerDayChange < 0 AND PlanChanged = 1
+                       AND RunIndexesInPlans = N'IX_T40_K (after)')
+            SET @T40Problems += N' the probe is not listed as improved, with a new plan that uses IX_T40_K after the change;';
+        IF NOT EXISTS (SELECT 1 FROM #T40Recs WHERE RecommendationId = @T40Rec AND IndexName = N'IX_T40_K' AND IndexExists = 1 AND UserSeeks > 0
+                       AND QueriesUsingBefore = 0 AND QueriesUsingAfter >= 1 AND ExecsPerDayUsingAfter > 0 AND AffectedQueries >= 1
+                       AND AffectedReadsPerExecAfter < AffectedReadsPerExecBefore AND Note IS NULL)
+            SET @T40Problems += N' the recommendation does not show IX_T40_K used by the probe after the change;';
+        IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.WorkloadSnapshot WHERE RunId = @T40Run AND DataBytesRead IS NOT NULL)
+           OR NOT EXISTS (SELECT 1 FROM AIIndexTuner.RunLog WHERE RunId = @T40Run AND Collector = N'Workload snapshot' AND Message LIKE N'SnapshotId %')
+            SET @T40Problems += N' CaptureSnapshots = 1 did not make the run record a workload snapshot;';
+    END;
+
+    ALTER DATABASE CURRENT SET QUERY_STORE (INTERVAL_LENGTH_MINUTES = 60);
+    DELETE AIIndexTuner.Config;
+    DROP TABLE dbo.T40;
+
+    IF @T40Problems <> N''
+    BEGIN
+        DECLARE @T40Msg nvarchar(2048) = LEFT(N'FAIL T40:' + @T40Problems, 2048);
+        THROW 50999, @T40Msg, 1;
+    END;
+    IF @T40Skip = 1
+        PRINT 'SKIP T40: the Query Store interval length change had not taken effect, so an interval spans the change';
+    ELSE
+        PRINT 'PASS T40: sp_AIIndexTuner_Impact compares Query Store before and after a run: the probe''s reads per execution drop, it is listed as improved with the new index in its plan, the recommendation shows the index used, and CaptureSnapshots makes the run record a snapshot';
 END;
 GO
 

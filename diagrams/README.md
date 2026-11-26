@@ -8,7 +8,7 @@ Each comes as an SVG (sharp at any size, editable in a text editor) and a 3200 x
 |---|---|---|
 | **Architecture** | What lives where: the stored procedures and tables inside your database, the diagnostic sources they read, and the one outside service they call | [SVG](architecture.svg), [PNG](architecture.png) |
 | **Data flow** | How data moves through the five steps, from collection to a verified index with an undo script, and where `RECOMMEND` stops and `CREATE` continues | [SVG](data-flow.svg), [PNG](data-flow.png) |
-| **Data model** | The three `AIIndexTuner` tables, their columns by purpose, the foreign key from `Recommendation` to `Run`, and the extended property that tags the indexes the tool creates | [SVG](data-model.svg), [PNG](data-model.png) |
+| **Data model** | Every `AIIndexTuner` table (`Config`, `Run`, `RunLog`, `Recommendation`, `IndexesToKeep` and `WorkloadSnapshot`), their columns by purpose, the foreign keys from `Recommendation` and `RunLog` to `Run`, and the extended property that tags the indexes the tool creates | [SVG](data-model.svg), [PNG](data-model.png) |
 | **Recommendation types** | The nine recommendation categories, and which can be applied automatically, which only when you allow it, and which always stay for review. Shows that the output covers more than new indexes | [SVG](recommendation-types.svg), [PNG](recommendation-types.png) |
 
 ![Architecture](architecture.png)
@@ -39,7 +39,7 @@ python diagrams/benchmark-charts.py
 ## Re-rendering the PNGs
 
 Edit the SVG, then render it with headless Chrome or Edge. The size is 1600 x 900 at 2x
-(`benchmark-space` is 1600 x 760 and `benchmark-rubric` 1600 x 1056: set `--window-size` to match):
+(`data-model` is 1600 x 1110, `benchmark-space` 1600 x 760 and `benchmark-rubric` 1600 x 1056: set `--window-size` to match):
 
 ```powershell
 $chrome = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
