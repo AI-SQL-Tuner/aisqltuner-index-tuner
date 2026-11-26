@@ -165,16 +165,27 @@ BEGIN
                         AffectedReadsPerExecBefore decimal(19, 1) NULL, AffectedReadsPerExecAfter decimal(19, 1) NULL,
                         Note nvarchar(400) COLLATE DATABASE_DEFAULT NULL);
     -- The run's applied index changes, with the plan XML pattern of each index: an Object element reads
-    -- Database="[d]" Schema="[s]" Table="[t]" Index="[i]".
+    -- Database="[d]" Schema="[s]" Table="[t]" Index="[i]". Names are written as the catalog has them,
+    -- so the pattern is matched in a binary collation: several times faster over a large Query Store.
+    -- Reading plan XML is the costly part, so each change reads only the plans that can use its index:
+    -- a created index only plans first compiled after it was built, a dropped one only plans compiled
+    -- before it was dropped (with 5 minutes either way for the build and the clock). A widened index
+    -- kept its name, so every plan is read for it.
     CREATE TABLE #ri (RecommendationId int NOT NULL PRIMARY KEY, IndexName sysname COLLATE DATABASE_DEFAULT NOT NULL,
-                      Pattern nvarchar(2000) COLLATE DATABASE_DEFAULT NOT NULL);
-    INSERT #ri (RecommendationId, IndexName, Pattern)
-    SELECT RecommendationId, COALESCE(IndexName, ReplacesIndex),
-           N'%Schema="' + AIIndexTuner.fn_EscapeLike(QUOTENAME(SchemaName)) + N'" Table="' + AIIndexTuner.fn_EscapeLike(QUOTENAME(TableName))
-           + N'" Index="' + AIIndexTuner.fn_EscapeLike(QUOTENAME(COALESCE(IndexName, ReplacesIndex))) + N'"%'
-    FROM AIIndexTuner.Recommendation
-    WHERE RunId = @RunId AND Status = 'Applied' AND AppliedAt IS NOT NULL
-      AND SchemaName IS NOT NULL AND TableName IS NOT NULL AND COALESCE(IndexName, ReplacesIndex) IS NOT NULL;
+                      Pattern nvarchar(2000) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                      CompiledFrom datetimeoffset(7) NULL, CompiledTo datetimeoffset(7) NULL);
+    INSERT #ri (RecommendationId, IndexName, Pattern, CompiledFrom, CompiledTo)
+    SELECT r.RecommendationId, COALESCE(r.IndexName, r.ReplacesIndex),
+           N'%Schema="' + AIIndexTuner.fn_EscapeLike(QUOTENAME(ISNULL(OBJECT_SCHEMA_NAME(o.ObjectId), r.SchemaName)))
+           + N'" Table="' + AIIndexTuner.fn_EscapeLike(QUOTENAME(ISNULL(OBJECT_NAME(o.ObjectId), r.TableName)))
+           + N'" Index="' + AIIndexTuner.fn_EscapeLike(QUOTENAME(ISNULL(i.name, COALESCE(r.IndexName, r.ReplacesIndex)))) + N'"%',
+           CASE WHEN r.Category = 'CreateIndex' THEN TODATETIMEOFFSET(DATEADD(MINUTE, -5, r.AppliedAt), @Tz) END,
+           CASE WHEN r.Category = 'DropIndex' THEN TODATETIMEOFFSET(DATEADD(MINUTE, 5, r.AppliedAt), @Tz) END
+    FROM AIIndexTuner.Recommendation AS r
+    CROSS APPLY (SELECT OBJECT_ID(QUOTENAME(r.SchemaName) + N'.' + QUOTENAME(r.TableName)) AS ObjectId) AS o
+    LEFT JOIN sys.indexes AS i ON i.object_id = o.ObjectId AND i.name = COALESCE(r.IndexName, r.ReplacesIndex)
+    WHERE r.RunId = @RunId AND r.Status = 'Applied' AND r.AppliedAt IS NOT NULL
+      AND r.SchemaName IS NOT NULL AND r.TableName IS NOT NULL AND COALESCE(r.IndexName, r.ReplacesIndex) IS NOT NULL;
 
     DECLARE @QueriesBoth int, @QueriesBeforeOnly int, @QueriesAfterOnly int, @PairsBefore int, @PairsAfter int;
 
@@ -269,11 +280,25 @@ BEGIN
         -- Which plans use an index the run created or dropped.
         CREATE TABLE #planidx (plan_id bigint NOT NULL, RecommendationId int NOT NULL, PRIMARY KEY (plan_id, RecommendationId));
         IF EXISTS (SELECT 1 FROM #ri)
-            INSERT #planidx (plan_id, RecommendationId)
+        BEGIN
+            -- First the candidates by compile time, without reading any plan XML; then the XML of those only.
+            CREATE TABLE #cand (plan_id bigint NOT NULL, RecommendationId int NOT NULL, PRIMARY KEY (plan_id, RecommendationId));
+            INSERT #cand (plan_id, RecommendationId)
             SELECT p.plan_id, ri.RecommendationId
             FROM (SELECT DISTINCT plan_id FROM #pm) AS pm
             INNER JOIN sys.query_store_plan AS p ON p.plan_id = pm.plan_id
-            INNER JOIN #ri AS ri ON CAST(p.query_plan AS nvarchar(max)) COLLATE DATABASE_DEFAULT LIKE ri.Pattern ESCAPE N'\';
+            INNER JOIN #ri AS ri ON (ri.CompiledFrom IS NULL OR p.initial_compile_start_time >= ri.CompiledFrom)
+                                AND (ri.CompiledTo IS NULL OR p.initial_compile_start_time <= ri.CompiledTo);
+
+            INSERT #planidx (plan_id, RecommendationId)
+            SELECT p.plan_id, ri.RecommendationId
+            FROM (SELECT DISTINCT plan_id FROM #cand) AS c
+            INNER JOIN sys.query_store_plan AS p ON p.plan_id = c.plan_id
+            CROSS APPLY (SELECT CAST(p.query_plan AS nvarchar(max)) COLLATE Latin1_General_100_BIN2 AS PlanXml) AS x
+            INNER JOIN #cand AS cr ON cr.plan_id = c.plan_id
+            INNER JOIN #ri AS ri ON ri.RecommendationId = cr.RecommendationId
+            WHERE x.PlanXml LIKE ri.Pattern ESCAPE N'\';
+        END;
 
         -- The queries in both periods, ranked by the change per day of the chosen measure.
         ;WITH c AS (

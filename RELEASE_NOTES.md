@@ -24,6 +24,11 @@ recommendations are kept, and it replaces the procedures and functions.
     by `@RankBy`, with plan changes and the run's indexes in their plans) and Recommendations
     (index use and writes since it was created, and the queries whose plans use it).
     `@ResultSet` returns one of them, for `INSERT ... EXEC`.
+  - To find the plans that use an index, it reads plan XML only where it can matter: for a created
+    index, plans first compiled after it was built; for a dropped one, plans compiled before. The
+    names are matched exactly, in a binary collation. On a 786 MB Query Store this took a run with two
+    created and two widened indexes from 86 to 13 seconds. A widened index still needs every plan in
+    the periods.
 - **`AIIndexTuner.WorkloadSnapshot`** and **`AIIndexTuner.Config.CaptureSnapshots`** (default 0),
   for databases without Query Store: database-wide cumulative counters from the plan cache and the
   data files. With `CaptureSnapshots = 1` each `sp_AIIndexTuner` run records one first (the
