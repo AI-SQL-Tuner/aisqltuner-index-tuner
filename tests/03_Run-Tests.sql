@@ -256,7 +256,12 @@ IF (SELECT COUNT(*) FROM sys.extended_properties AS ep
     INNER JOIN sys.indexes AS i ON ep.class = 7 AND ep.major_id = i.object_id AND ep.minor_id = i.index_id
     WHERE ep.name = N'AIIndexTuner' AND i.object_id = OBJECT_ID(N'dbo.Orders')) <> 3
     THROW 50999, N'FAIL T3: expected 3 tagged indexes.', 1;
-PRINT 'PASS T3: CREATE applies 3 indexes, skips 4 with reasons, leaves 2 for review, resists injection';
+-- The run completes after its apply step, not when the model answers (run 63 on 1.2.0 showed CompletedAt before the builds).
+IF NOT EXISTS (SELECT 1 FROM AIIndexTuner.Run AS r
+               WHERE r.RunId = @RunId AND r.Status = 'Succeeded' AND r.ApplyMs IS NOT NULL
+                 AND r.CompletedAt >= (SELECT MAX(AppliedAt) FROM AIIndexTuner.Recommendation WHERE RunId = @RunId))
+    THROW 50999, N'FAIL T3: the run was not completed after its apply step, with ApplyMs.', 1;
+PRINT 'PASS T3: CREATE applies 3 indexes, skips 4 with reasons, leaves 2 for review, resists injection, and completes the run after applying';
 GO
 
 /* ===== T4: rerun is idempotent: existing indexes are detected ===== */

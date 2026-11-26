@@ -32,6 +32,14 @@ recommendations are kept, and it replaces the procedures and functions.
   between them.
 - `setup/Uninstall.sql` drops `dbo.sp_AIIndexTuner_Impact` too.
 
+### Fixed
+
+- A CREATE run was marked `Succeeded`, with its `CompletedAt`, as soon as the model's answer was
+  stored, before its indexes were built. While they were built it looked finished, with `ApplyMs`
+  NULL, and a run killed then was never found as `Abandoned`. It now stays `Running` until its apply
+  step ends, and then gets `Succeeded`, `CompletedAt` and `ApplyMs` together. An error that stops
+  the apply step marks the run `Failed`, with the error and the open `RunLog` step closed.
+
 ### Tests
 
 - New test T40 (issue #72): Query Store with one-minute intervals, a query that scans a table, a
@@ -42,6 +50,7 @@ recommendations are kept, and it replaces the procedures and functions.
 - New test T41 (issue #72): snapshot figures per day and per execution from known counters, with a
   pair across a restart and a pair that spans the change left out; `@Snapshot = 1`; parameter
   checks.
+- T3 checks that a CREATE run is completed after its last applied index, with `ApplyMs`.
 
 ## 1.1.1 (2026-11-17)
 
