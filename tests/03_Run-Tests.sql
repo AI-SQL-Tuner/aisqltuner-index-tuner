@@ -2219,7 +2219,7 @@ GO
    2,000 CPU ms and 100,000 reads, one day after at 1,000 CPU ms and 20,000 reads. A pair across a
    restart is left out, and so is the pair that spans the change. */
 BEGIN
-    DECLARE @T41Problems nvarchar(max) = N'', @T41Run int, @T41Empty int, @T41Error int, @T41Base datetime2(0) = SYSDATETIME(),
+    DECLARE @T41Problems nvarchar(max) = N'', @T41Run int, @T41Empty int, @T41Other int, @T41Error int, @T41Base datetime2(0) = SYSDATETIME(),
             @T41Count int, @MB bigint = 1048576;
 
     INSERT AIIndexTuner.Run (Mode, Status) VALUES ('CREATE', 'Succeeded');
@@ -2228,6 +2228,13 @@ BEGIN
     VALUES (@T41Run, 1, 'Statistics', N'T41 change', 'Applied', DATEADD(DAY, -3, @T41Base));
     INSERT AIIndexTuner.Run (Mode, Status) VALUES ('RECOMMEND', 'Succeeded');
     SET @T41Empty = SCOPE_IDENTITY();
+    -- Another run's index changes: two in the after period, one long before the periods.
+    INSERT AIIndexTuner.Run (Mode, Status) VALUES ('CREATE', 'Succeeded');
+    SET @T41Other = SCOPE_IDENTITY();
+    INSERT AIIndexTuner.Recommendation (RunId, Priority, Category, Title, SchemaName, TableName, IndexName, Status, AppliedAt)
+    VALUES (@T41Other, 1, 'CreateIndex', N'T41 other 1', 'dbo', 'T41A', 'IX_T41A', 'Applied', DATEADD(HOUR, -36, @T41Base)),
+           (@T41Other, 2, 'DropIndex', N'T41 other 2', 'dbo', 'T41B', 'IX_T41B', 'Applied', DATEADD(HOUR, -35, @T41Base)),
+           (@T41Other, 3, 'CreateIndex', N'T41 other 3', 'dbo', 'T41C', 'IX_T41C', 'Applied', DATEADD(DAY, -20, @T41Base));
 
     DELETE AIIndexTuner.WorkloadSnapshot;
     INSERT AIIndexTuner.WorkloadSnapshot (CapturedAt, ServerStartTime, Executions, CpuMs, DurationMs, LogicalReads, LogicalWrites, PhysicalReads,
@@ -2265,6 +2272,9 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM #T41Summary WHERE Source = 'Snapshots' AND SnapshotPairsBefore = 1 AND SnapshotPairsAfter = 1
                    AND BeforeDays = 1 AND AfterDays = 1 AND Warnings LIKE N'%1 pairs of consecutive snapshots in the periods were left out%')
         SET @T41Problems += N' the summary does not show one pair a day long on each side and the restart pair left out;';
+    IF NOT EXISTS (SELECT 1 FROM #T41Summary WHERE Warnings LIKE N'%Run ' + CAST(@T41Other AS nvarchar(10)) + N' also changed 2 indexes between % after this run''s change and inside the measured time%CreateIndex [[]dbo].[[]T41A].[[]IX_T41A], DropIndex [[]dbo].[[]T41B].[[]IX_T41B]%'
+                   AND Warnings NOT LIKE N'%IX_T41C%')
+        SET @T41Problems += N' the summary does not warn of the other run''s two index changes in the after period, or names the one outside the periods;';
     IF NOT EXISTS (SELECT 1 FROM #T41Workload WHERE Scope = N'Database' AND Metric = N'CPU ms' AND BeforePerDay = 2000 AND AfterPerDay = 1000
                    AND PerDayChangePct = -50 AND BeforePerExec = 2 AND AfterPerExec = 0.5 AND PerExecChangePct = -75)
        OR NOT EXISTS (SELECT 1 FROM #T41Workload WHERE Metric = N'Logical reads' AND BeforePerDay = 100000 AND AfterPerDay = 20000)
@@ -2297,15 +2307,15 @@ BEGIN
     IF ISNULL(@T41Error, 0) <> 50507 SET @T41Problems += N' a run with nothing applied was accepted;';
 
     DELETE AIIndexTuner.WorkloadSnapshot;
-    DELETE AIIndexTuner.Recommendation WHERE RunId IN (@T41Run, @T41Empty);
-    DELETE AIIndexTuner.Run WHERE RunId IN (@T41Run, @T41Empty);
+    DELETE AIIndexTuner.Recommendation WHERE RunId IN (@T41Run, @T41Empty, @T41Other);
+    DELETE AIIndexTuner.Run WHERE RunId IN (@T41Run, @T41Empty, @T41Other);
 
     IF @T41Problems <> N''
     BEGIN
         DECLARE @T41Msg nvarchar(2048) = LEFT(N'FAIL T41:' + @T41Problems, 2048);
         THROW 50999, @T41Msg, 1;
     END;
-    PRINT 'PASS T41: sp_AIIndexTuner_Impact compares workload snapshots per day and per execution, leaves out pairs across a restart or the change, records a snapshot with @Snapshot = 1, and checks its parameters';
+    PRINT 'PASS T41: sp_AIIndexTuner_Impact compares workload snapshots per day and per execution, leaves out pairs across a restart or the change, warns of other runs'' index changes in the periods, records a snapshot with @Snapshot = 1, and checks its parameters';
 END;
 GO
 

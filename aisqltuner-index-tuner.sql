@@ -5180,6 +5180,19 @@ BEGIN
         INSERT #Warnings (Warning) VALUES (CONCAT(N'Only ', CAST(@AfterDays * 24 AS decimal(9, 1)), N' hours since the change are covered: the figures are preliminary.'));
     IF @BeforeDays > 0 AND @AfterDays > 0 AND ABS(@BeforeDays - @AfterDays) >= 1
         INSERT #Warnings (Warning) VALUES (CONCAT(N'The periods cover ', CAST(@BeforeDays AS decimal(9, 2)), N' and ', CAST(@AfterDays AS decimal(9, 2)), N' days. Per-day figures are scaled to match, but a workload with a weekly cycle compares fairly only over the same whole weeks.'));
+    -- Index changes by other runs in the measured time: the difference is not this run's alone.
+    INSERT #Warnings (Warning)
+    SELECT LEFT(CONCAT(N'Run ', o.RunId, N' also changed ', COUNT(*), CASE WHEN COUNT(*) = 1 THEN N' index' ELSE N' indexes' END,
+                       N' between ', CONVERT(varchar(16), MIN(o.AppliedAt), 120), N' and ', CONVERT(varchar(16), MAX(o.AppliedAt), 120),
+                       CASE WHEN MAX(o.AppliedAt) < @First THEN N', before' ELSE N', after' END,
+                       N' this run''s change and inside the measured time, so part of the difference may be theirs: ',
+                       STRING_AGG(CONVERT(nvarchar(max), CONCAT(o.Category, N' ', QUOTENAME(o.SchemaName), N'.', QUOTENAME(o.TableName), N'.', QUOTENAME(o.IndexName))), N', ')
+                           WITHIN GROUP (ORDER BY o.AppliedAt, o.RecommendationId)), 1000)
+    FROM AIIndexTuner.Recommendation AS o
+    WHERE o.RunId <> @RunId AND o.Status = 'Applied' AND o.IndexName IS NOT NULL
+      AND o.AppliedAt >= @BeforeFrom AND o.AppliedAt <= @AfterTo
+    GROUP BY o.RunId, CASE WHEN o.AppliedAt < @First THEN 0 ELSE 1 END
+    ORDER BY MIN(o.AppliedAt);
 
     /* ===== Applied recommendations ===== */
     DECLARE @UsageSince datetime2(0);

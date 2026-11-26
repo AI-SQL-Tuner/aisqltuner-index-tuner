@@ -514,7 +514,7 @@ It returns four result sets:
 
 | Result set | What it shows |
 |---|---|
-| Summary | The periods compared and the days each covers, the Query Store state and settings, and warnings that affect how far to trust the figures: little time since the change, periods of different length, Query Store read-only or near its size limit, data older than its retention, a capture mode other than `ALL` |
+| Summary | The periods compared and the days each covers, the Query Store state and settings, and warnings that affect how far to trust the figures: little time since the change, periods of different length, Query Store read-only or near its size limit, data older than its retention, a capture mode other than `ALL`, index changes by other runs inside the measured time |
 | Workload | CPU, duration, logical and physical reads, writes and log, as totals, per day and per execution, before and after, with the change in percent. With Query Store, once for all queries and once for only the queries that ran in both periods, the like-for-like comparison |
 | Queries | The `@Top` most improved and most regressed queries that ran in both periods, ranked by `@RankBy` (`CPU`, `Reads` or `Duration`): the change per execution times the executions per day after the change. Each row says whether its plan changed and which of the run's indexes its plans use, before or after |
 | Recommendations | Each applied recommendation: whether the index exists, its seeks, scans, lookups and updates since it was created, its leaf writes and page allocations, the queries whose plans used it before and after, and their cost per execution before and after. A note flags an index nobody reads and queries that got more expensive |
