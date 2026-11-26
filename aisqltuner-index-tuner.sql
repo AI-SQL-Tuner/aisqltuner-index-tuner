@@ -5183,7 +5183,9 @@ BEGIN
     -- Index changes by other runs in the measured time: the difference is not this run's alone.
     INSERT #Warnings (Warning)
     SELECT LEFT(CONCAT(N'Run ', o.RunId, N' also changed ', COUNT(*), CASE WHEN COUNT(*) = 1 THEN N' index' ELSE N' indexes' END,
-                       N' between ', CONVERT(varchar(16), MIN(o.AppliedAt), 120), N' and ', CONVERT(varchar(16), MAX(o.AppliedAt), 120),
+                       CASE WHEN CONVERT(varchar(16), MIN(o.AppliedAt), 120) = CONVERT(varchar(16), MAX(o.AppliedAt), 120)
+                            THEN CONCAT(N' at ', CONVERT(varchar(16), MIN(o.AppliedAt), 120))
+                            ELSE CONCAT(N' between ', CONVERT(varchar(16), MIN(o.AppliedAt), 120), N' and ', CONVERT(varchar(16), MAX(o.AppliedAt), 120)) END,
                        CASE WHEN MAX(o.AppliedAt) < @First THEN N', before' ELSE N', after' END,
                        N' this run''s change and inside the measured time, so part of the difference may be theirs: ',
                        STRING_AGG(CONVERT(nvarchar(max), CONCAT(o.Category, N' ', QUOTENAME(o.SchemaName), N'.', QUOTENAME(o.TableName), N'.', QUOTENAME(o.IndexName))), N', ')

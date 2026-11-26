@@ -2272,7 +2272,7 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM #T41Summary WHERE Source = 'Snapshots' AND SnapshotPairsBefore = 1 AND SnapshotPairsAfter = 1
                    AND BeforeDays = 1 AND AfterDays = 1 AND Warnings LIKE N'%1 pairs of consecutive snapshots in the periods were left out%')
         SET @T41Problems += N' the summary does not show one pair a day long on each side and the restart pair left out;';
-    IF NOT EXISTS (SELECT 1 FROM #T41Summary WHERE Warnings LIKE N'%Run ' + CAST(@T41Other AS nvarchar(10)) + N' also changed 2 indexes between % after this run''s change and inside the measured time%CreateIndex [[]dbo].[[]T41A].[[]IX_T41A], DropIndex [[]dbo].[[]T41B].[[]IX_T41B]%'
+    IF NOT EXISTS (SELECT 1 FROM #T41Summary WHERE Warnings LIKE N'%Run ' + CAST(@T41Other AS nvarchar(10)) + N' also changed 2 indexes between % and %, after this run''s change and inside the measured time%CreateIndex [[]dbo].[[]T41A].[[]IX_T41A], DropIndex [[]dbo].[[]T41B].[[]IX_T41B]%'
                    AND Warnings NOT LIKE N'%IX_T41C%')
         SET @T41Problems += N' the summary does not warn of the other run''s two index changes in the after period, or names the one outside the periods;';
     IF NOT EXISTS (SELECT 1 FROM #T41Workload WHERE Scope = N'Database' AND Metric = N'CPU ms' AND BeforePerDay = 2000 AND AfterPerDay = 1000
